@@ -149,6 +149,7 @@ def collect_titration_rows(
 
 
 LANGMUIR_METRIC_KEY = "peak_current"
+DEFAULT_SWV_VLINES_TEXT = ""
 
 
 def supports_langmuir(metric_key: str) -> bool:
@@ -207,6 +208,36 @@ def parse_scan_windows(
         windows.append(window)
 
     return windows, errors
+
+
+def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
+    vlines: List[Tuple[float, str]] = []
+    errors: List[str] = []
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        token = raw_line.strip()
+        if not token:
+            continue
+
+        parts = token.split(",", 1)
+        if len(parts) != 2:
+            errors.append(f"Ignored line {line_number}: use scan,label format.")
+            continue
+
+        scan_text, label = parts[0].strip(), parts[1].strip()
+        if not label:
+            errors.append(f"Ignored line {line_number}: label cannot be blank.")
+            continue
+
+        try:
+            scan_value = float(scan_text)
+        except ValueError:
+            errors.append(f"Ignored line {line_number}: scan index must be numeric.")
+            continue
+
+        vlines.append((scan_value, label))
+
+    return vlines, errors
 
 
 def scan_in_windows(scan_number: float, scan_windows: List[Tuple[int, int]]) -> bool:
@@ -313,6 +344,85 @@ def remap_vlines_to_filtered_scan_axis(
     return remapped
 
 
+def filter_vlines_to_results_axis(
+    vlines: List[Tuple[float, str]],
+    results: List[dict],
+) -> List[Tuple[float, str]]:
+    if not vlines or not results:
+        return []
+
+    scan_numbers = [
+        float(row["scan_number"])
+        for row in results
+        if row.get("scan_number") is not None
+    ]
+    if not scan_numbers:
+        return []
+
+    min_scan = min(scan_numbers)
+    max_scan = max(scan_numbers)
+    in_range = [
+        (float(x), str(label))
+        for x, label in vlines
+        if min_scan <= float(x) <= max_scan
+    ]
+    left_candidates = [
+        (float(x), str(label))
+        for x, label in vlines
+        if float(x) < min_scan
+    ]
+    if left_candidates:
+        nearest_left = max(left_candidates, key=lambda item: item[0])
+        return [nearest_left] + in_range
+    return in_range
+
+
+def build_channel_indexes(
+    results: List[dict],
+    scan_range: Optional[Tuple[int, int]] = None,
+) -> dict:
+    def _scan_sort_key(row: dict) -> float:
+        scan_number = row.get("scan_number")
+        return float(scan_number) if scan_number is not None else float("inf")
+
+    all_by_channel = {}
+    ok_by_channel = {}
+    failed_by_channel = {}
+
+    for row in results:
+        channel = row.get("channel")
+        if channel is None:
+            continue
+        all_by_channel.setdefault(channel, []).append(row)
+        if row.get("status") == "OK":
+            ok_by_channel.setdefault(channel, []).append(row)
+        elif row.get("status") == "FAILED":
+            failed_by_channel.setdefault(channel, []).append(row)
+
+    for mapping in (all_by_channel, ok_by_channel, failed_by_channel):
+        for channel, rows in mapping.items():
+            mapping[channel] = sorted(rows, key=_scan_sort_key)
+
+    if scan_range is None:
+        ok_in_range_by_channel = ok_by_channel
+    else:
+        start, end = scan_range
+        ok_in_range_by_channel = {
+            channel: [
+                row for row in rows
+                if row.get("scan_number") is not None and start <= row["scan_number"] <= end
+            ]
+            for channel, rows in ok_by_channel.items()
+        }
+
+    return {
+        "all_by_channel": all_by_channel,
+        "ok_by_channel": ok_by_channel,
+        "failed_by_channel": failed_by_channel,
+        "ok_in_range_by_channel": ok_in_range_by_channel,
+    }
+
+
 def reindex_swv_results_for_display(
     results: List[dict],
     vlines: List[Tuple[float, str]],
@@ -369,6 +479,12 @@ for k, v in dict(
     last_results_mode=None,
     folders=[],
     run_count=0,
+    swv_post_method_filter_enabled=False,
+    swv_post_selected_method_groups=[],
+    swv_post_vlines_input=DEFAULT_SWV_VLINES_TEXT,
+    swv_enable_titration_analysis=False,
+    swv_titration_edge_trim_fraction=0.15,
+    swv_fit_titration_langmuir=True,
 ).items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -606,59 +722,6 @@ with st.sidebar:
 
     st.divider()
 
-    #  Vlines 
-    vlines: List[Tuple[float, str]] = []
-    if analysis_mode == "SWV":
-        st.subheader(" Vertical Lines")
-        vlines_input = st.text_area(
-            "scan,label  one per line",
-            value="\n".join([
-                "10,LSV 7",  "20,LSV 3",  "30,LSV 9",  "40,LSV 2",  "50,LSV 10",
-                "60,LSV 5",  "70,LSV 1",  "80,LSV 4",  "90,LSV 8",  "100,LSV 6",
-                "120,Buffer added", "140,DS added", "160,Buffer added",
-                "170,LSV 7", "180,LSV 3", "190,LSV 9", "200,LSV 2", "210,LSV 10",
-                "220,LSV 5", "230,LSV 1", "240,LSV 4", "250,LSV 8", "260,LSV 6",
-            ]),
-            height=180,
-        )
-        for line in vlines_input.splitlines():
-            parts = line.strip().split(",", 1)
-            if len(parts) == 2:
-                try:
-                    vlines.append((float(parts[0].strip()), parts[1].strip()))
-                except ValueError:
-                    pass
-        st.caption(
-            "Vertical lines are entered using the original scan index. "
-            "When subsection analysis is active, matching vlines are remapped onto the concatenated analysis axis."
-        )
-
-    enable_titration_analysis = False
-    titration_edge_trim_fraction = 0.15
-    fit_titration_langmuir = False
-    if analysis_mode == "SWV":
-        enable_titration_analysis = st.checkbox(
-            "Treat vline intervals as titration steps",
-            value=False,
-            help="Each interval between consecutive vertical lines becomes one titration step.",
-        )
-        if enable_titration_analysis:
-            titration_edge_trim_fraction = st.slider(
-                "Plateau edge trim fraction",
-                min_value=0.0,
-                max_value=0.4,
-                value=0.15,
-                step=0.05,
-                help="Uses only the middle portion of each step when estimating the plateau median.",
-            )
-            fit_titration_langmuir = st.checkbox(
-                "Fit Langmuir-style curve to step plateaus",
-                value=True,
-                help="Only applies to corrected peak-current plateaus and fits a Langmuir-to-saturation curve with an optional post-saturation polynomial tail.",
-            )
-
-    st.divider()
-
     #  Failed traces 
     max_failed = 40
     if analysis_mode == "SWV":
@@ -815,21 +878,20 @@ else:
         "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
         "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
         "Skew":                     ("skew",             "Skew (corrected trace)"),
-        "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized)"),
+        "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized, bracket-relative)"),
         "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
     }
     if not compute_skew:
         metric_cfg.pop("Skew", None)
-        metric_cfg.pop("Peak offset (normalized)", None)
     if not compute_wavelet_energy:
         metric_cfg.pop("Wavelet energy", None)
 
 plot_scan_range = None if scan_windows else scan_range
-active_vlines = remap_vlines_to_active_scan_range(
-    vlines,
-    scan_windows=scan_windows,
-    scan_range=scan_range if use_scan_range and not scan_windows else None,
-)
+active_vlines: List[Tuple[float, str]] = []
+vlines: List[Tuple[float, str]] = []
+enable_titration_analysis = False
+titration_edge_trim_fraction = 0.15
+fit_titration_langmuir = False
 swv_method_filter_enabled = False
 swv_method_filter_applied = False
 selected_swv_method_groups: List[str] = []
@@ -839,36 +901,105 @@ if analysis_mode == "SWV":
         key=_method_group_sort_key,
     )
     if available_method_groups:
+        selected_groups_state = [
+            group
+            for group in st.session_state.get("swv_post_selected_method_groups", [])
+            if group in available_method_groups
+        ]
+        if not selected_groups_state:
+            selected_groups_state = list(available_method_groups)
+        st.session_state["swv_post_selected_method_groups"] = selected_groups_state
+
+    if available_method_groups:
         mf_c1, mf_c2 = st.columns([1, 3])
         swv_method_filter_enabled = mf_c1.checkbox(
             "Filter by SWV method",
-            value=False,
+            key="swv_post_method_filter_enabled",
             help="Uses the SWV method file to split the dataset into method groups without rerunning analysis.",
         )
         if swv_method_filter_enabled:
             selected_swv_method_groups = mf_c2.multiselect(
                 "SWV method groups",
                 options=available_method_groups,
-                default=available_method_groups,
+                key="swv_post_selected_method_groups",
                 help="Selected groups are concatenated into a fresh sequential scan axis for display.",
             )
         else:
-            selected_swv_method_groups = available_method_groups
+            selected_swv_method_groups = list(available_method_groups)
+    else:
+        swv_method_filter_enabled = False
+        selected_swv_method_groups = []
+        st.caption("No SWV method metadata was found for this result set.")
 
-        selected_group_set = set(selected_swv_method_groups)
-        swv_method_filter_applied = swv_method_filter_enabled and (
-            selected_group_set != set(available_method_groups)
+    selected_group_set = set(selected_swv_method_groups)
+    swv_method_filter_applied = bool(available_method_groups) and swv_method_filter_enabled and (
+        selected_group_set != set(available_method_groups)
+    )
+    if swv_method_filter_applied:
+        results = [
+            r for r in results
+            if r.get("swv_method_group", "Unknown method") in selected_group_set
+        ]
+        results, _, plot_scan_range = reindex_swv_results_for_display(results, [])
+        st.caption(
+            "SWV method filtering is display-only. The filtered subset is concatenated and renumbered "
+            "without rerunning the expensive analysis."
         )
-        if swv_method_filter_applied:
-            results = [
-                r for r in results
-                if r.get("swv_method_group", "Unknown method") in selected_group_set
-            ]
-            results, active_vlines, plot_scan_range = reindex_swv_results_for_display(results, active_vlines)
+
+    with st.expander("Scan Annotations", expanded=False):
+        with st.form("swv_post_analysis_controls"):
             st.caption(
-                "SWV method filtering is display-only. The filtered subset is concatenated and renumbered "
-                "without rerunning the expensive analysis."
+                "Apply vlines and titration options together. "
+                "Vlines use the current plotted scan axis, including subsection-relative numbering."
             )
+            st.text_area(
+                "scan,label  one per line",
+                height=180,
+                key="swv_post_vlines_input",
+            )
+
+            enable_titration_analysis = st.checkbox(
+                "Treat vline intervals as titration steps",
+                key="swv_enable_titration_analysis",
+                help="Each interval between consecutive vertical lines becomes one titration step.",
+            )
+            if enable_titration_analysis:
+                if not st.session_state.get("_swv_titration_trim_initialized_for_toggle", False):
+                    st.session_state["swv_titration_edge_trim_fraction"] = 0.15
+                    st.session_state["_swv_titration_trim_initialized_for_toggle"] = True
+                titration_edge_trim_fraction = st.slider(
+                    "Plateau edge trim fraction",
+                    min_value=0.0,
+                    max_value=0.4,
+                    step=0.05,
+                    key="swv_titration_edge_trim_fraction",
+                    help="Uses only the middle portion of each step when estimating the plateau median.",
+                )
+                fit_titration_langmuir = st.checkbox(
+                    "Fit Langmuir-style curve to step plateaus",
+                    key="swv_fit_titration_langmuir",
+                    help="Only applies to corrected peak-current plateaus and fits a Langmuir-to-saturation curve with an optional post-saturation polynomial tail.",
+                )
+            else:
+                st.session_state["_swv_titration_trim_initialized_for_toggle"] = False
+            st.form_submit_button("Apply Display Controls", use_container_width=True)
+
+        vlines, vline_errors = parse_vlines(st.session_state.get("swv_post_vlines_input", DEFAULT_SWV_VLINES_TEXT))
+        for err in vline_errors:
+            st.warning(err)
+
+        active_vlines = filter_vlines_to_results_axis(vlines, results)
+        kept_vlines = len(active_vlines)
+        if use_scan_range and scan_windows:
+            st.caption(
+                f"{kept_vlines} vline(s) are inside the current subsection axis built from {format_scan_windows(scan_windows)}."
+            )
+        elif swv_method_filter_applied:
+            st.caption(
+                f"{kept_vlines} vline(s) are inside the current filtered display axis."
+            )
+        else:
+            st.caption(f"{kept_vlines} vline(s) are inside the current analyzed scan axis.")
 
 titration_ready = enable_titration_analysis and len(active_vlines) >= 2
 x_axis_label = (
@@ -878,7 +1009,11 @@ x_axis_label = (
 )
 ok_results     = [r for r in results if r.get("status") == "OK"]
 failed_results = [r for r in results if r.get("status") == "FAILED"]
-all_channels   = sorted({r["channel"] for r in results})
+channel_indexes = build_channel_indexes(results, scan_range=plot_scan_range)
+results_by_channel = channel_indexes["all_by_channel"]
+failed_results_by_channel = channel_indexes["failed_by_channel"]
+ok_plot_results_by_channel = channel_indexes["ok_in_range_by_channel"]
+all_channels   = sorted(results_by_channel)
 channels_display = channels_to_plot if channels_to_plot else all_channels
 ch_options = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
 
@@ -953,9 +1088,7 @@ if view == "Overlays":
         y_key = key_map[trace_type]
 
         for ch in channels_display:
-            ch_res = [r for r in ok_results if r["channel"] == ch]
-            if plot_scan_range:
-                ch_res = [r for r in ch_res if plot_scan_range[0] <= r["scan_number"] <= plot_scan_range[1]]
+            ch_res = ok_plot_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
             with st.expander(f"Channel {ch}  ({len(ch_res)} cycles)", expanded=len(channels_display) <= 4):
@@ -998,9 +1131,7 @@ if view == "Overlays":
         y_key = key_map[trace_type]
 
         for ch in channels_display:
-            ch_res = [r for r in ok_results if r["channel"] == ch]
-            if plot_scan_range:
-                ch_res = [r for r in ch_res if plot_scan_range[0] <= r["scan_number"] <= plot_scan_range[1]]
+            ch_res = ok_plot_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
             with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(channels_display) <= 4):
@@ -1182,9 +1313,14 @@ if view == "Drift":
         )
     else:
         st.markdown(
-            "Both metrics are computed **per channel**  the first valid scan for each channel "
+            "These metrics are computed **per channel** and the first valid scan for each channel "
             "is used as the reference (zero line). This lets you compare channels even if they "
             "started at different absolute values."
+        )
+        st.caption(
+            "Peak voltage drift is the absolute peak-position shift. Peak offset (normalized) is "
+            "relative to that scan's own left/right correction anchors, so whole-peak translations "
+            "can stay small if the anchors move with the peak."
         )
 
     dr_c1, dr_c2 = st.columns([3, 1])
@@ -1218,11 +1354,10 @@ if view == "Drift":
             "Skew drift":             ("skew_drift",         "Skew",
                                        "Change in corrected-trace asymmetry  sensitive to baseline shape changes."),
             "Peak offset (normalized) drift": ("peak_offset_norm_drift", "Peak offset (normalized)",
-                                       "Shift in peak position relative to bracket center (normalized)."),
+                                       "Shift relative to the scan's own bracket center; pure whole-peak shifts can stay small."),
         }
         if not compute_skew:
             drift_options.pop("Skew drift", None)
-            drift_options.pop("Peak offset (normalized) drift", None)
 
     selected_drift = dr_c1.multiselect(
         "Drift metrics to display",
@@ -1297,7 +1432,7 @@ if view == "Failures":
             st.divider()
 
             for ch in channels_display:
-                ch_failed = [r for r in failed_results if r["channel"] == ch]
+                ch_failed = failed_results_by_channel.get(ch, [])
                 if not ch_failed:
                     continue
                 with st.expander(f"Ch{ch}  {len(ch_failed)} failed cycles", expanded=False):
@@ -1348,7 +1483,7 @@ if view == "Failures":
             st.divider()
 
             for ch in channels_display:
-                ch_failed = [r for r in failed_results if r["channel"] == ch]
+                ch_failed = failed_results_by_channel.get(ch, [])
                 if not ch_failed:
                     continue
                 to_plot = ch_failed[:int(max_failed)]
@@ -1664,9 +1799,7 @@ if view == "Export":
                     _save(fig, f"drift/{dk}.{fig_format}")
 
             for ch in channels_display:
-                ch_res = [r for r in ok_results if r["channel"] == ch]
-                if plot_scan_range:
-                    ch_res = [r for r in ch_res if plot_scan_range[0] <= r["scan_number"] <= plot_scan_range[1]]
+                ch_res = ok_plot_results_by_channel.get(ch, [])
                 if analysis_mode == "CV":
                     for yk, lbl in (
                         ("smoothed_current", "smoothed"),

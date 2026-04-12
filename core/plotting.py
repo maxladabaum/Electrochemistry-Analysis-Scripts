@@ -95,9 +95,20 @@ def _cmap_fig(
 
             y = r[y_key]
 
-            left_candidates = np.asarray(r.get("left_local_min_candidates", []), dtype=int)
+            double_correction_applied = bool(r.get("double_correction_applied")) and (
+                r.get("second_pass_corrected_current") is not None
+            )
+            left_candidates_key = (
+                "first_pass_left_local_min_candidates" if double_correction_applied else "left_local_min_candidates"
+            )
+            right_candidates_key = (
+                "first_pass_right_local_min_candidates" if double_correction_applied else "right_local_min_candidates"
+            )
+            left_idx_key = "first_pass_left_min_idx" if double_correction_applied else "left_min_idx"
+            right_idx_key = "first_pass_right_min_idx" if double_correction_applied else "right_min_idx"
+            left_candidates = np.asarray(r.get(left_candidates_key, []), dtype=int)
 
-            right_candidates = np.asarray(r.get("right_local_min_candidates", []), dtype=int)
+            right_candidates = np.asarray(r.get(right_candidates_key, []), dtype=int)
 
             if len(left_candidates):
 
@@ -123,7 +134,7 @@ def _cmap_fig(
 
                 )
 
-            for idx_key in ("left_min_idx", "right_min_idx"):
+            for idx_key in (left_idx_key, right_idx_key):
 
                 idx = r.get(idx_key)
 
@@ -256,13 +267,21 @@ def _filter_titration_vlines(
 
         return []
 
-    filtered = (
-
-        [(float(x), str(label)) for x, label in vlines if scan_range[0] <= x <= scan_range[1]]
-
-        if scan_range else [(float(x), str(label)) for x, label in vlines]
-
-    )
+    if scan_range:
+        start_scan, end_scan = scan_range
+        in_range = [
+            (float(x), str(label))
+            for x, label in vlines
+            if start_scan <= x <= end_scan
+        ]
+        left_candidates = [
+            (float(x), str(label))
+            for x, label in vlines
+            if float(x) < start_scan
+        ]
+        filtered = ([max(left_candidates, key=lambda item: item[0])] if left_candidates else []) + in_range
+    else:
+        filtered = [(float(x), str(label)) for x, label in vlines]
     filtered = sorted(filtered, key=lambda item: item[0])
 
     deduped: List[Tuple[float, str]] = []

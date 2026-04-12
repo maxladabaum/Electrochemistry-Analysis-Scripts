@@ -289,12 +289,11 @@ def analyze_swv_arrays(
 
     skew_val = float(skew(y_corr)) if compute_skew else np.nan
     peak_offset_norm = np.nan
-    if compute_skew:
-        v_left = float(v[left_idx])
-        v_right = float(v[right_idx])
-        denom = (v_right - v_left) / 2.0
-        if denom != 0:
-            peak_offset_norm = float((v[peak_idx_corr] - (v_left + v_right) / 2.0) / denom)
+    v_left = float(v[left_idx])
+    v_right = float(v[right_idx])
+    denom = (v_right - v_left) / 2.0
+    if denom != 0:
+        peak_offset_norm = float((v[peak_idx_corr] - (v_left + v_right) / 2.0) / denom)
 
     return {
         "file_path": file_path,
@@ -486,12 +485,12 @@ def partial_traces_for_failure_arrays(
 
 def compute_drift_fields(all_results: List[dict]) -> List[dict]:
     """
-    Adds two drift fields to each result (in-place), computed per channel
+    Adds three drift fields to each result (in-place), computed per channel
     relative to each channel's first valid (OK) scan:
 
       peak_voltage_drift           peak_voltage               - reference peak_voltage  (V)
       skew_drift                   skew                       - reference skew
-      peak_offset_norm_drift        peak_offset_norm          - reference peak_offset_norm
+      peak_offset_norm_drift       peak_offset_norm          - reference peak_offset_norm
     """
     ref: Dict[int, dict] = {}
 
