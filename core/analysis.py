@@ -291,6 +291,7 @@ def analyze_swv_arrays(
     peak_offset_norm = np.nan
     v_left = float(v[left_idx])
     v_right = float(v[right_idx])
+    bracket_width_V = float(v_right - v_left)
     denom = (v_right - v_left) / 2.0
     if denom != 0:
         peak_offset_norm = float((v[peak_idx_corr] - (v_left + v_right) / 2.0) / denom)
@@ -310,6 +311,7 @@ def analyze_swv_arrays(
         "peak_voltage": float(v[peak_idx_corr]),
         "peak_current": peak_height,
         "peak_current_raw": float(i[first_pass["peak_idx"]]),
+        "bracket_width_V": bracket_width_V,
         "peak_idx": first_pass["peak_idx"],
         "peak_idx_corr": peak_idx_corr,
         "left_min_idx": left_idx,
@@ -485,10 +487,11 @@ def partial_traces_for_failure_arrays(
 
 def compute_drift_fields(all_results: List[dict]) -> List[dict]:
     """
-    Adds three drift fields to each result (in-place), computed per channel
+    Adds four drift fields to each result (in-place), computed per channel
     relative to each channel's first valid (OK) scan:
 
       peak_voltage_drift           peak_voltage               - reference peak_voltage  (V)
+      bracket_width_drift          bracket_width_V            - reference bracket_width_V  (V)
       skew_drift                   skew                       - reference skew
       peak_offset_norm_drift       peak_offset_norm          - reference peak_offset_norm
     """
@@ -501,6 +504,7 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
         ch = r["channel"]
         if r.get("status") != "OK":
             r["peak_voltage_drift"] = np.nan
+            r["bracket_width_drift"] = np.nan
             r["skew_drift"] = np.nan
             r["peak_offset_norm_drift"] = np.nan
             continue
@@ -509,6 +513,7 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
             ref[ch] = r  # first OK scan for this channel = reference
 
         r["peak_voltage_drift"] = r["peak_voltage"] - ref[ch]["peak_voltage"]
+        r["bracket_width_drift"] = r["bracket_width_V"] - ref[ch]["bracket_width_V"]
         r["skew_drift"]         = r["skew"]         - ref[ch]["skew"]
         r["peak_offset_norm_drift"] = r["peak_offset_norm"] - ref[ch]["peak_offset_norm"]
 
@@ -665,6 +670,7 @@ def run_batch(
                 "peak_current": np.nan,
                 "peak_current_raw": np.nan,
                 "peak_voltage": np.nan,
+                "bracket_width_V": np.nan,
                 "skew": np.nan,
                 "peak_offset_norm": np.nan,
                 "wavelet_energy": np.nan,

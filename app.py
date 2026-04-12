@@ -608,7 +608,7 @@ with st.sidebar:
         )
         use_double_correction = st.checkbox(
             "Double baseline correction",
-            value=False,
+            value=True,
             help=(
                 "Optional refinement: after the first baseline rotation, run one more "
                 "bracketing-minima correction on the once-corrected trace so the anchors "
@@ -877,6 +877,7 @@ else:
     metric_cfg = {
         "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
         "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
+        "Bracket width (V)":        ("bracket_width_V",  "Distance between left/right correction anchors (V)"),
         "Skew":                     ("skew",             "Skew (corrected trace)"),
         "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized, bracket-relative)"),
         "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
@@ -1351,6 +1352,8 @@ if view == "Drift":
         drift_options = {
             "Peak voltage drift (V)": ("peak_voltage_drift", "Peak voltage (V)",
                                        "Shift in peak position  indicates a change in the redox potential."),
+            "Bracket width drift (V)": ("bracket_width_drift", "Bracket width (V)",
+                                       "Change in the distance between the left and right correction anchors."),
             "Skew drift":             ("skew_drift",         "Skew",
                                        "Change in corrected-trace asymmetry  sensitive to baseline shape changes."),
             "Peak offset (normalized) drift": ("peak_offset_norm_drift", "Peak offset (normalized)",
@@ -1545,9 +1548,9 @@ if view == "Data Table":
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "file_name", "status",
-            "peak_voltage", "peak_current", "peak_current_raw",
+            "peak_voltage", "peak_current", "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
-            "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
+            "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
     df = pd.DataFrame([{k: r.get(k) for k in scalar_keys} for r in results])
 
@@ -1686,9 +1689,9 @@ if view == "Export":
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "timestamp", "file_name", "status",
-            "peak_voltage", "peak_current", "peak_current_raw",
+            "peak_voltage", "peak_current", "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
-            "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
+            "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
     csv_bytes = pd.DataFrame([{k: r.get(k) for k in export_keys} for r in results])\
                   .to_csv(index=False).encode()
@@ -1787,6 +1790,7 @@ if view == "Export":
             else:
                 drift_exports = (
                     ("peak_voltage_drift", "Peak voltage (V)", "Peak voltage drift"),
+                    ("bracket_width_drift", "Bracket width (V)", "Bracket width drift"),
                     ("skew_drift",         "Skew",             "Skew drift"),
                     ("peak_offset_norm_drift", "Peak offset (normalized)", "Peak offset (normalized) drift"),
                 )
