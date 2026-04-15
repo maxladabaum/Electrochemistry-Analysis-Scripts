@@ -13,8 +13,11 @@ import zipfile
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import pywt
 import streamlit as st
+from scipy.stats import skew
 
 from core import (
     build_titration_step_table,
@@ -30,6 +33,11 @@ from core import (
     plot_titration_plateaus,
     run_cv_batch,
     run_batch,
+)
+from core.processing import (
+    detect_dominant_peak,
+    rotate_offset_using_bracketing_minima,
+    rotate_offset_using_prominent_bracketing_minima,
 )
 
 
@@ -50,6 +58,15 @@ def _pick_folder_windows() -> str:
         "print(p or '')\n"
     )
     return subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+
+
+def _append_unique_folder(folders: List[str], picked: str) -> List[str]:
+    picked_clean = picked.strip()
+    if not picked_clean:
+        return list(folders)
+    if picked_clean in folders:
+        return list(folders)
+    return [*folders, picked_clean]
 
 # 
 # Page config
@@ -89,6 +106,8 @@ def cached_run_batch(
     scan_range,
     compute_skew,
     compute_wavelet_energy,
+    compute_wavelet_denoised_trace,
+    use_wavelet_for_correction,
     edge_trim_fraction,
     min_peak_prominence_uA,
 ):
@@ -118,6 +137,8 @@ def cached_run_batch(
         scan_range=scan_range,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
+        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+        use_wavelet_for_correction=use_wavelet_for_correction,
     )
 
 
@@ -175,6 +196,8 @@ def build_export_metadata(
     titration_edge_trim_fraction: Optional[float] = None,
     peak_height_source_key: Optional[str] = None,
     peak_height_source_label: Optional[str] = None,
+    compute_wavelet_denoised_trace: Optional[bool] = None,
+    use_wavelet_for_correction: Optional[bool] = None,
 ) -> dict:
     metadata = {
         "analysis_crop_min_V": float(crop_range[0]),
@@ -212,6 +235,8 @@ def build_export_metadata(
             ),
             analysis_peak_height_source_key=peak_height_source_key or "",
             analysis_peak_height_source_label=peak_height_source_label or "",
+            analysis_compute_wavelet_denoised_trace=bool(compute_wavelet_denoised_trace),
+            analysis_use_wavelet_for_correction=bool(use_wavelet_for_correction),
         )
     else:
         metadata.update(
@@ -239,23 +264,99 @@ def supports_langmuir(metric_key: str) -> bool:
 def annotate_swv_peak_height_metrics(
     results: List[dict],
     selected_peak_height_source: str,
+    minima_search_window_V: float,
+    use_prominent_minima: bool,
+    compute_skew: bool,
+    compute_wavelet_energy: bool,
 ) -> List[dict]:
-    for row in results:
-        corrected_height = row.get("peak_current")
-        row["peak_current_corrected"] = corrected_height
+    def _compute_trace_based_metrics(row: dict, trace_key: str) -> dict:
+        voltage = row.get("voltage")
+        trace = row.get(trace_key)
+        raw_current = row.get("raw_current")
+        if voltage is None or trace is None:
+            return {}
 
-        smoothed_height = float("nan")
-        peak_idx_corr = row.get("peak_idx_corr")
-        smoothed_trace = row.get("smoothed_corrected_current")
         try:
-            idx = int(peak_idx_corr)
-            if smoothed_trace is not None and 0 <= idx < len(smoothed_trace):
-                smoothed_height = float(smoothed_trace[idx])
-        except (TypeError, ValueError, IndexError):
-            pass
+            v = np.asarray(voltage, dtype=float)
+            y = np.asarray(trace, dtype=float)
+            raw = np.asarray(raw_current, dtype=float) if raw_current is not None else None
+            if len(v) < 5 or len(y) != len(v):
+                return {}
 
-        row["peak_current_smoothed_corrected"] = smoothed_height
-        row["peak_current_selected"] = row.get(selected_peak_height_source, corrected_height)
+            peak_idx_seed = int(detect_dominant_peak(y))
+            corr = (
+                rotate_offset_using_prominent_bracketing_minima(v, y, peak_idx_seed, minima_search_window_V)
+                if use_prominent_minima
+                else rotate_offset_using_bracketing_minima(v, y, peak_idx_seed, minima_search_window_V)
+            )
+            left_idx = int(corr["left_idx"])
+            right_idx = int(corr["right_idx"])
+            segment = y[left_idx:right_idx + 1]
+            peak_idx = left_idx + int(detect_dominant_peak(segment, boundary_margin=0))
+
+            v_left = float(v[left_idx])
+            v_right = float(v[right_idx])
+            denom = (v_right - v_left) / 2.0
+            peak_offset_norm = np.nan
+            if abs(denom) > 1e-12:
+                peak_offset_norm = float((float(v[peak_idx]) - ((v_left + v_right) / 2.0)) / denom)
+
+            wavelet_energy = np.nan
+            if compute_wavelet_energy:
+                coeffs = pywt.wavedec(y, "haar", level=3)
+                wavelet_energy = float(sum(np.sum(c**2) for c in coeffs))
+
+            return {
+                "peak_idx_corr": peak_idx,
+                "left_min_idx": left_idx,
+                "right_min_idx": right_idx,
+                "peak_voltage": float(v[peak_idx]),
+                "peak_current": float(y[peak_idx]),
+                "peak_current_raw": float(raw[peak_idx]) if raw is not None and 0 <= peak_idx < len(raw) else np.nan,
+                "bracket_width_V": float(v_right - v_left),
+                "peak_offset_norm": peak_offset_norm,
+                "skew": float(skew(y)) if compute_skew else np.nan,
+                "wavelet_energy": wavelet_energy,
+            }
+        except Exception:
+            return {}
+
+    for row in results:
+        if row.get("status") != "OK":
+            row["peak_current_corrected"] = row.get("peak_current", np.nan)
+            row["peak_current_smoothed_corrected"] = np.nan
+            row["peak_current_selected"] = row.get(selected_peak_height_source, row.get("peak_current", np.nan))
+            continue
+
+        corrected_metrics = _compute_trace_based_metrics(row, "corrected_current")
+        smoothed_metrics = _compute_trace_based_metrics(row, "smoothed_corrected_current")
+
+        row["peak_current_corrected"] = corrected_metrics.get("peak_current", np.nan)
+        row["peak_current_smoothed_corrected"] = smoothed_metrics.get("peak_current", np.nan)
+
+        selected_metrics = (
+            smoothed_metrics
+            if selected_peak_height_source == "peak_current_smoothed_corrected"
+            else corrected_metrics
+        )
+        for key in (
+            "peak_idx_corr",
+            "left_min_idx",
+            "right_min_idx",
+            "peak_voltage",
+            "peak_current",
+            "peak_current_raw",
+            "bracket_width_V",
+            "peak_offset_norm",
+            "skew",
+            "wavelet_energy",
+        ):
+            if key in selected_metrics:
+                row[key] = selected_metrics[key]
+
+        row["peak_current_selected"] = selected_metrics.get("peak_current", row.get("peak_current", np.nan))
+
+    compute_drift_fields(results)
 
     return results
 
@@ -615,8 +716,8 @@ with st.sidebar:
     if c1.button("  Browse (Windows)", use_container_width=True, disabled=not sys.platform.startswith("win")):
         try:
             picked = _pick_folder_windows()
-            if picked and picked not in st.session_state.folders:
-                st.session_state.folders.append(picked)
+            if picked:
+                st.session_state.folders = _append_unique_folder(st.session_state.folders, picked)
         except subprocess.CalledProcessError as e:
             st.error(f"Windows folder picker failed: {e}")
         except Exception as e:
@@ -627,8 +728,8 @@ with st.sidebar:
             # Use Finder's native picker via AppleScript (Tk dialogs can crash Streamlit on macOS).
             script = 'POSIX path of (choose folder with prompt "Select electrochemistry data folder")'
             picked = subprocess.check_output(["osascript", "-e", script], text=True).strip()
-            if picked and picked not in st.session_state.folders:
-                st.session_state.folders.append(picked)
+            if picked:
+                st.session_state.folders = _append_unique_folder(st.session_state.folders, picked)
         except FileNotFoundError:
             st.error("macOS folder picker failed: `osascript` not found.")
         except subprocess.CalledProcessError:
@@ -644,7 +745,7 @@ with st.sidebar:
         "Folders (one per line  or browse above)",
         value="\n".join(st.session_state.folders),
         height=90,
-        help="You can also paste paths directly here.",
+        help="You can analyze multiple folders together. Each browse click adds one folder, and you can also paste multiple paths here one per line.",
     )
     edited = [f.strip() for f in raw_folders.splitlines() if f.strip()]
     st.session_state.folders = edited
@@ -695,6 +796,7 @@ with st.sidebar:
     minima_search_window = 0.30
     use_prominent_minima = False
     use_double_correction = False
+    use_wavelet_for_correction = False
     min_peak_height = None
     edge_trim_fraction = 0.05
     min_peak_prominence = None
@@ -704,11 +806,6 @@ with st.sidebar:
         minima_search_window = st.number_input(
             "Minima search window (V)", value=0.30, step=0.01, format="%.3f",
             help="Voltage window either side of peak when searching for bracketing minima.",
-        )
-        use_prominent_minima = st.checkbox(
-            "Use prominent local minima for bracketing",
-            value=False,
-            help="Experimental comparison mode: uses peaks of the inverted smoothed signal and takes the most prominent local minimum on each side of the detected peak.",
         )
         use_double_correction = st.checkbox(
             "Double baseline correction",
@@ -759,9 +856,28 @@ with st.sidebar:
     if analysis_mode == "SWV":
         compute_skew = st.checkbox("Compute skew metric", value=True)
         compute_wavelet_energy = st.checkbox("Compute wavelet energy", value=True)
+        with st.expander("Experimental", expanded=False):
+            use_prominent_minima = st.checkbox(
+                "Use prominent local minima for bracketing",
+                value=False,
+                help="Experimental comparison mode: uses peaks of the inverted smoothed signal and takes the most prominent local minimum on each side of the detected peak.",
+            )
+            compute_wavelet_denoised_trace = st.checkbox(
+                "Compute wavelet-denoised trace",
+                value=False,
+                help="Adds an optional denoised trace for visual comparison in overlays and trace inspectors. It does not change the current peak metrics.",
+            )
+            use_wavelet_for_correction = st.checkbox(
+                "Use wavelet-denoised trace for baseline correction",
+                value=False,
+                disabled=not compute_wavelet_denoised_trace,
+                help="Optional experiment: use the wavelet-denoised trace instead of the Savitzky-Golay smoothed trace for the first-pass baseline correction and anchor search.",
+            )
     else:
         compute_skew = False
         compute_wavelet_energy = False
+        compute_wavelet_denoised_trace = False
+        use_wavelet_for_correction = False
         st.caption("CV mode skips the heavier SWV-only skew and wavelet metrics.")
     use_cache = st.checkbox("Use cached results", value=True, help="Disable to force a full re-run with progress.")
 
@@ -866,6 +982,8 @@ if run_clicked and folders and not folder_errors:
                     scan_range=None if scan_windows else scan_range,
                     compute_skew=compute_skew,
                     compute_wavelet_energy=compute_wavelet_energy,
+                    compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+                    use_wavelet_for_correction=use_wavelet_for_correction,
                     edge_trim_fraction=edge_trim_fraction,
                     min_peak_prominence_uA=min_peak_prominence,
                 )
@@ -905,6 +1023,8 @@ if run_clicked and folders and not folder_errors:
                     scan_range=None if scan_windows else scan_range,
                     compute_skew=compute_skew,
                     compute_wavelet_energy=compute_wavelet_energy,
+                    compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+                    use_wavelet_for_correction=use_wavelet_for_correction,
                     progress_callback=_progress,
                 )
             progress_bar.progress(100)
@@ -927,28 +1047,14 @@ if run_clicked and folders and not folder_errors:
 results = st.session_state.get("results")
 results_mode = st.session_state.get("results_mode")
 if results is None:
-    if (
-        st.session_state.get("last_results") is not None
-        and st.session_state.get("last_results_mode") == analysis_mode
-    ):
-        st.warning("Showing last successful results (current run returned nothing).")
-        results = st.session_state.last_results
-    else:
-        st.info(" Configure parameters in the sidebar, then click **Run Analysis**.")
-        st.stop()
+    st.info(" Configure parameters in the sidebar, then click **Run Analysis**.")
+    st.stop()
 elif results_mode != analysis_mode:
     st.info(f"Current results are for {results_mode or 'another mode'}. Run {analysis_mode} analysis to populate this view.")
     st.stop()
 if len(results) == 0:
-    if (
-        st.session_state.get("last_results") is not None
-        and st.session_state.get("last_results_mode") == analysis_mode
-    ):
-        st.warning("No results returned. Showing last successful results.")
-        results = st.session_state.last_results
-    else:
-        st.warning("No results returned. Check folder paths and file naming pattern.")
-        st.stop()
+    st.warning("No results returned for the current selection. Check folder paths and file naming pattern.")
+    st.stop()
 
 if analysis_mode == "CV":
     ec_labels = [label for label in ["EC3", "EC4"] if any(r.get("ec_label") == label for r in results)]
@@ -990,8 +1096,8 @@ if analysis_mode == "SWV":
         horizontal=True,
         key="swv_peak_height_source_label",
         help=(
-            "Peak position still comes from the smoothed corrected trace. "
-            "This only changes which y-value is reported as the SWV peak height."
+            "Use one consistent SWV trace basis for the derived SWV metrics. "
+            "The selected trace is used for peak finding, anchor placement, and downstream metric values."
         ),
     )
     (
@@ -1000,10 +1106,17 @@ if analysis_mode == "SWV":
         selected_peak_height_ylabel,
     ) = peak_height_source_options[peak_source_label]
     selected_peak_height_source_label = peak_source_label
-    results = annotate_swv_peak_height_metrics(results, selected_peak_height_source)
+    results = annotate_swv_peak_height_metrics(
+        results,
+        selected_peak_height_source,
+        minima_search_window_V=minima_search_window,
+        use_prominent_minima=use_prominent_minima,
+        compute_skew=compute_skew,
+        compute_wavelet_energy=compute_wavelet_energy,
+    )
     st.caption(
-        "Peak location is still taken from the corrected-and-smoothed peak index. "
-        "This switch only changes the reported peak height value."
+        "The selected SWV trace now drives the derived SWV metrics as a set: peak height, "
+        "peak voltage, bracket width, peak offset, skew, wavelet energy, and the related drift fields."
     )
 
 if analysis_mode == "CV":
@@ -1029,6 +1142,11 @@ else:
         metric_cfg.pop("Skew", None)
     if not compute_wavelet_energy:
         metric_cfg.pop("Wavelet energy", None)
+
+has_wavelet_denoised_trace = (
+    analysis_mode == "SWV"
+    and any(r.get("wavelet_denoised_current") is not None for r in results)
+)
 
 plot_scan_range = None if scan_windows else scan_range
 active_vlines: List[Tuple[float, str]] = []
@@ -1254,7 +1372,10 @@ if view == "Overlays":
                     st.warning("No plottable traces for this channel.")
     else:
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
-        trace_type   = ov_c1.radio("Trace type", ["Corrected", "Smoothed Corrected", "Raw", "Smoothed"],
+        trace_type_options = ["Corrected", "Smoothed Corrected", "Raw", "Smoothed"]
+        if has_wavelet_denoised_trace:
+            trace_type_options.append("Wavelet Denoised")
+        trace_type   = ov_c1.radio("Trace type", trace_type_options,
                                     horizontal=True, key="overlay_type")
         cmap_name    = ov_c2.selectbox("Colour map",
                                        ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
@@ -1271,6 +1392,7 @@ if view == "Overlays":
             "Smoothed Corrected": "smoothed_corrected_current",
             "Raw": "raw_current",
             "Smoothed": "smoothed_current",
+            "Wavelet Denoised": "wavelet_denoised_current",
         }
         y_key = key_map[trace_type]
 
@@ -1285,7 +1407,7 @@ if view == "Overlays":
                     ylabel="Current (uA)",
                     colormap_name=cmap_name,
                     show_anchors=show_anchors,
-                    show_peak_markers=show_peak_markers,
+                    show_peak_markers=(show_peak_markers and y_key != "wavelet_denoised_current"),
                     show_zero_baseline=(show_baseline and y_key in ("corrected_current", "smoothed_corrected_current")),
                 )
                 if fig:
@@ -1637,13 +1759,16 @@ if view == "Failures":
                     for yk, yl in (
                         ("raw_current",       "Raw Current (uA)"),
                         ("smoothed_current",  "Smoothed Current (uA)"),
+                        ("wavelet_denoised_current", "Wavelet-Denoised Current (uA)"),
                         ("corrected_current", "Corrected Current (uA)"),
                         ("smoothed_corrected_current", "Smoothed Corrected Current (uA)"),
                     ):
+                        if yk == "wavelet_denoised_current" and not has_wavelet_denoised_trace:
+                            continue
                         fig = plot_failed_traces(
                             to_plot, y_key=yk, ylabel=yl,
                             title=f"Ch{ch}  {yl}",
-                            show_peak_markers=(yk != "raw_current"),
+                            show_peak_markers=(yk not in ("raw_current", "wavelet_denoised_current")),
                             show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),
                             show_local_baselines=(yk == "smoothed_current"),
                             show_minima_candidates=(yk == "smoothed_current"),
@@ -1833,6 +1958,8 @@ if view == "Export":
         titration_edge_trim_fraction=titration_edge_trim_fraction if analysis_mode == "SWV" else None,
         peak_height_source_key=selected_peak_height_source if analysis_mode == "SWV" else None,
         peak_height_source_label=selected_peak_height_source_label if analysis_mode == "SWV" else None,
+        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace if analysis_mode == "SWV" else None,
+        use_wavelet_for_correction=use_wavelet_for_correction if analysis_mode == "SWV" else None,
     )
 
     st.markdown("####  Signal Processing Inputs CSV")
@@ -2005,11 +2132,14 @@ if view == "Export":
                         if fig:
                             _save(fig, f"overlays/ch{ch}_{lbl}.{fig_format}")
                 else:
-                    for yk, lbl in (
+                    export_overlay_keys = [
                         ("corrected_current", "corrected"),
                         ("smoothed_corrected_current", "smoothed_corrected"),
                         ("raw_current", "raw"),
-                    ):
+                    ]
+                    if has_wavelet_denoised_trace:
+                        export_overlay_keys.append(("wavelet_denoised_current", "wavelet_denoised"))
+                    for yk, lbl in export_overlay_keys:
                         fig = plot_overlaid_traces(ch_res, y_key=yk,
                                                    title=f"Ch{ch}  {lbl}",
                                                    show_anchors=(yk == "corrected_current"))

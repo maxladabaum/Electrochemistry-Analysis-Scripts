@@ -107,6 +107,8 @@ def _process_file_cached(
     min_peak_height_uA: Optional[float],
     compute_skew: bool,
     compute_wavelet_energy: bool,
+    compute_wavelet_denoised_trace: bool,
+    use_wavelet_for_correction: bool,
 ) -> dict:
     v_raw, i_raw = _load_filtered_arrays_cached(
         filepath=filepath,
@@ -128,6 +130,8 @@ def _process_file_cached(
             min_peak_height_uA=min_peak_height_uA,
             compute_skew=compute_skew,
             compute_wavelet_energy=compute_wavelet_energy,
+            compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+            use_wavelet_for_correction=use_wavelet_for_correction,
             file_path=filepath,
         )
         return {"status": "OK", "result": result, "partial": None, "error": None}
@@ -141,6 +145,8 @@ def _process_file_cached(
             minima_search_window_V=minima_search_window_V,
             use_prominent_minima=use_prominent_minima,
             use_double_correction=use_double_correction,
+            compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+            use_wavelet_for_correction=use_wavelet_for_correction,
         )
         return {"status": "FAILED", "result": None, "partial": partial, "error": str(exc)}
 
@@ -187,6 +193,33 @@ def _run_correction_pass(
     }
 
 
+def _wavelet_denoise_trace(y: np.ndarray) -> np.ndarray:
+    signal = np.asarray(y, dtype=float)
+    if signal.size < 8:
+        return signal.copy()
+
+    pad = max(8, min(signal.size - 1, signal.size // 3))
+    padded = np.pad(signal, pad_width=pad, mode="reflect")
+    wavelet = "sym4"
+    max_level = pywt.dwt_max_level(len(padded), pywt.Wavelet(wavelet).dec_len)
+    level = max(1, min(4, max_level))
+    coeffs = pywt.wavedec(padded, wavelet=wavelet, mode="symmetric", level=level)
+    if len(coeffs) < 2:
+        return signal.copy()
+
+    sigma = np.median(np.abs(coeffs[-1])) / 0.6745 if len(coeffs[-1]) else 0.0
+    threshold = float(sigma * np.sqrt(2.0 * np.log(len(padded)))) if sigma > 0 else 0.0
+    denoised_coeffs = [coeffs[0]]
+    for detail in coeffs[1:]:
+        denoised_coeffs.append(pywt.threshold(detail, threshold, mode="soft"))
+
+    reconstructed = pywt.waverec(denoised_coeffs, wavelet=wavelet, mode="symmetric")
+    trimmed = np.asarray(reconstructed[pad:pad + signal.size], dtype=float)
+    if trimmed.size != signal.size:
+        trimmed = np.resize(trimmed, signal.shape)
+    return trimmed
+
+
 def analyze_swv_file(
     filepath: str,
     crop_range: Tuple[float, float] = (-0.6, -0.2),
@@ -200,6 +233,8 @@ def analyze_swv_file(
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
+    compute_wavelet_denoised_trace: bool = False,
+    use_wavelet_for_correction: bool = False,
 ) -> dict:
     file_mtime_ns, file_size = _file_signature(filepath)
     v_raw, i_raw = _load_filtered_arrays_cached(
@@ -222,6 +257,8 @@ def analyze_swv_file(
         min_peak_height_uA=min_peak_height_uA,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
+        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+        use_wavelet_for_correction=use_wavelet_for_correction,
         file_path=filepath,
     )
 
@@ -238,6 +275,8 @@ def analyze_swv_arrays(
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
+    compute_wavelet_denoised_trace: bool = False,
+    use_wavelet_for_correction: bool = False,
     file_path: Optional[str] = None,
 ) -> dict:
     mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
@@ -247,9 +286,19 @@ def analyze_swv_arrays(
         raise ValueError("Too few points after cropping.")
 
     i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
+    wavelet_denoised_current = (
+        _wavelet_denoise_trace(i)
+        if (compute_wavelet_denoised_trace or use_wavelet_for_correction)
+        else None
+    )
+    first_pass_input = (
+        wavelet_denoised_current
+        if use_wavelet_for_correction and wavelet_denoised_current is not None
+        else i_smooth
+    )
     first_pass = _run_correction_pass(
         v=v,
-        y_for_correction=i_smooth,
+        y_for_correction=first_pass_input,
         smooth_window=smooth_window,
         smooth_polyorder=smooth_polyorder,
         minima_search_window_V=minima_search_window_V,
@@ -301,6 +350,7 @@ def analyze_swv_arrays(
         "voltage": v,
         "raw_current": i,
         "smoothed_current": i_smooth,
+        "wavelet_denoised_current": wavelet_denoised_current,
         "corrected_current": y_corr,
         "smoothed_corrected_current": y_corr_smooth,
         "local_baseline": first_pass["local_baseline"],
@@ -348,6 +398,7 @@ def analyze_swv_arrays(
         "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
         "double_correction_requested": bool(use_double_correction),
         "double_correction_applied": bool(second_pass is not None),
+        "wavelet_correction_applied": bool(use_wavelet_for_correction and wavelet_denoised_current is not None),
         "double_correction_error": double_correction_error,
         "correction_passes": 2 if second_pass is not None else 1,
         "skew": skew_val,
@@ -365,8 +416,11 @@ def partial_traces_for_failure_arrays(
     minima_search_window_V: float,
     use_prominent_minima: bool,
     use_double_correction: bool,
+    compute_wavelet_denoised_trace: bool,
+    use_wavelet_for_correction: bool,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
+                wavelet_denoised_current=None,
                 smoothed_corrected_current=None,
                 corrected_current=None, local_baseline=None,
                 peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None,
@@ -395,6 +449,7 @@ def partial_traces_for_failure_arrays(
                 second_pass_minima_mode=None,
                 double_correction_requested=bool(use_double_correction),
                 double_correction_applied=False,
+                wavelet_correction_applied=False,
                 double_correction_error=None,
                 correction_passes=1)
     try:
@@ -407,10 +462,21 @@ def partial_traces_for_failure_arrays(
 
         i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
         base["smoothed_current"] = i_smooth
+        wavelet_denoised_current = (
+            _wavelet_denoise_trace(i)
+            if (compute_wavelet_denoised_trace or use_wavelet_for_correction)
+            else None
+        )
+        base["wavelet_denoised_current"] = wavelet_denoised_current
+        first_pass_input = (
+            wavelet_denoised_current
+            if use_wavelet_for_correction and wavelet_denoised_current is not None
+            else i_smooth
+        )
 
         first_pass = _run_correction_pass(
             v=v,
-            y_for_correction=i_smooth,
+            y_for_correction=first_pass_input,
             smooth_window=smooth_window,
             smooth_polyorder=smooth_polyorder,
             minima_search_window_V=minima_search_window_V,
@@ -477,6 +543,7 @@ def partial_traces_for_failure_arrays(
             ),
             "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
             "double_correction_applied": bool(second_pass is not None),
+            "wavelet_correction_applied": bool(use_wavelet_for_correction and wavelet_denoised_current is not None),
             "double_correction_error": double_correction_error,
             "correction_passes": 2 if second_pass is not None else 1,
             "partial_error": None,
@@ -565,6 +632,8 @@ def run_batch(
     scan_range: Optional[Tuple[int, int]] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
+    compute_wavelet_denoised_trace: bool = False,
+    use_wavelet_for_correction: bool = False,
     progress_callback=None,
 ) -> List[dict]:
     files = collect_swv_csvs_from_folders(folders)
@@ -657,6 +726,8 @@ def run_batch(
             min_peak_height_uA=min_peak_height_uA,
             compute_skew=compute_skew,
             compute_wavelet_energy=compute_wavelet_energy,
+            compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+            use_wavelet_for_correction=use_wavelet_for_correction,
         )
 
         if processed["status"] == "OK":
@@ -678,6 +749,7 @@ def run_batch(
                 "error": processed["error"],
                 **{k: partial.get(k) for k in (
                     "voltage", "raw_current", "smoothed_current",
+                    "wavelet_denoised_current",
                     "corrected_current", "smoothed_corrected_current",
                     "local_baseline", "partial_error",
                     "left_min_idx", "right_min_idx", "peak_idx", "peak_idx_corr",
@@ -693,6 +765,7 @@ def run_batch(
                     "second_pass_left_min_idx", "second_pass_right_min_idx",
                     "second_pass_left_local_min_candidates", "second_pass_right_local_min_candidates",
                     "second_pass_minima_mode", "double_correction_requested",
+                    "wavelet_correction_applied",
                     "double_correction_applied", "double_correction_error",
                     "correction_passes",
                 )},

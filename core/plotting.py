@@ -1317,6 +1317,11 @@ def plot_single_trace(result: dict) -> plt.Figure:
     labels = ["Raw", "Smoothed"]
     colors = ["steelblue", "darkorange"]
 
+    if result.get("wavelet_denoised_current") is not None:
+        keys.append("wavelet_denoised_current")
+        labels.append("Wavelet Denoised")
+        colors.append("mediumpurple")
+
     if use_prominent_minima:
         keys.append("inverted_smoothed_current")
         labels.append("Inverted Smoothed")
