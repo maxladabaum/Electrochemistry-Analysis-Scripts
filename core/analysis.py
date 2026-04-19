@@ -73,6 +73,10 @@ def load_swv_method_metadata(method_path: str) -> dict:
     frequency_hz = float(loop_match.group("frequency"))
     meta["swv_frequency_hz"] = frequency_hz
     meta["swv_method_group"] = _format_frequency_label(frequency_hz)
+    meta["swv_sweep_start_V"] = float(loop_match.group("start").rstrip("m"))
+    meta["swv_sweep_end_V"] = float(loop_match.group("end").rstrip("m"))
+    meta["swv_step_size_V"] = float(loop_match.group("step").rstrip("m"))
+    meta["swv_amplitude_V"] = float(loop_match.group("amplitude").rstrip("m"))
     return meta
 
 
@@ -709,6 +713,10 @@ def run_batch(
             method_exists=method_meta.get("method_exists"),
             swv_frequency_hz=method_meta.get("swv_frequency_hz"),
             swv_method_group=method_meta.get("swv_method_group"),
+            swv_sweep_start_V=method_meta.get("swv_sweep_start_V"),
+            swv_sweep_end_V=method_meta.get("swv_sweep_end_V"),
+            swv_step_size_V=method_meta.get("swv_step_size_V"),
+            swv_amplitude_V=method_meta.get("swv_amplitude_V"),
         )
 
         processed = _process_file_cached(

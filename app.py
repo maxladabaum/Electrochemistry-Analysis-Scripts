@@ -1989,6 +1989,7 @@ if view == "Export":
     else:
         export_keys = [
             "channel", "swv_method_group", "frequency_hz",
+            "swv_sweep_start_V", "swv_sweep_end_V", "swv_step_size_V", "swv_amplitude_V",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "timestamp", "file_name", "status",
             "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
