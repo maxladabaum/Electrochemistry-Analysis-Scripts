@@ -269,6 +269,8 @@ def annotate_swv_peak_height_metrics(
     compute_skew: bool,
     compute_wavelet_energy: bool,
 ) -> List[dict]:
+    background_drift_reference_scans = 3
+
     def _compute_trace_based_metrics(row: dict, trace_key: str) -> dict:
         voltage = row.get("voltage")
         trace = row.get(trace_key)
@@ -326,6 +328,10 @@ def annotate_swv_peak_height_metrics(
             row["peak_current_corrected"] = row.get("peak_current", np.nan)
             row["peak_current_smoothed_corrected"] = np.nan
             row["peak_current_selected"] = row.get(selected_peak_height_source, row.get("peak_current", np.nan))
+            row["background_drift_rms_reference"] = np.nan
+            row["background_drift_fraction"] = np.nan
+            row["background_drift_percent"] = np.nan
+            row["peak_current_background_drift_corrected"] = np.nan
             continue
 
         corrected_metrics = _compute_trace_based_metrics(row, "corrected_current")
@@ -355,6 +361,52 @@ def annotate_swv_peak_height_metrics(
                 row[key] = selected_metrics[key]
 
         row["peak_current_selected"] = selected_metrics.get("peak_current", row.get("peak_current", np.nan))
+
+    ref_candidates_by_channel: Dict[int, List[float]] = {}
+    sorted_results = sorted(results, key=lambda r: (r.get("channel", -1), r.get("scan_number", np.inf)))
+    for row in sorted_results:
+        if row.get("status") != "OK":
+            continue
+        ch = row.get("channel")
+        bg = row.get("background_current_rms")
+        if ch is None or bg is None or not np.isfinite(bg):
+            continue
+        ref_candidates_by_channel.setdefault(int(ch), [])
+        if len(ref_candidates_by_channel[int(ch)]) < background_drift_reference_scans:
+            ref_candidates_by_channel[int(ch)].append(float(bg))
+
+    ref_by_channel = {
+        ch: float(np.median(vals))
+        for ch, vals in ref_candidates_by_channel.items()
+        if vals and np.all(np.isfinite(vals))
+    }
+
+    for row in results:
+        ch = row.get("channel")
+        ref = ref_by_channel.get(int(ch)) if ch is not None else None
+        bg = row.get("background_current_rms")
+        peak_selected = row.get("peak_current_selected")
+        row["background_drift_rms_reference"] = ref if ref is not None else np.nan
+        if (
+            row.get("status") == "OK"
+            and ref is not None
+            and np.isfinite(ref)
+            and abs(ref) > 1e-12
+            and bg is not None
+            and np.isfinite(bg)
+        ):
+            bg_norm = float(bg) / float(ref)
+            drift_fraction = bg_norm - 1.0
+            row["background_drift_fraction"] = drift_fraction
+            row["background_drift_percent"] = 100.0 * drift_fraction
+            if peak_selected is not None and np.isfinite(peak_selected) and abs(bg_norm) > 1e-12:
+                row["peak_current_background_drift_corrected"] = float(peak_selected) / bg_norm
+            else:
+                row["peak_current_background_drift_corrected"] = np.nan
+        else:
+            row["background_drift_fraction"] = np.nan
+            row["background_drift_percent"] = np.nan
+            row["peak_current_background_drift_corrected"] = np.nan
 
     compute_drift_fields(results)
 
@@ -1093,6 +1145,7 @@ if analysis_mode == "SWV":
     peak_source_label = st.radio(
         "SWV peak height source",
         options=list(peak_height_source_options.keys()),
+        index=1,
         horizontal=True,
         key="swv_peak_height_source_label",
         help=(
@@ -1132,11 +1185,14 @@ if analysis_mode == "CV":
 else:
     metric_cfg = {
         selected_peak_height_metric_label: ("peak_current_selected", selected_peak_height_ylabel),
+        "Background drift corrected peak": ("peak_current_background_drift_corrected", "Background-Drift-Corrected Peak (uA)"),
+        "Background drift (%)": ("background_drift_percent", "Background Drift (%)"),
         "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
         "Bracket width (V)":        ("bracket_width_V",  "Distance between left/right correction anchors (V)"),
         "Skew":                     ("skew",             "Skew (corrected trace)"),
         "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized, bracket-relative)"),
         "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
+        "Background metrics | RMS": ("background_current_rms", "Outside-Crop RMS (uA)"),
     }
     if not compute_skew:
         metric_cfg.pop("Skew", None)
@@ -1429,6 +1485,12 @@ if view == "Metrics":
         options=list(metric_cfg.keys()),
         default=list(metric_cfg.keys()),
     )
+    if analysis_mode == "SWV":
+        st.caption(
+            "Background RMS is computed as the RMS of the raw signal outside the selected crop window, "
+            "so the peak-analysis region is excluded by construction. Background drift uses the median "
+            "background RMS of the first 3 valid scans in each channel as the reference."
+        )
     ch_options   = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
     ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel",
                                    help="Selecting one channel dims the others.")
@@ -1816,9 +1878,10 @@ if view == "Data Table":
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "file_name", "status",
-            "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
+            "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected", "peak_current", "peak_current_smoothed_corrected",
             "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
+            "background_current_rms", "background_drift_rms_reference", "background_drift_percent",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
     df = pd.DataFrame([{k: r.get(k) for k in scalar_keys} for r in results])
@@ -1992,9 +2055,10 @@ if view == "Export":
             "swv_sweep_start_V", "swv_sweep_end_V", "swv_step_size_V", "swv_amplitude_V",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "timestamp", "file_name", "status",
-            "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
+            "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected", "peak_current", "peak_current_smoothed_corrected",
             "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
+            "background_current_rms", "background_drift_rms_reference", "background_drift_percent",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
     csv_rows = []

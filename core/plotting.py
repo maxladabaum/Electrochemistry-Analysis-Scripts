@@ -66,13 +66,11 @@ def _cmap_fig(
         ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
 
     for i, r in enumerate(results):
-
         if r.get(y_key) is None or r.get("voltage") is None:
 
             continue
 
         color = cmap(norm(i))
-
         ax.plot(r["voltage"], r[y_key], color=color, lw=linewidth, alpha=alpha)
 
 
@@ -569,7 +567,6 @@ def plot_overlaid_traces(
     show_minima_candidates: bool = False,
 
 ) -> Optional[plt.Figure]:
-
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
 
     if not usable:

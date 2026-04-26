@@ -241,6 +241,14 @@ Peak current  = I_corr[k_peak,corr]
 
 So the app uses the first-pass peak only to place the baseline anchors, but the final reported peak position and peak height come from the baseline-corrected trace.
 
+If the SWV peak source is set to `Corrected + smoothed`, then the reported peak height instead uses:
+
+```text
+Peak current_selected = I_corr_smooth[k_peak,corr]
+```
+
+In that mode, the same selected trace basis is also used for the derived SWV metrics that depend on the final peak location.
+
 ### 8. Interpretation
 
 If the measured signal is thought of as
@@ -274,6 +282,82 @@ The parameter `minima_search_window_V` changes the allowed regions `L` and `R`:
 
 - Smaller values force the minima to be closer to the peak, making the correction more local but also more sensitive to noise or shoulders.
 - Larger values allow the minima to be farther from the peak, which can be more stable but may span a region where the true baseline is less linear.
+
+## Background drift metric
+
+The app also computes a simple peak-excluded background metric from the full raw trace. Let the crop window be:
+
+```text
+v_min <= v <= v_max
+```
+
+and let the full raw current be:
+
+```text
+I_raw = {I_k}
+```
+
+Define the outside-crop index set:
+
+```text
+O = {k : v_k < v_min or v_k > v_max}
+```
+
+Then the background RMS is:
+
+```text
+Background RMS = sqrt( mean( I_k^2 ) over k in O )
+```
+
+or equivalently:
+
+```text
+Background RMS = sqrt( (1 / |O|) * sum_{k in O} I_k^2 )
+```
+
+This metric is intentionally computed outside the SWV crop window so the peak-analysis region does not directly drive the background estimate.
+
+## Background drift correction
+
+For each channel, the app uses the median background RMS of the first 3 valid scans as the reference:
+
+```text
+R_ref = median(R_1, R_2, R_3)
+```
+
+where `R_t` is the background RMS at scan `t` for that channel.
+
+The normalized background level is:
+
+```text
+R_norm(t) = R_t / R_ref
+```
+
+The background drift fraction is:
+
+```text
+D(t) = R_norm(t) - 1
+```
+
+and the background drift percent shown in the UI is:
+
+```text
+Background drift (%) = 100 * D(t)
+```
+
+If the selected SWV peak height is `P_selected(t)`, then the background-drift-corrected peak is:
+
+```text
+P_corr,bg(t) = P_selected(t) / R_norm(t)
+```
+
+or equivalently:
+
+```text
+P_corr,bg(t) = P_selected(t) * (R_ref / R_t)
+```
+
+This correction is an experimental normalization layer. It assumes that scan-to-scan changes in the outside-crop RMS act as a multiplicative background drift on the selected peak height.
 
 ## Using core modules directly (no UI)
 
