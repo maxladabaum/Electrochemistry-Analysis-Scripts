@@ -54,7 +54,10 @@ If you enable `Treat vline intervals as titration steps` in the sidebar, the app
 - Plateau values are estimated per channel and per metric using the median of the middle portion of each step.
 - Metric plots gain horizontal step plateaus, midpoint markers, and a smooth bridge through the step centers.
 - An optional Langmuir-style fit is drawn from plateau value vs. titration step index.
+- When the Langmuir fit is enabled, the app also exposes a Langmuir fit summary table / CSV with the fitted baseline, amplitude, saturation step, and apparent `Kd`.
 - The Data Table and Export tabs expose step-level titration summaries only when this mode is enabled.
+
+Because the current Langmuir x-axis is the titration step index rather than a physical concentration, the reported `Kd` is an apparent `Kd` in step-index units. If your steps map to known concentrations, you can convert or refit externally against that concentration axis.
 
 The plateau estimator trims a configurable fraction from both edges of each step before taking the median, which helps suppress transition scans immediately after an addition event.
 

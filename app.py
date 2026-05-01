@@ -20,6 +20,7 @@ import streamlit as st
 from scipy.stats import skew
 
 from core import (
+    build_titration_langmuir_summary_table,
     build_titration_step_table,
     compute_drift_fields,
     plot_cv_overlaid_cycles,
@@ -154,6 +155,36 @@ def collect_titration_rows(
     rows = []
     for label, (metric_key, ylabel) in metric_cfg.items():
         metric_rows = build_titration_step_table(
+            all_results,
+            metric=metric_key,
+            vlines=vlines,
+            channels=channels,
+            scan_range=scan_range,
+            edge_trim_fraction=edge_trim_fraction,
+        )
+        for row in metric_rows:
+            rows.append({
+                "metric_label": label,
+                "metric_key": metric_key,
+                "metric_ylabel": ylabel,
+                **row,
+            })
+    return rows
+
+
+def collect_langmuir_summary_rows(
+    all_results,
+    metric_cfg,
+    channels,
+    vlines,
+    scan_range,
+    edge_trim_fraction,
+):
+    rows = []
+    for label, (metric_key, ylabel) in metric_cfg.items():
+        if not supports_langmuir(metric_key):
+            continue
+        metric_rows = build_titration_langmuir_summary_table(
             all_results,
             metric=metric_key,
             vlines=vlines,
@@ -2082,6 +2113,47 @@ if view == "Data Table":
             else:
                 st.info("No titration steps with valid plateau data match the current filters.")
 
+        if fit_titration_langmuir:
+            st.markdown("#### Langmuir fit summary")
+            if not titration_ready:
+                st.info("Add at least two vertical lines inside the active scan range to build Langmuir fits.")
+            else:
+                langmuir_rows = collect_langmuir_summary_rows(
+                    filtered_results,
+                    metric_cfg=metric_cfg,
+                    channels=ch_filter,
+                    vlines=active_vlines,
+                    scan_range=plot_scan_range,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                )
+                if langmuir_rows:
+                    langmuir_df = pd.DataFrame([
+                        {
+                            "Metric": row["metric_label"],
+                            "Channel": row["channel"],
+                            "Fit status": row["langmuir_fit_status"],
+                            "Apparent Kd (step index)": row["langmuir_kd_step_index"],
+                            "Baseline": row["langmuir_baseline"],
+                            "Amplitude": row["langmuir_amplitude"],
+                            "Saturation step": row["saturation_step_index"],
+                            "Saturation plateau": row["saturation_plateau_value"],
+                            "Step count": row["step_count"],
+                            "Pre-sat steps": row["pre_saturation_step_count"],
+                            "Post-sat steps": row["post_saturation_step_count"],
+                            "Post-sat poly degree": row["post_saturation_polynomial_degree"],
+                            "Left marker @ sat": row["saturation_left_vline_label"],
+                            "Right marker @ sat": row["saturation_right_vline_label"],
+                        }
+                        for row in langmuir_rows
+                    ])
+                    st.dataframe(langmuir_df, use_container_width=True, height=220)
+                    st.caption(
+                        "Apparent Kd is reported in titration-step units because the current Langmuir x-axis "
+                        "uses step index as a proxy for concentration."
+                    )
+                else:
+                    st.info("No Langmuir fit summaries are available for the current filters.")
+
     if analysis_mode == "SWV":
         st.divider()
         st.markdown("#### Single-trace inspector")
@@ -2232,6 +2304,31 @@ if view == "Export":
                 )
             else:
                 st.info("No titration step rows are available for export with the current settings.")
+
+    if enable_titration_analysis and fit_titration_langmuir:
+        st.markdown("####  Langmuir fit summary CSV")
+        if not titration_ready:
+            st.info("Add at least two vertical lines inside the active scan range to export Langmuir fit summaries.")
+        else:
+            langmuir_export_rows = collect_langmuir_summary_rows(
+                results,
+                metric_cfg=metric_cfg,
+                channels=channels_display,
+                vlines=active_vlines,
+                scan_range=plot_scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+            )
+            if langmuir_export_rows:
+                langmuir_csv = pd.DataFrame(langmuir_export_rows).to_csv(index=False).encode()
+                st.download_button(
+                    "  Download langmuir_fit_summary.csv",
+                    data=langmuir_csv,
+                    file_name="swv_langmuir_fit_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.info("No Langmuir fit summary rows are available for export with the current settings.")
 
     st.divider()
 

@@ -12,6 +12,7 @@ from .processing import apply_smoothing, detect_dominant_peak, rotate_offset_usi
 from .analysis import analyze_swv_file, run_batch, compute_drift_fields
 from .cv_analysis import analyze_cv_file, compute_cv_drift_fields, run_cv_batch
 from .plotting import (
+    build_titration_langmuir_summary_table,
     build_titration_step_table,
     plot_overlaid_traces,
     plot_failed_traces,

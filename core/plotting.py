@@ -536,6 +536,89 @@ def _build_langmuir_hybrid_fit(x: np.ndarray, y: np.ndarray) -> Optional[dict]:
     }
 
 
+def build_titration_langmuir_summary_table(
+    all_results: List[dict],
+    metric: str,
+    vlines: Optional[List[Tuple[float, str]]],
+    channels: Optional[List[int]] = None,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+    edge_trim_fraction: float = 0.15,
+) -> List[dict]:
+    step_rows = build_titration_step_table(
+        all_results,
+        metric=metric,
+        vlines=vlines,
+        channels=channels,
+        scan_windows=scan_windows,
+        scan_range=scan_range,
+        edge_trim_fraction=edge_trim_fraction,
+    )
+    if not step_rows:
+        return []
+
+    rows: List[dict] = []
+    for ch in sorted({row["channel"] for row in step_rows}):
+        ch_steps = sorted(
+            [row for row in step_rows if row["channel"] == ch],
+            key=lambda row: row["step_index"],
+        )
+        if len(ch_steps) < 2:
+            continue
+
+        x = np.asarray([row["step_index"] for row in ch_steps], dtype=float)
+        y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
+        hybrid_fit = _build_langmuir_hybrid_fit(x, y)
+        if hybrid_fit is None:
+            continue
+
+        saturation_idx = hybrid_fit["saturation_idx"]
+        saturation_step = ch_steps[saturation_idx]
+        langmuir_params = hybrid_fit["langmuir_params"]
+        post_sat_poly = hybrid_fit["post_sat_poly"]
+
+        baseline = None
+        amplitude = None
+        kd_step_index = None
+        fit_status = "guide_only"
+        if langmuir_params is not None:
+            baseline = float(langmuir_params[0])
+            amplitude = float(langmuir_params[1])
+            kd_step_index = float(langmuir_params[2])
+            fit_status = "langmuir_only"
+
+        post_sat_poly_degree = None
+        if post_sat_poly is not None and saturation_idx < (len(ch_steps) - 1):
+            _, post_sat_poly_degree = post_sat_poly
+            fit_status = (
+                "langmuir_plus_post_sat_poly"
+                if langmuir_params is not None
+                else "guide_plus_post_sat_poly"
+            )
+
+        rows.append({
+            "channel": ch,
+            "metric_key": metric,
+            "fit_axis": "titration_step_index",
+            "fit_axis_note": "proxy_concentration",
+            "step_count": int(len(ch_steps)),
+            "pre_saturation_step_count": int(saturation_idx + 1),
+            "post_saturation_step_count": int(len(ch_steps) - saturation_idx - 1),
+            "saturation_step_index": float(hybrid_fit["saturation_x"]),
+            "saturation_plateau_value": float(hybrid_fit["saturation_y"]),
+            "saturation_left_vline_label": saturation_step["left_vline_label"],
+            "saturation_right_vline_label": saturation_step["right_vline_label"],
+            "langmuir_fit_used": bool(langmuir_params is not None),
+            "langmuir_fit_status": fit_status,
+            "langmuir_baseline": baseline,
+            "langmuir_amplitude": amplitude,
+            "langmuir_kd_step_index": kd_step_index,
+            "post_saturation_polynomial_degree": post_sat_poly_degree,
+        })
+
+    return rows
+
+
 # ---- public plot functions
 
 
@@ -1107,6 +1190,8 @@ def plot_titration_langmuir(
 
                     pre_sat_label = "Langmuir <= sat" if langmuir_params is not None else "guide <= sat"
                     fit_note = f"Ch{ch}: sat step {int(round(saturation_x))}, {pre_sat_label}"
+                    if langmuir_params is not None:
+                        fit_note += f", app. Kd {langmuir_params[2]:.3g} steps"
                     if post_sat_poly is not None and saturation_idx < (x.size - 1):
                         poly_model, poly_degree = post_sat_poly
                         x_dense = np.linspace(saturation_x, x.max(), 200)
