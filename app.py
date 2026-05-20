@@ -6,13 +6,15 @@ Run with:  python -m streamlit run app.py
 import bisect
 import io
 import json
+import math
 import os
 import subprocess
 import sys
 import zipfile
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 import pywt
@@ -285,12 +287,298 @@ def build_export_metadata(
     return metadata
 
 
+def _fig_to_image(fig: plt.Figure, dpi: int = 130) -> np.ndarray:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return plt.imread(buf)
+
+
+def _grid_dimensions(n_items: int, max_cols: int = 3) -> Tuple[int, int]:
+    if n_items <= 0:
+        return 0, 0
+    cols = min(max_cols, max(1, math.ceil(math.sqrt(n_items))))
+    rows = int(math.ceil(n_items / cols))
+    return rows, cols
+
+
+def build_plot_grid_page(
+    title: str,
+    plot_factories: List[Tuple[str, Callable[[], Optional[plt.Figure]]]],
+    max_cols: int = 3,
+    image_dpi: int = 130,
+) -> Optional[plt.Figure]:
+    images = []
+    for label, make_plot in plot_factories:
+        fig = make_plot()
+        if fig is None:
+            continue
+        images.append((label, _fig_to_image(fig, dpi=image_dpi)))
+
+    if not images:
+        return None
+
+    rows, cols = _grid_dimensions(len(images), max_cols=max_cols)
+    page_width = max(11.0, cols * 5.0)
+    page_height = max(8.5, rows * 4.2 + 0.6)
+    page, axes = plt.subplots(rows, cols, figsize=(page_width, page_height))
+    axes_arr = np.asarray(axes).reshape(-1)
+
+    for ax, (_label, image) in zip(axes_arr, images):
+        ax.imshow(image)
+        ax.axis("off")
+
+    for ax in axes_arr[len(images):]:
+        ax.axis("off")
+
+    page.suptitle(title, fontsize=15, fontweight="bold", y=0.995)
+    page.tight_layout(rect=(0, 0, 1, 0.975))
+    return page
+
+
+def build_export_pdf(
+    analysis_mode: str,
+    results: List[dict],
+    ok_results_by_channel: Dict[int, List[dict]],
+    channels: List[int],
+    metric_cfg: Dict[str, Tuple[str, str]],
+    drift_cfg: Dict[str, Tuple[str, str, str]],
+    active_vlines: List[Tuple[float, str]],
+    scan_range: Optional[Tuple[int, int]],
+    xlabel: str,
+    metrics_layout: str = "Combined",
+    drift_layout: str = "Combined",
+    highlight_metric_channel: Optional[int] = None,
+    highlight_drift_channel: Optional[int] = None,
+) -> bytes:
+    pdf_buf = io.BytesIO()
+
+    if analysis_mode == "CV":
+        raw_overlay_key = "raw_current"
+        fitted_overlay_key = "smoothed_current"
+        fitted_overlay_label = "Smoothed overlays"
+    else:
+        raw_overlay_key = "raw_current"
+        fitted_overlay_key = "smoothed_corrected_current"
+        fitted_overlay_label = "Smoothed corrected overlays"
+
+    with PdfPages(pdf_buf) as pdf:
+        raw_factories = []
+        fitted_factories = []
+        for ch in channels:
+            ch_res = ok_results_by_channel.get(ch, [])
+            if analysis_mode == "CV":
+                raw_factories.append((
+                    f"Ch{ch}",
+                    lambda ch=ch, ch_res=ch_res: plot_cv_overlaid_cycles(
+                        ch_res,
+                        y_key=raw_overlay_key,
+                        title=f"Ch{ch} raw",
+                        show_peak_markers=True,
+                        show_peak_reference_vlines=True,
+                    ),
+                ))
+                fitted_factories.append((
+                    f"Ch{ch}",
+                    lambda ch=ch, ch_res=ch_res: plot_cv_overlaid_cycles(
+                        ch_res,
+                        y_key=fitted_overlay_key,
+                        title=f"Ch{ch} smoothed",
+                        show_peak_markers=True,
+                        show_peak_reference_vlines=True,
+                    ),
+                ))
+            else:
+                raw_factories.append((
+                    f"Ch{ch}",
+                    lambda ch=ch, ch_res=ch_res: plot_overlaid_traces(
+                        ch_res,
+                        y_key=raw_overlay_key,
+                        title=f"Ch{ch} raw",
+                    ),
+                ))
+                fitted_factories.append((
+                    f"Ch{ch}",
+                    lambda ch=ch, ch_res=ch_res: plot_overlaid_traces(
+                        ch_res,
+                        y_key=fitted_overlay_key,
+                        title=f"Ch{ch} smoothed corrected",
+                        show_peak_markers=True,
+                        show_zero_baseline=True,
+                    ),
+                ))
+
+        for page_title, factories in (
+            ("Raw overlays by channel", raw_factories),
+            (fitted_overlay_label + " by channel", fitted_factories),
+        ):
+            page = build_plot_grid_page(page_title, factories, max_cols=3)
+            if page:
+                pdf.savefig(page, bbox_inches="tight")
+                plt.close(page)
+
+        metric_items = list(metric_cfg.items())
+        if metrics_layout == "Individual channels":
+            for label, (metric, ylabel) in metric_items:
+                factories = [
+                    (
+                        f"Ch{ch}",
+                        lambda metric=metric, ylabel=ylabel, label=label, ch=ch: plot_metric_vs_scan(
+                            results,
+                            metric=metric,
+                            channels=[ch],
+                            title=f"Ch{ch} | {label}",
+                            ylabel=ylabel,
+                            vlines=active_vlines,
+                            scan_range=scan_range,
+                            figsize=(5, 3),
+                            xlabel=xlabel,
+                        ),
+                    )
+                    for ch in channels
+                ]
+                page = build_plot_grid_page(f"Metrics | {label}", factories, max_cols=3)
+                if page:
+                    pdf.savefig(page, bbox_inches="tight")
+                    plt.close(page)
+        else:
+            factories = [
+                (
+                    label,
+                    lambda metric=metric, ylabel=ylabel, label=label: plot_metric_vs_scan(
+                        results,
+                        metric=metric,
+                        channels=channels,
+                        title=label,
+                        ylabel=ylabel,
+                        vlines=active_vlines,
+                        scan_range=scan_range,
+                        highlight_channel=highlight_metric_channel,
+                        xlabel=xlabel,
+                    ),
+                )
+                for label, (metric, ylabel) in metric_items
+            ]
+            page = build_plot_grid_page("Metrics", factories, max_cols=2)
+            if page:
+                pdf.savefig(page, bbox_inches="tight")
+                plt.close(page)
+
+        drift_items = list(drift_cfg.items())
+        if drift_layout == "Individual channels":
+            for label, (drift_key, ylabel, _caption) in drift_items:
+                factories = [
+                    (
+                        f"Ch{ch}",
+                        lambda drift_key=drift_key, ylabel=ylabel, label=label, ch=ch: plot_drift_vs_scan(
+                            results,
+                            drift_metric=drift_key,
+                            channels=[ch],
+                            title=f"Ch{ch} | {label}",
+                            ylabel=ylabel,
+                            vlines=active_vlines,
+                            scan_range=scan_range,
+                            figsize=(5, 3),
+                            xlabel=xlabel,
+                        ),
+                    )
+                    for ch in channels
+                ]
+                page = build_plot_grid_page(f"Drift | {label}", factories, max_cols=3)
+                if page:
+                    pdf.savefig(page, bbox_inches="tight")
+                    plt.close(page)
+        else:
+            factories = [
+                (
+                    label,
+                    lambda drift_key=drift_key, ylabel=ylabel, label=label: plot_drift_vs_scan(
+                        results,
+                        drift_metric=drift_key,
+                        channels=channels,
+                        title=label,
+                        ylabel=ylabel,
+                        vlines=active_vlines,
+                        scan_range=scan_range,
+                        highlight_channel=highlight_drift_channel,
+                        xlabel=xlabel,
+                    ),
+                )
+                for label, (drift_key, ylabel, _caption) in drift_items
+            ]
+            page = build_plot_grid_page("Drift", factories, max_cols=2)
+            if page:
+                pdf.savefig(page, bbox_inches="tight")
+                plt.close(page)
+
+    pdf_buf.seek(0)
+    return pdf_buf.getvalue()
+
+
 LANGMUIR_METRIC_KEY = "peak_current_selected"
 DEFAULT_SWV_VLINES_TEXT = ""
 
 
 def supports_langmuir(metric_key: str) -> bool:
     return metric_key == LANGMUIR_METRIC_KEY
+
+
+def build_drift_options(analysis_mode: str, compute_skew: bool = True) -> Dict[str, Tuple[str, str, str]]:
+    if analysis_mode == "CV":
+        return {
+            "Reduction peak drift (V)": (
+                "reduction_peak_voltage_drift",
+                "Reduction Peak Drift (V)",
+                "Shift in the reduction peak position relative to the first valid cycle.",
+            ),
+            "Oxidation peak drift (V)": (
+                "oxidation_peak_voltage_drift",
+                "Oxidation Peak Drift (V)",
+                "Shift in the oxidation peak position relative to the first valid cycle.",
+            ),
+            "Peak separation drift (V)": (
+                "peak_separation_drift",
+                "Peak Separation Drift (V)",
+                "Change in oxidation minus reduction peak spacing over time.",
+            ),
+            "Loop area drift": (
+                "loop_area_abs_drift",
+                "Loop Area Drift (uA*V)",
+                "Change in the enclosed CV loop area relative to the first valid cycle.",
+            ),
+        }
+
+    drift_options = {
+        "Peak voltage drift (V)": (
+            "peak_voltage_drift",
+            "Peak voltage (V)",
+            "Shift in peak position  indicates a change in the redox potential.",
+        ),
+        "Bracket width drift (V)": (
+            "bracket_width_drift",
+            "Bracket width (V)",
+            "Change in the distance between the left and right correction anchors.",
+        ),
+        "Background drift (%)": (
+            "background_drift_percent",
+            "Background Drift (%)",
+            "Percent change in outside-crop background RMS relative to the channel reference scans.",
+        ),
+        "Skew drift": (
+            "skew_drift",
+            "Skew",
+            "Change in corrected-trace asymmetry  sensitive to baseline shape changes.",
+        ),
+        "Peak offset (normalized) drift": (
+            "peak_offset_norm_drift",
+            "Peak offset (normalized)",
+            "Shift relative to the scan's own bracket center; pure whole-peak shifts can stay small.",
+        ),
+    }
+    if not compute_skew:
+        drift_options.pop("Skew drift", None)
+    return drift_options
 
 
 def annotate_swv_peak_height_metrics(
@@ -1812,44 +2100,10 @@ if view == "Drift":
         )
 
     dr_c1, dr_c2 = st.columns([3, 1])
-    if analysis_mode == "CV":
-        drift_options = {
-            "Reduction peak drift (V)": (
-                "reduction_peak_voltage_drift",
-                "Reduction Peak Drift (V)",
-                "Shift in the reduction peak position relative to the first valid cycle.",
-            ),
-            "Oxidation peak drift (V)": (
-                "oxidation_peak_voltage_drift",
-                "Oxidation Peak Drift (V)",
-                "Shift in the oxidation peak position relative to the first valid cycle.",
-            ),
-            "Peak separation drift (V)": (
-                "peak_separation_drift",
-                "Peak Separation Drift (V)",
-                "Change in oxidation minus reduction peak spacing over time.",
-            ),
-            "Loop area drift": (
-                "loop_area_abs_drift",
-                "Loop Area Drift (uA*V)",
-                "Change in the enclosed CV loop area relative to the first valid cycle.",
-            ),
-        }
-    else:
-        drift_options = {
-            "Peak voltage drift (V)": ("peak_voltage_drift", "Peak voltage (V)",
-                                       "Shift in peak position  indicates a change in the redox potential."),
-            "Bracket width drift (V)": ("bracket_width_drift", "Bracket width (V)",
-                                       "Change in the distance between the left and right correction anchors."),
-            "Background drift (%)": ("background_drift_percent", "Background Drift (%)",
-                                       "Percent change in outside-crop background RMS relative to the channel reference scans."),
-            "Skew drift":             ("skew_drift",         "Skew",
-                                       "Change in corrected-trace asymmetry  sensitive to baseline shape changes."),
-            "Peak offset (normalized) drift": ("peak_offset_norm_drift", "Peak offset (normalized)",
-                                       "Shift relative to the scan's own bracket center; pure whole-peak shifts can stay small."),
-        }
-        if not compute_skew:
-            drift_options.pop("Skew drift", None)
+    drift_options = build_drift_options(
+        analysis_mode,
+        compute_skew=compute_skew if analysis_mode == "SWV" else True,
+    )
 
     selected_drift = dr_c1.multiselect(
         "Drift metrics to display",
@@ -2332,6 +2586,52 @@ if view == "Export":
 
     st.divider()
 
+    drift_export_cfg = build_drift_options(
+        analysis_mode,
+        compute_skew=compute_skew if analysis_mode == "SWV" else True,
+    )
+
+    st.markdown("####  All plots PDF")
+    pdf_c1, pdf_c2 = st.columns(2)
+    pdf_metric_layout = pdf_c1.radio(
+        "Metrics pages",
+        ["Combined", "Individual channels"],
+        horizontal=True,
+        key="export_pdf_metric_layout",
+        help="Combined puts all selected channels in each metric plot. Individual channels creates one page per metric type with separate channel plots.",
+    )
+    pdf_drift_layout = pdf_c2.radio(
+        "Drift pages",
+        ["Combined", "Individual channels"],
+        horizontal=True,
+        key="export_pdf_drift_layout",
+        help="Combined puts all selected channels in each drift plot. Individual channels creates one page per drift type with separate channel plots.",
+    )
+
+    if st.button("  Build all plots PDF", use_container_width=True):
+        pdf_bytes = build_export_pdf(
+            analysis_mode=analysis_mode,
+            results=results,
+            ok_results_by_channel=ok_plot_results_by_channel,
+            channels=channels_display,
+            metric_cfg=metric_cfg,
+            drift_cfg=drift_export_cfg,
+            active_vlines=active_vlines,
+            scan_range=plot_scan_range,
+            xlabel=x_axis_label,
+            metrics_layout=pdf_metric_layout,
+            drift_layout=pdf_drift_layout,
+        )
+        st.download_button(
+            "  Download all_plots.pdf",
+            data=pdf_bytes,
+            file_name="cv_all_plots.pdf" if analysis_mode == "CV" else "swv_all_plots.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.divider()
+
     st.markdown("####  Figures ZIP")
     fig_format = st.selectbox("Format", ["png", "pdf", "svg"], index=0)
     fig_dpi    = st.slider("DPI (PNG only)", 72, 300, 150)
@@ -2386,23 +2686,7 @@ if view == "Export":
                         if fig:
                             _save(fig, f"titration/langmuir/{metric}.{fig_format}")
 
-            if analysis_mode == "CV":
-                drift_exports = (
-                    ("reduction_peak_voltage_drift", "Reduction Peak Drift (V)", "Reduction peak drift"),
-                    ("oxidation_peak_voltage_drift", "Oxidation Peak Drift (V)", "Oxidation peak drift"),
-                    ("peak_separation_drift", "Peak Separation Drift (V)", "Peak separation drift"),
-                    ("loop_area_abs_drift", "Loop Area Drift (uA*V)", "Loop area drift"),
-                )
-            else:
-                drift_exports = (
-                    ("peak_voltage_drift", "Peak voltage (V)", "Peak voltage drift"),
-                    ("bracket_width_drift", "Bracket width (V)", "Bracket width drift"),
-                    ("background_drift_percent", "Background Drift (%)", "Background drift (%)"),
-                    ("skew_drift",         "Skew",             "Skew drift"),
-                    ("peak_offset_norm_drift", "Peak offset (normalized)", "Peak offset (normalized) drift"),
-                )
-
-            for dk, ylabel, title in drift_exports:
+            for title, (dk, ylabel, _caption) in drift_export_cfg.items():
                 fig = plot_drift_vs_scan(results, drift_metric=dk, channels=channels_display,
                                          title=title, ylabel=ylabel,
                                          vlines=active_vlines, scan_range=plot_scan_range, xlabel=x_axis_label)
