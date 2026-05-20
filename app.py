@@ -4,6 +4,7 @@ Run with:  python -m streamlit run app.py
 """
 
 import io
+import math
 import os
 import subprocess
 import sys
@@ -11,8 +12,10 @@ import zipfile
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
+from matplotlib.backends.backend_pdf import PdfPages
 
 from core import (
     build_titration_step_table,
@@ -124,6 +127,154 @@ def collect_titration_rows(
                 **row,
             })
     return rows
+
+
+def _chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size], (i // size) + 1
+
+
+def _make_grid(n_items: int, max_cols: int = 3):
+    cols = min(max_cols, max(n_items, 1))
+    rows = int(math.ceil(max(n_items, 1) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5.2 * cols, 3.6 * rows), squeeze=False)
+    return fig, axes.flatten()
+
+
+def _filtered_results_for_channel(results, ch, scan_range=None):
+    ch_res = [r for r in results if r.get("status") == "OK" and r.get("channel") == ch]
+    if scan_range:
+        ch_res = [r for r in ch_res if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+    return sorted(ch_res, key=lambda r: r["scan_number"])
+
+
+def _add_vlines_to_axis(ax, vlines, scan_range=None, y_frac: float = 0.85):
+    if not vlines:
+        return
+    for x, label in vlines:
+        if scan_range and not (scan_range[0] <= x <= scan_range[1]):
+            continue
+        ax.axvline(x=x, color="gray", linestyle="--", alpha=0.45, lw=0.8)
+        ax.text(
+            x, y_frac, label,
+            rotation=90, va="center", ha="center",
+            transform=ax.get_xaxis_transform(),
+            fontsize=6, color="gray",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=1.0),
+        )
+
+
+def _plot_overlay_grid_page(
+    results,
+    channels,
+    y_key,
+    title,
+    ylabel="Current (uA)",
+    colormap_name="plasma",
+    scan_range=None,
+):
+    fig, axes = _make_grid(len(channels), max_cols=3)
+    for ax, ch in zip(axes, channels):
+        ch_res = _filtered_results_for_channel(results, ch, scan_range=scan_range)
+        usable = [r for r in ch_res if r.get(y_key) is not None and r.get("voltage") is not None]
+        cmap = plt.get_cmap(colormap_name, max(len(usable), 2))
+        for i, r in enumerate(usable):
+            denom = max(len(usable) - 1, 1)
+            ax.plot(r["voltage"], r[y_key], color=cmap(i / denom), lw=0.65, alpha=0.85)
+        if y_key in ("corrected_current", "smoothed_corrected_current"):
+            ax.axhline(0, color="gray", lw=0.7, linestyle="--", alpha=0.6)
+        ax.set_title(f"Ch{ch} ({len(usable)} traces)", fontsize=10)
+        ax.set_xlabel("Voltage (V)", fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(False)
+    for ax in axes[len(channels):]:
+        ax.set_visible(False)
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def _plot_combined_metric_page(
+    results,
+    metric_items,
+    channels,
+    title,
+    vlines=None,
+    scan_range=None,
+    drift=False,
+):
+    fig, axes = _make_grid(len(metric_items), max_cols=2)
+    all_ch = sorted({r["channel"] for r in results})
+    channels = [ch for ch in channels if ch in all_ch]
+    cmap = plt.get_cmap("tab10")
+    colors = {ch: cmap(i % 10) for i, ch in enumerate(all_ch)}
+
+    for ax, (label, metric, ylabel) in zip(axes, metric_items):
+        if drift:
+            ax.axhline(0, color="gray", lw=0.8, linestyle="--", alpha=0.55)
+        plotted = False
+        for ch in channels:
+            ch_res = _filtered_results_for_channel(results, ch, scan_range=scan_range)
+            x = [r["scan_number"] for r in ch_res]
+            y = [r.get(metric, np.nan) for r in ch_res]
+            if not x or all(np.isnan(v) for v in y):
+                continue
+            ax.plot(x, y, marker="o", ms=2.4, lw=1.1, color=colors[ch], alpha=0.9, label=f"Ch{ch}")
+            plotted = True
+        ax.set_title(label, fontsize=10)
+        ax.set_xlabel("Scan number", fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.tick_params(labelsize=7)
+        _add_vlines_to_axis(ax, vlines, scan_range=scan_range)
+        if scan_range:
+            ax.set_xlim(scan_range)
+        if plotted:
+            ax.legend(title="Channel", loc="best", fontsize=6, title_fontsize=7)
+    for ax in axes[len(metric_items):]:
+        ax.set_visible(False)
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return fig
+
+
+def _plot_individual_metric_pages(
+    pdf,
+    results,
+    metric_items,
+    channels,
+    title_prefix,
+    vlines=None,
+    scan_range=None,
+    drift=False,
+    channels_per_page=12,
+):
+    for label, metric, ylabel in metric_items:
+        pages = list(_chunked(channels, channels_per_page))
+        for page_channels, page_num in pages:
+            fig, axes = _make_grid(len(page_channels), max_cols=3)
+            for ax, ch in zip(axes, page_channels):
+                ch_res = _filtered_results_for_channel(results, ch, scan_range=scan_range)
+                x = [r["scan_number"] for r in ch_res]
+                y = [r.get(metric, np.nan) for r in ch_res]
+                if drift:
+                    ax.axhline(0, color="gray", lw=0.8, linestyle="--", alpha=0.55)
+                if x and not all(np.isnan(v) for v in y):
+                    ax.plot(x, y, marker="o", ms=2.5, lw=1.2, color="tab:blue", alpha=0.9)
+                ax.set_title(f"Ch{ch}", fontsize=10)
+                ax.set_xlabel("Scan number", fontsize=8)
+                ax.set_ylabel(ylabel, fontsize=8)
+                ax.tick_params(labelsize=7)
+                _add_vlines_to_axis(ax, vlines, scan_range=scan_range)
+                if scan_range:
+                    ax.set_xlim(scan_range)
+            for ax in axes[len(page_channels):]:
+                ax.set_visible(False)
+            suffix = f" page {page_num}" if len(pages) > 1 else ""
+            fig.suptitle(f"{title_prefix}: {label}{suffix}", fontsize=14)
+            fig.tight_layout(rect=(0, 0, 1, 0.96))
+            pdf.savefig(fig)
+            plt.close(fig)
 
 
 # 
@@ -919,6 +1070,120 @@ if view == "Export":
                 )
             else:
                 st.info("No titration step rows are available for export with the current settings.")
+
+    st.divider()
+
+    st.markdown("####  Report PDF")
+    pdf_c1, pdf_c2 = st.columns([2, 1])
+    pdf_metric_layout = pdf_c1.radio(
+        "Metrics and drift layout",
+        ["Combined summary pages", "Individual channel grids"],
+        horizontal=True,
+        help=(
+            "Combined uses one page for all metrics and one page for all drift plots. "
+            "Individual channel grids creates per-metric/per-drift channel-grid pages."
+        ),
+    )
+    pdf_cmap = pdf_c2.selectbox(
+        "Overlay colour map",
+        ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
+        key="report_pdf_cmap",
+    )
+
+    drift_export_items = [
+        ("Peak voltage drift (V)", "peak_voltage_drift", "Peak voltage (V)"),
+    ]
+    if compute_skew:
+        drift_export_items.extend([
+            ("Skew drift", "skew_drift", "Skew"),
+            ("Peak offset (normalized) drift", "peak_offset_norm_drift", "Peak offset (normalized)"),
+        ])
+    metric_export_items = [
+        (label, metric, ylabel)
+        for label, (metric, ylabel) in metric_cfg.items()
+    ]
+
+    if st.button("  Build report PDF", use_container_width=True):
+        pdf_buf = io.BytesIO()
+        with PdfPages(pdf_buf) as pdf:
+            for page_channels, page_num in _chunked(channels_display, 12):
+                page_suffix = f" page {page_num}" if len(channels_display) > 12 else ""
+                fig = _plot_overlay_grid_page(
+                    results,
+                    channels=page_channels,
+                    y_key="raw_current",
+                    title=f"Raw overlays by channel{page_suffix}",
+                    colormap_name=pdf_cmap,
+                    scan_range=scan_range,
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            for page_channels, page_num in _chunked(channels_display, 12):
+                page_suffix = f" page {page_num}" if len(channels_display) > 12 else ""
+                fig = _plot_overlay_grid_page(
+                    results,
+                    channels=page_channels,
+                    y_key="smoothed_corrected_current",
+                    title=f"Smoothed fitted overlays by channel{page_suffix}",
+                    colormap_name=pdf_cmap,
+                    scan_range=scan_range,
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            if pdf_metric_layout == "Combined summary pages":
+                fig = _plot_combined_metric_page(
+                    results,
+                    metric_items=metric_export_items,
+                    channels=channels_display,
+                    title="Metrics by scan",
+                    vlines=vlines,
+                    scan_range=scan_range,
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+
+                fig = _plot_combined_metric_page(
+                    results,
+                    metric_items=drift_export_items,
+                    channels=channels_display,
+                    title="Drift by scan",
+                    vlines=vlines,
+                    scan_range=scan_range,
+                    drift=True,
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+            else:
+                _plot_individual_metric_pages(
+                    pdf,
+                    results,
+                    metric_items=metric_export_items,
+                    channels=channels_display,
+                    title_prefix="Metrics by channel",
+                    vlines=vlines,
+                    scan_range=scan_range,
+                )
+                _plot_individual_metric_pages(
+                    pdf,
+                    results,
+                    metric_items=drift_export_items,
+                    channels=channels_display,
+                    title_prefix="Drift by channel",
+                    vlines=vlines,
+                    scan_range=scan_range,
+                    drift=True,
+                )
+
+        pdf_buf.seek(0)
+        st.download_button(
+            "  Download report.pdf",
+            data=pdf_buf,
+            file_name="swv_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
     st.divider()
 
