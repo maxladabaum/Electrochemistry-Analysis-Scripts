@@ -1697,6 +1697,19 @@ def _plot_traces(
                 f"Ch {channel}" if channel != "Unknown" else "Unknown channel"
                 for channel in selected_channels
             )
+        params = observation.get("params") or {}
+        parameter_text = (
+            f"Frequency={float(params['frequency']):g} Hz"
+            if params.get("frequency") is not None else "Frequency=unknown"
+        )
+        parameter_text += (
+            f" | Step size={float(params['step_potential']):g} V"
+            if params.get("step_potential") is not None else " | Step size=unknown"
+        )
+        parameter_text += (
+            f" | Amplitude={float(params['amplitude']):g} V"
+            if params.get("amplitude") is not None else " | Amplitude=unknown"
+        )
         ax.set(
             xlabel="Voltage (V)", ylabel="Current (uA)",
             title=(
@@ -1704,6 +1717,7 @@ def _plot_traces(
                 f"{'smoothed corrected' if corrected else 'raw'} SWV traces"
                 f"{channel_title}"
                 f"{f' ({correction_label})' if corrected else ''}"
+                f"\n{parameter_text}"
             ),
         )
         ax.grid(alpha=.25)
