@@ -45,6 +45,7 @@ from core.processing import (
     rotate_offset_using_bracketing_minima,
     rotate_offset_using_prominent_bracketing_minima,
 )
+from bo_session_viewer import render_bo_session_app
 
 
 def _pick_folder_windows() -> str:
@@ -1340,10 +1341,16 @@ for k, v in dict(
 with st.sidebar:
     analysis_mode = st.radio(
         "Analysis mode",
-        ["SWV", "CV"],
+        ["SWV", "CV", "BO Session"],
         horizontal=True,
-        help="SWV keeps the current workflow. CV adds a lighter electrochemical cycle analysis path.",
+        help="Analyze SWV/CV data or inspect a saved Bayesian-optimization session.",
     )
+
+if analysis_mode == "BO Session":
+    render_bo_session_app()
+    st.stop()
+
+with st.sidebar:
     st.title("⚡ SWV Analysis" if analysis_mode == "SWV" else "⚡ CV Analysis")
     st.divider()
 
