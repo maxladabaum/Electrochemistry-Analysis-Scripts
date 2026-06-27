@@ -906,7 +906,16 @@ def _pdf_text_page(pdf: PdfPages, title: str, lines: list[str]) -> None:
 def _pdf_save(pdf: PdfPages, fig, title: str | None = None) -> None:
     if title and fig.axes:
         fig.suptitle(title, fontsize=13, y=.995)
-    fig.tight_layout(rect=(0, .035, 1, .97) if title else (0, .035, 1, 1))
+    parameter_context = getattr(pdf, "_bo_parameter_context", "")
+    if parameter_context:
+        fig.text(
+            .01, .023,
+            f"BO parameter context: {parameter_context}",
+            fontsize=5,
+            va="bottom",
+            wrap=True,
+        )
+    fig.tight_layout(rect=(0, .05, 1, .97) if title else (0, .05, 1, 1))
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
@@ -918,6 +927,43 @@ def _pdf_equation_footer(fig, label: str, equation: str) -> None:
 
 def _has_numeric_variation(values) -> bool:
     return pd.to_numeric(pd.Series(values), errors="coerce").dropna().nunique() > 1
+
+
+def _session_parameter_context(observations: list[dict]) -> str:
+    labels = {
+        "begin_potential": "begin",
+        "end_potential": "end",
+        "step_potential": "step",
+        "amplitude": "amp",
+        "frequency": "freq",
+        "conditioning_potential": "cond E",
+        "conditioning_time": "cond t",
+    }
+    units = {
+        "begin_potential": "V",
+        "end_potential": "V",
+        "step_potential": "V",
+        "amplitude": "V",
+        "frequency": "Hz",
+        "conditioning_potential": "V",
+        "conditioning_time": "s",
+    }
+    parts = []
+    for parameter in PARAMETERS:
+        values = sorted({
+            float((observation.get("params") or {})[parameter])
+            for observation in observations
+            if (observation.get("params") or {}).get(parameter) is not None
+        })
+        if not values:
+            continue
+        value_text = (
+            f"{values[0]:g}"
+            if len(values) == 1
+            else f"{values[0]:g}–{values[-1]:g}"
+        )
+        parts.append(f"{labels[parameter]}={value_text} {units[parameter]}")
+    return " | ".join(parts)
 
 
 def _pdf_metric_landscapes(
@@ -1084,8 +1130,21 @@ def _pdf_surrogate_iteration(
     path: Path,
     objective_equation_label: str,
     objective_equation: str,
+    observations: list[dict],
 ) -> None:
     predictions = pd.read_csv(path)
+    current_observation = next(
+        (
+            observation for observation in observations
+            if int(observation.get("iteration", 0)) == artifact_iteration
+        ),
+        None,
+    )
+    parameter_text = _iteration_parameter_text(current_observation)
+    tested = [
+        observation for observation in observations
+        if int(observation.get("iteration", 0)) <= artifact_iteration
+    ]
     dimensions = [
         name for name in PARAMETERS
         if name in predictions.columns and predictions[name].nunique(dropna=True) > 1
@@ -1105,6 +1164,19 @@ def _pdf_surrogate_iteration(
             ax.scatter(predictions[parameter], predictions[value_key], s=7, alpha=.3)
             grouped = predictions.groupby(parameter)[value_key].median()
             ax.plot(grouped.index, grouped.values, color="#d67b32")
+            tested_for_axis = [
+                observation for observation in tested
+                if (observation.get("params") or {}).get(parameter) is not None
+            ]
+            if tested_for_axis:
+                ax.plot(
+                    [observation["params"][parameter] for observation in tested_for_axis],
+                    [observation.get("Q_run", np.nan) for observation in tested_for_axis],
+                    color="#d67b32",
+                    marker="o",
+                    linewidth=1.2,
+                    label="tested parameter sets",
+                )
             ax.set(xlabel=parameter, ylabel=value_key)
             ax.grid(alpha=.2)
         for ax in axes.flat[len(dimensions):]:
@@ -1112,21 +1184,55 @@ def _pdf_surrogate_iteration(
         _pdf_equation_footer(fig, objective_equation_label, objective_equation)
         _pdf_save(
             pdf, fig,
-            f"Surrogate iteration {artifact_iteration} — {value_key}",
+            f"Surrogate iteration {artifact_iteration} — {value_key}\n{parameter_text}",
         )
         pairs = list(itertools.combinations(dimensions, 2))
         for start in range(0, len(pairs), 4):
             page_pairs = pairs[start:start + 4]
             map_fig, map_axes = plt.subplots(2, 2, figsize=(8.5, 8), squeeze=False)
             for ax, (x_name, y_name) in zip(map_axes.flat, page_pairs):
-                scatter = ax.scatter(
-                    predictions[x_name],
-                    predictions[y_name],
-                    c=predictions[value_key],
-                    cmap="viridis",
-                    s=8,
-                    alpha=.55,
-                )
+                try:
+                    scatter = ax.tricontourf(
+                        predictions[x_name],
+                        predictions[y_name],
+                        predictions[value_key],
+                        levels=14,
+                        cmap="viridis",
+                    )
+                    ax.tricontour(
+                        predictions[x_name],
+                        predictions[y_name],
+                        predictions[value_key],
+                        levels=14,
+                        colors="white",
+                        linewidths=.25,
+                        alpha=.5,
+                    )
+                except Exception:
+                    scatter = ax.scatter(
+                        predictions[x_name],
+                        predictions[y_name],
+                        c=predictions[value_key],
+                        cmap="viridis",
+                        s=8,
+                        alpha=.55,
+                    )
+                tested_for_axes = [
+                    observation for observation in tested
+                    if all(
+                        (observation.get("params") or {}).get(axis) is not None
+                        for axis in (x_name, y_name)
+                    )
+                ]
+                if tested_for_axes:
+                    ax.plot(
+                        [observation["params"][x_name] for observation in tested_for_axes],
+                        [observation["params"][y_name] for observation in tested_for_axes],
+                        color="#d67b32",
+                        marker="o",
+                        linewidth=1.3,
+                        markersize=4,
+                    )
                 ax.set(xlabel=x_name, ylabel=y_name)
                 map_fig.colorbar(scatter, ax=ax, shrink=.75)
             for ax in map_axes.flat[len(page_pairs):]:
@@ -1137,7 +1243,8 @@ def _pdf_surrogate_iteration(
             _pdf_save(
                 pdf,
                 map_fig,
-                f"Surrogate iteration {artifact_iteration} — {value_key} — 2D maps",
+                f"Surrogate iteration {artifact_iteration} — {value_key} — 2D maps\n"
+                f"{parameter_text}",
             )
         for x_name, y_name, z_name in itertools.combinations(dimensions, 3):
             tensor_fig = plt.figure(figsize=(8, 6))
@@ -1152,6 +1259,23 @@ def _pdf_surrogate_iteration(
                 alpha=.4,
             )
             tensor_ax.set(xlabel=x_name, ylabel=y_name, zlabel=z_name)
+            tested_for_axes = [
+                observation for observation in tested
+                if all(
+                    (observation.get("params") or {}).get(axis) is not None
+                    for axis in (x_name, y_name, z_name)
+                )
+            ]
+            if tested_for_axes:
+                tensor_ax.plot(
+                    [observation["params"][x_name] for observation in tested_for_axes],
+                    [observation["params"][y_name] for observation in tested_for_axes],
+                    [observation["params"][z_name] for observation in tested_for_axes],
+                    color="#d67b32",
+                    marker="o",
+                    linewidth=1.3,
+                    markersize=4,
+                )
             tensor_fig.colorbar(
                 tensor_scatter,
                 ax=tensor_ax,
@@ -1164,7 +1288,8 @@ def _pdf_surrogate_iteration(
             _pdf_save(
                 pdf,
                 tensor_fig,
-                f"Surrogate iteration {artifact_iteration} — {value_key} — 3D tensor",
+                f"Surrogate iteration {artifact_iteration} — {value_key} — 3D tensor\n"
+                f"{parameter_text}",
             )
 
 
@@ -1188,6 +1313,7 @@ def build_bo_session_pdf(
     best = observations[int(np.nanargmax(q_values))]
     output = BytesIO()
     with PdfPages(output) as pdf:
+        pdf._bo_parameter_context = _session_parameter_context(observations)
         _pdf_text_page(pdf, "Bayesian Optimization Session Report", [
             f"Session: {session['state'].get('session_id', session['root'].name)}",
             f"Objective: {'Paired response' if paired else 'Standard quality'}",
@@ -1487,6 +1613,7 @@ def build_bo_session_pdf(
                     artifact_path,
                     objective_equation_label,
                     objective_equation,
+                    observations,
                 )
     return output.getvalue()
 
@@ -2056,6 +2183,22 @@ def _observed_points(session: dict, iteration: int, axes: list[str]):
     return rows
 
 
+def _iteration_parameter_text(observation: dict | None) -> str:
+    params = (observation or {}).get("params") or {}
+    parts = []
+    for label, key, unit in (
+        ("Frequency", "frequency", "Hz"),
+        ("Step size", "step_potential", "V"),
+        ("Amplitude", "amplitude", "V"),
+    ):
+        value = params.get(key)
+        try:
+            parts.append(f"{label}={float(value):g} {unit}")
+        except (TypeError, ValueError):
+            parts.append(f"{label}=unknown")
+    return " | ".join(parts)
+
+
 def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: str, view: str,
                     x_name: str, y_name: str | None, z_name: str | None):
     if view == "3D tensor":
@@ -2095,12 +2238,27 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         if len(grouped) > 1:
             ax.plot(grouped.index, grouped.values, color="#d67b32", label="median at X")
         observed = _observed_points(session, iteration, [x_name])
-        if observed and value == "predicted_mean_Q":
-            ax.scatter([obs["params"][x_name] for obs in observed], [obs["Q_run"] for obs in observed],
-                       color="#d67b32", label="observed Q_run")
+        if observed:
+            observed_x = [obs["params"][x_name] for obs in observed]
+            observed_q = [obs["Q_run"] for obs in observed]
+            ax.plot(
+                observed_x, observed_q,
+                color="#d67b32", marker="o", linewidth=1.4,
+                label="tested parameter sets",
+            )
         ax.set(xlabel=x_name, ylabel=value)
         ax.legend()
-    ax.set_title(f"{view} | {value} | artifact iteration {iteration}")
+    current_observation = next(
+        (
+            observation for observation in session["observations"]
+            if int(observation.get("iteration", 0)) == int(iteration)
+        ),
+        None,
+    )
+    ax.set_title(
+        f"{view} | {value} | artifact iteration {iteration}\n"
+        f"{_iteration_parameter_text(current_observation)}"
+    )
     ax.grid(alpha=.2)
     fig.tight_layout()
     return fig
