@@ -46,6 +46,8 @@ from core.processing import (
     rotate_offset_using_prominent_bracketing_minima,
 )
 from bo_session_viewer import render_bo_session_app
+from core.mat_conversion import convert_mat_folders_to_swv_csv
+from core.io import collect_measurement_csvs_from_folders
 
 
 def _pick_folder_windows() -> str:
@@ -74,6 +76,30 @@ def _append_unique_folder(folders: List[str], picked: str) -> List[str]:
     if picked_clean in folders:
         return list(folders)
     return [*folders, picked_clean]
+
+
+def _measurement_voltage_bounds(
+    folders: Tuple[str, ...],
+    mode: str,
+) -> Optional[Tuple[float, float]]:
+    """Return the finite voltage extent across the selected native data files."""
+    lower = math.inf
+    upper = -math.inf
+    for measurement in collect_measurement_csvs_from_folders(list(folders), mode=mode):
+        try:
+            voltage = pd.read_csv(
+                measurement.path,
+                usecols=["Potential (V)"],
+            )["Potential (V)"].to_numpy(dtype=float)
+        except Exception:
+            continue
+        finite = voltage[np.isfinite(voltage)]
+        if finite.size:
+            lower = min(lower, float(np.min(finite)))
+            upper = max(upper, float(np.max(finite)))
+    if not (math.isfinite(lower) and math.isfinite(upper)) or lower >= upper:
+        return None
+    return lower, upper
 
 # 
 # Page config
@@ -1330,6 +1356,7 @@ for k, v in dict(
     swv_titration_edge_trim_fraction=0.15,
     swv_fit_titration_langmuir=True,
     swv_titration_concentration_unit="uM",
+    mat_conversion_report=None,
 ).items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1407,22 +1434,96 @@ with st.sidebar:
         for fe in folder_errors:
             st.error(f"Not found: `{fe}`")
 
+    if analysis_mode == "SWV" and folders and not folder_errors:
+        mat_count = sum(
+            1
+            for folder in folders
+            for path in Path(folder).rglob("*")
+            if path.is_file()
+            and path.suffix.lower() == ".mat"
+            and "_mat_csv" not in path.parts
+        )
+        if mat_count:
+            st.caption(f"Found {mat_count} MATLAB file(s) in the selected folders.")
+            if st.button("Convert MAT files for SWV", use_container_width=True):
+                with st.spinner("Converting MATLAB files to native SWV CSVs..."):
+                    report = convert_mat_folders_to_swv_csv(folders)
+                st.session_state.mat_conversion_report = report
+                updated_folders = list(st.session_state.folders)
+                for output_folder in report["output_folders"]:
+                    updated_folders = _append_unique_folder(updated_folders, output_folder)
+                st.session_state.folders = updated_folders
+                st.rerun()
+
+    conversion_report = st.session_state.get("mat_conversion_report")
+    if analysis_mode == "SWV" and conversion_report:
+        converted_count = len(conversion_report.get("converted", []))
+        failed_count = len(conversion_report.get("failed", []))
+        if converted_count:
+            st.success(f"Converted {converted_count} MAT file(s) to SWV CSV.")
+        if failed_count:
+            st.warning(f"{failed_count} MAT file(s) could not be converted.")
+            with st.expander("MAT conversion errors"):
+                st.dataframe(
+                    pd.DataFrame(conversion_report["failed"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     st.divider()
 
     #  Crop & voltage 
     st.subheader(" Voltage / Crop")
     col1, col2 = st.columns(2)
     if analysis_mode == "SWV":
-        crop_min = col1.number_input("Crop min (V)", value=-0.61, step=0.01, format="%.3f", key="swv_crop_min")
-        crop_max = col2.number_input("Crop max (V)", value=-0.30, step=0.01, format="%.3f", key="swv_crop_max")
+        crop_state_key = ("SWV", tuple(folders))
+        if st.session_state.get("swv_crop_folder_key") != crop_state_key:
+            bounds = _measurement_voltage_bounds(tuple(folders), mode="swv")
+            if bounds is not None:
+                st.session_state.swv_crop_min = bounds[0]
+                st.session_state.swv_crop_max = bounds[1]
+            st.session_state.swv_crop_folder_key = crop_state_key
+        crop_min = col1.number_input(
+            "Crop min (V)",
+            value=-0.61,
+            step=0.01,
+            format="%.3f",
+            key="swv_crop_min",
+        )
+        crop_max = col2.number_input(
+            "Crop max (V)",
+            value=-0.30,
+            step=0.01,
+            format="%.3f",
+            key="swv_crop_max",
+        )
         min_start_voltage = st.number_input(
             "Min start voltage (V)", value=-0.70, step=0.01, format="%.3f",
             help="Skip files whose first voltage point is below this value.",
             key="swv_min_start_voltage",
         )
     else:
-        crop_min = col1.number_input("Crop min (V)", value=-0.20, step=0.01, format="%.3f", key="cv_crop_min")
-        crop_max = col2.number_input("Crop max (V)", value=0.90, step=0.01, format="%.3f", key="cv_crop_max")
+        crop_state_key = ("CV", tuple(folders))
+        if st.session_state.get("cv_crop_folder_key") != crop_state_key:
+            bounds = _measurement_voltage_bounds(tuple(folders), mode="cv")
+            if bounds is not None:
+                st.session_state.cv_crop_min = bounds[0]
+                st.session_state.cv_crop_max = bounds[1]
+            st.session_state.cv_crop_folder_key = crop_state_key
+        crop_min = col1.number_input(
+            "Crop min (V)",
+            value=-0.20,
+            step=0.01,
+            format="%.3f",
+            key="cv_crop_min",
+        )
+        crop_max = col2.number_input(
+            "Crop max (V)",
+            value=0.90,
+            step=0.01,
+            format="%.3f",
+            key="cv_crop_max",
+        )
         min_start_voltage = None
         st.caption("CV cropping is applied to both the forward and reverse sweep before peak detection.")
 

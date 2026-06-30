@@ -24,7 +24,7 @@ def plot_cv_overlaid_cycles(
         return None
 
     n = len(usable)
-    cmap = cm.get_cmap(colormap_name, max(n, 2))
+    cmap = plt.get_cmap(colormap_name, max(n, 2))
     norm = Normalize(vmin=0, vmax=max(n - 1, 1))
 
     fig, ax = plt.subplots(figsize=(10, 5))

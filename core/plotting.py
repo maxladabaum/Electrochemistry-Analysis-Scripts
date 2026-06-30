@@ -111,7 +111,7 @@ def _cmap_fig(
 
     n = len(results)
 
-    cmap = cm.get_cmap(colormap_name, max(n, 2))
+    cmap = plt.get_cmap(colormap_name, max(n, 2))
 
     norm = Normalize(vmin=0, vmax=max(n - 1, 1))
 

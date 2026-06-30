@@ -16,6 +16,17 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+Or launch it by double-clicking the file for your operating system:
+
+- Windows: `launch_app_windows.bat`
+- macOS: `launch_app_mac.command`
+
+The launcher creates a local `.venv` virtual environment when needed and
+installs all packages from `requirements.txt` before starting the app.
+
+On macOS, if the launcher is not executable after downloading it, run
+`chmod +x launch_app_mac.command` once.
+
 If `streamlit` is installed globally on Windows instead of in the active virtualenv, you can also run:
 
 ```bash
@@ -23,6 +34,20 @@ py -m streamlit run app.py
 ```
 
 The app opens automatically at http://localhost:8501
+
+## MATLAB SWV files
+
+MATLAB files use the normal **SWV** analysis mode. Add folders containing
+`.mat` files, then click **Convert MAT files for SWV**. Files are discovered
+recursively and converted into native SWV CSVs in a `_mat_csv` folder, which
+the app adds to the selected data folders automatically. Matching method files
+are generated so the normal SWV frequency filters continue to work.
+
+Matrices may be stored as either 2-by-N or N-by-2 arrays (voltage and current).
+The converter prefers a variable named `data`, falling back to the first
+numeric 2D matrix. Filenames such as `ch_5_scan_10_100hz_swv.mat` supply the
+channel, scan number, and frequency. After conversion, all processing,
+metrics, plots, filters, and exports are exactly the existing SWV pipeline.
 
 ## Project layout
 
