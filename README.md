@@ -1,6 +1,7 @@
 # SWV Analysis UI
 
-Interactive Streamlit app for batch SWV electrochemistry analysis.
+Interactive Streamlit app for batch SWV/CV electrochemistry analysis and saved
+Bayesian-optimization sessions.
 
 ## Setup
 
@@ -45,6 +46,24 @@ swv_app/
 | ⚠️ Failures | Failed trace plots + single-trace inspector |
 | 🗂 Data Table | Filterable results table |
 | 💾 Export | Download CSVs, save a reusable experiment output bundle, and optionally export figures |
+
+## Bayesian-optimization sessions
+
+Choose **BO Session** under **Analysis mode**, then enter the
+`bo_session_<name>` folder containing `bo_state.json`. The viewer reconstructs
+both standard and paired-response BO sessions, including selectable metric
+trends and history, per-channel scores, raw and corrected traces, 1D/2D/3D
+surrogate views, measured-data landscapes, and candidate tables. Measured-data
+landscapes plot non-Q metrics such as peak height directly against experimental
+parameters without surrogate predictions. Raw/corrected traces are shown when
+the recorded CSV files are still accessible beside or inside the session's
+experiment folder. Corrected traces can use either the BO session's saved
+parameters or editable native SWV processing settings in the sidebar.
+
+The **PDF Export** tab builds a shareable, chronological report containing Q
+definitions, objective and parameter evolution, channel and phase trends,
+measured 1D/2D/3D landscapes, surrogate evolution for every saved artifact,
+and all locally accessible raw and corrected SWV traces.
 
 ## Experiment output bundles
 
