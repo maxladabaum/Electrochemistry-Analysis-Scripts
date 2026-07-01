@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.interpolate import griddata
 import streamlit as st
 
 from core.analysis import analyze_swv_arrays
@@ -784,19 +785,36 @@ def _plot_real_data_landscape(
             height=480,
         )
     elif view == "2D map":
+        valid, grid = _interpolated_2d_grid(points, x_name, y_name)
         fig = go.Figure()
+        if grid is not None:
+            grid_x, grid_y, grid_values = grid
+            fig.add_trace(go.Heatmap(
+                x=grid_x,
+                y=grid_y,
+                z=grid_values,
+                colorscale="Viridis",
+                colorbar={"title": metric_label},
+                hovertemplate=(
+                    f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                    f"Interpolated {metric_label}: %{{z:.4g}}<extra></extra>"
+                ),
+                connectgaps=False,
+            ))
         fig.add_trace(go.Scatter(
-            x=points[x_name],
-            y=points[y_name],
+            x=valid[x_name],
+            y=valid[y_name],
             mode="markers",
             marker={
-                "size": 11,
-                "color": points["value"],
+                "size": 8,
+                "color": valid["value"],
                 "colorscale": "Viridis",
-                "showscale": True,
+                "showscale": grid is None,
                 "colorbar": {"title": metric_label},
+                "line": {"color": "white", "width": 1},
             },
-            customdata=points[["iteration", "channel", "value"]],
+            name="measured points",
+            customdata=valid[["iteration", "channel", "value"]],
             hovertemplate=(
                 f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
                 f"{metric_label}: %{{customdata[2]:.4g}}<br>"
@@ -929,6 +947,45 @@ def _has_numeric_variation(values) -> bool:
     return pd.to_numeric(pd.Series(values), errors="coerce").dropna().nunique() > 1
 
 
+def _interpolated_2d_grid(
+    points: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    resolution: int = 120,
+) -> tuple[pd.DataFrame, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
+    """Clean measured points and linearly interpolate inside their convex hull."""
+    columns = [x_name, y_name, "value"]
+    metadata = [name for name in ("iteration", "channel") if name in points.columns]
+    valid = points[columns + metadata].copy()
+    valid[columns] = valid[columns].apply(pd.to_numeric, errors="coerce")
+    valid = valid.dropna(subset=columns)
+
+    unique = valid.groupby([x_name, y_name], as_index=False)["value"].mean()
+    if (
+        len(unique) < 3
+        or unique[x_name].nunique() < 2
+        or unique[y_name].nunique() < 2
+    ):
+        return valid, None
+
+    grid_x = np.linspace(unique[x_name].min(), unique[x_name].max(), resolution)
+    grid_y = np.linspace(unique[y_name].min(), unique[y_name].max(), resolution)
+    mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+    try:
+        grid_values = griddata(
+            unique[[x_name, y_name]].to_numpy(),
+            unique["value"].to_numpy(),
+            (mesh_x, mesh_y),
+            method="linear",
+            rescale=True,
+        )
+    except Exception:
+        return valid, None
+    if not np.isfinite(grid_values).any():
+        return valid, None
+    return valid, (grid_x, grid_y, grid_values)
+
+
 def _session_parameter_context(observations: list[dict]) -> str:
     labels = {
         "begin_potential": "begin",
@@ -1007,10 +1064,23 @@ def _pdf_metric_landscapes(
         page_pairs = pairs[start:start + 4]
         fig, axes = plt.subplots(2, 2, figsize=(8.5, 8), squeeze=False)
         for ax, (x_name, y_name) in zip(axes.flat, page_pairs):
-            scatter = ax.scatter(
-                points[x_name], points[y_name], c=points["value"],
-                cmap="viridis", s=28,
-            )
+            valid, grid = _interpolated_2d_grid(points, x_name, y_name)
+            if grid is not None:
+                grid_x, grid_y, grid_values = grid
+                scatter = ax.contourf(
+                    grid_x, grid_y, grid_values,
+                    levels=14, cmap="viridis",
+                )
+                ax.scatter(
+                    valid[x_name], valid[y_name],
+                    facecolors="none", edgecolors="white",
+                    linewidths=.65, s=20,
+                )
+            else:
+                scatter = ax.scatter(
+                    valid[x_name], valid[y_name], c=valid["value"],
+                    cmap="viridis", s=28,
+                )
             ax.set(xlabel=x_name, ylabel=y_name, title=f"{metric}")
             fig.colorbar(scatter, ax=ax, shrink=.75)
         for ax in axes.flat[len(page_pairs):]:
@@ -1191,28 +1261,23 @@ def _pdf_surrogate_iteration(
             page_pairs = pairs[start:start + 4]
             map_fig, map_axes = plt.subplots(2, 2, figsize=(8.5, 8), squeeze=False)
             for ax, (x_name, y_name) in zip(map_axes.flat, page_pairs):
+                valid = predictions[[x_name, y_name, value_key]].apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                ).dropna()
                 try:
                     scatter = ax.tricontourf(
-                        predictions[x_name],
-                        predictions[y_name],
-                        predictions[value_key],
+                        valid[x_name],
+                        valid[y_name],
+                        valid[value_key],
                         levels=14,
                         cmap="viridis",
                     )
-                    ax.tricontour(
-                        predictions[x_name],
-                        predictions[y_name],
-                        predictions[value_key],
-                        levels=14,
-                        colors="white",
-                        linewidths=.25,
-                        alpha=.5,
-                    )
                 except Exception:
                     scatter = ax.scatter(
-                        predictions[x_name],
-                        predictions[y_name],
-                        c=predictions[value_key],
+                        valid[x_name],
+                        valid[y_name],
+                        c=valid[value_key],
                         cmap="viridis",
                         s=8,
                         alpha=.55,
