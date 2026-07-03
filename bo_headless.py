@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -151,13 +152,14 @@ def _analysis_args_from_request(payload: dict) -> dict:
     analysis = dict(payload.get("analysis") or {})
     crop_min = float(analysis.get("crop_min_v", -0.6))
     crop_max = float(analysis.get("crop_max_v", -0.1))
+    require_minima = bool(analysis.get("require_local_minima_on_both_sides", False))
     return {
         "folders": [str(Path(p)) for p in payload.get("folders", [])],
         "crop_range": (crop_min, crop_max),
         "smooth_window": int(analysis.get("smooth_window", 15)),
         "smooth_polyorder": int(analysis.get("smooth_polyorder", 2)),
         "minima_search_window_V": float(analysis.get("minima_search_window_v", 0.30)),
-        "use_prominent_minima": bool(analysis.get("use_prominent_minima", False)),
+        "use_prominent_minima": bool(analysis.get("use_prominent_minima", False)) or require_minima,
         "use_double_correction": bool(analysis.get("use_double_correction", False)),
         "min_peak_height_uA": (
             None if analysis.get("min_peak_height_ua") in (None, "", "none")
@@ -179,6 +181,7 @@ def run_request(payload: dict) -> dict:
     if not folders:
         raise ValueError("At least one folder is required")
     results = run_batch(folders=folders, **args)
+    _apply_result_constraints(results, dict(payload.get("analysis") or {}))
     channel_metrics = _build_channel_metrics(results)
     output_dir = Path(payload.get("output_dir") or Path(folders[0]) / "bo_analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +189,13 @@ def run_request(payload: dict) -> dict:
     stem = str(payload.get("output_stem") or f"bo_analysis_{timestamp}")
     results_csv = output_dir / f"{stem}_results.csv"
     pd.DataFrame(results).to_csv(results_csv, index=False)
+    results_json = output_dir / f"{stem}_results.json"
+    tmp_results_json = results_json.with_name(f".{results_json.name}.tmp")
+    with open(tmp_results_json, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(results), fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_results_json, results_json)
     summary = {
         "schema_version": 1,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -194,12 +204,58 @@ def run_request(payload: dict) -> dict:
         "result_count": len(results),
         "channel_metrics": channel_metrics,
         "results_csv": str(results_csv),
+        "results_json": str(results_json),
+        "analysis_engine": "Electrochemistry-Analysis-Scripts",
     }
     summary_path = output_dir / f"{stem}.json"
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     summary["summary_path"] = str(summary_path)
     return summary
+
+
+def _apply_result_constraints(results: List[dict], analysis: dict) -> None:
+    peak_min = analysis.get("peak_voltage_min_v")
+    peak_max = analysis.get("peak_voltage_max_v")
+    peak_min = None if peak_min in (None, "", "none") else float(peak_min)
+    peak_max = None if peak_max in (None, "", "none") else float(peak_max)
+    require_minima = bool(analysis.get("require_local_minima_on_both_sides", False))
+    for row in results:
+        if str(row.get("status") or "").upper() != "OK":
+            continue
+        reasons = []
+        peak_voltage = row.get("peak_voltage")
+        if peak_min is not None and float(peak_voltage) < peak_min:
+            reasons.append(f"peak voltage {float(peak_voltage):g} V is below {peak_min:g} V")
+        if peak_max is not None and float(peak_voltage) > peak_max:
+            reasons.append(f"peak voltage {float(peak_voltage):g} V is above {peak_max:g} V")
+        if require_minima:
+            left = row.get("left_local_min_candidates")
+            right = row.get("right_local_min_candidates")
+            if left is None or len(left) == 0 or right is None or len(right) == 0:
+                reasons.append("prominent local minima were not found on both sides")
+        if reasons:
+            row["status"] = "FAILED"
+            row["error"] = "; ".join(reasons)
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+    except Exception:
+        pass
+    if isinstance(value, float) and value != value:
+        return None
+    return value
 
 
 def main() -> int:

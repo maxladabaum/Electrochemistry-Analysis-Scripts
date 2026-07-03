@@ -224,12 +224,24 @@ def _wavelet_denoise_trace(y: np.ndarray) -> np.ndarray:
     return trimmed
 
 
-def _compute_outside_crop_rms(i_raw: np.ndarray, crop_mask: np.ndarray) -> float:
-    signal = np.asarray(i_raw, dtype=float)
-    outside = signal[~np.asarray(crop_mask, dtype=bool)]
-    if outside.size == 0:
+def _compute_minima_bracket_rms_noise(current: np.ndarray, left_idx: int, right_idx: int) -> float:
+    """Estimate white noise without treating the trace's DC level as noise."""
+    signal = np.asarray(current, dtype=float)
+    if signal.size == 0 or left_idx is None or right_idx is None:
         return np.nan
-    return float(np.sqrt(np.mean(outside ** 2)))
+    try:
+        lo = max(0, min(int(left_idx), int(right_idx)))
+        hi = min(signal.size - 1, max(int(left_idx), int(right_idx)))
+    except (TypeError, ValueError):
+        return np.nan
+    segment = signal[lo:hi + 1]
+    segment = segment[np.isfinite(segment)]
+    if segment.size < 2:
+        return np.nan
+    differences = np.diff(segment)
+    if differences.size == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(differences ** 2)) / np.sqrt(2.0))
 
 
 def _compute_outside_crop_median(i_raw: np.ndarray, crop_mask: np.ndarray) -> float:
@@ -300,7 +312,6 @@ def analyze_swv_arrays(
     file_path: Optional[str] = None,
 ) -> dict:
     mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
-    background_rms = _compute_outside_crop_rms(i_raw, mask)
     background_median = _compute_outside_crop_median(i_raw, mask)
     v, i = v_raw[mask], i_raw[mask]
 
@@ -349,6 +360,7 @@ def analyze_swv_arrays(
     left_idx, right_idx = int(final_pass["left_idx"]), int(final_pass["right_idx"])
     peak_idx_corr = int(final_pass["peak_idx_corr"])
     peak_height = float(y_corr[peak_idx_corr])
+    background_rms = _compute_minima_bracket_rms_noise(i, left_idx, right_idx)
 
     if min_peak_height_uA is not None and peak_height < float(min_peak_height_uA):
         raise ValueError(f"Peak height {peak_height:.4g} uA below cutoff {min_peak_height_uA:.4g} uA")
@@ -444,7 +456,7 @@ def partial_traces_for_failure_arrays(
     use_wavelet_for_correction: bool,
 ) -> dict:
     initial_mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
-    base = dict(background_current_rms=_compute_outside_crop_rms(i_raw, initial_mask),
+    base = dict(background_current_rms=np.nan,
                 background_current_median=_compute_outside_crop_median(i_raw, initial_mask),
                 voltage=None, raw_current=None, smoothed_current=None,
                 wavelet_denoised_current=None,

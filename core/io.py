@@ -11,6 +11,8 @@ FILENAME_RE = re.compile(
     r"(?P<date>\d{8})_(?P<time>\d{4})_(?P<scan>\d+)_ch(?P<ch2>\d+)\.csv$",
     re.IGNORECASE,
 )
+CHANNEL_RE = re.compile(r"(?:^|[_\-\s])ch(?:annel)?\s*0*(\d+)(?:\D|$)", re.IGNORECASE)
+SCAN_RE = re.compile(r"(?:^|[_\-\s])meas[_\-\s].*?(\d+)(?:\D|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -34,28 +36,40 @@ def collect_measurement_csvs_from_folders(
     wanted_mode = mode.lower() if mode else None
     out: List[MeasurementFile] = []
     for folder_index, folder in enumerate(folders):
-        if not os.path.isdir(folder):
-            raise ValueError(f"Folder not found: {folder}")
-        for fn in os.listdir(folder):
+        if os.path.isfile(folder):
+            root = os.path.dirname(folder)
+            filenames = [os.path.basename(folder)]
+        elif os.path.isdir(folder):
+            root = folder
+            filenames = os.listdir(folder)
+        else:
+            raise ValueError(f"Input path not found: {folder}")
+        for fn in filenames:
             if not fn.lower().endswith(".csv"):
                 continue
             m = FILENAME_RE.match(fn)
-            if not m:
-                continue
-            file_mode = m.group("mode").lower()
+            file_mode = m.group("mode").lower() if m else ("cv" if fn.lower().startswith("cv") else "swv")
             if wanted_mode is not None and file_mode != wanted_mode:
                 continue
-            ch = int(m.group("ch"))
-            if int(m.group("ch2")) != ch:
-                continue
-            ts = int(f"{m.group('date')}{m.group('time')}")
+            if m:
+                ch = int(m.group("ch"))
+                if int(m.group("ch2")) != ch:
+                    continue
+                scan = int(m.group("scan"))
+                ts = int(f"{m.group('date')}{m.group('time')}")
+            else:
+                channel_match = CHANNEL_RE.search(fn)
+                scan_match = SCAN_RE.search(fn)
+                ch = int(channel_match.group(1)) if channel_match else 1
+                scan = int(scan_match.group(1)) if scan_match else 1
+                ts = int(os.stat(os.path.join(root, fn)).st_mtime_ns)
             out.append(
                 MeasurementFile(
                     mode=file_mode,
-                    scan=int(m.group("scan")),
+                    scan=scan,
                     ch=ch,
                     ts=ts,
-                    path=os.path.join(folder, fn),
+                    path=os.path.join(root, fn),
                     folder_index=folder_index,
                 )
             )

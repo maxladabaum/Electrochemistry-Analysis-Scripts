@@ -84,6 +84,10 @@ parameters without surrogate predictions. Raw/corrected traces are shown when
 the recorded CSV files are still accessible beside or inside the session's
 experiment folder. Corrected traces can use either the BO session's saved
 parameters or editable native SWV processing settings in the sidebar.
+Sessions with independently optimized channel groups are analyzed together by
+default. Group-level trends remain separate, and observations are selected by
+group plus iteration. The sidebar can optionally scope the analysis to one
+group.
 
 The **PDF Export** tab builds a shareable, chronological report containing Q
 definitions, objective and parameter evolution, channel and phase trends,

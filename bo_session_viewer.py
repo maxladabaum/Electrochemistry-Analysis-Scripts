@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import itertools
+from functools import lru_cache
 from io import BytesIO
+import os
 from pathlib import Path, PureWindowsPath
 import re
 import subprocess
@@ -12,6 +14,7 @@ import sys
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
@@ -104,29 +107,145 @@ def load_bo_session(folder: str | Path) -> dict:
     }
 
 
+def _session_channel_groups(session: dict) -> list[dict]:
+    """Return the persisted groups that have observations in this session."""
+    observations = session["observations"]
+    observed_ids = {
+        int(obs.get("group_id", 1))
+        for obs in observations
+        if obs.get("group_id", 1) is not None
+    }
+    configured = (
+        session["state"].get("channel_groups")
+        or session["config"].get("channel_groups")
+        or []
+    )
+    groups = []
+    for raw in configured:
+        try:
+            group_id = int(raw.get("id", 1))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if observed_ids and group_id not in observed_ids:
+            continue
+        groups.append({
+            "id": group_id,
+            "name": str(raw.get("name") or f"Group {group_id}"),
+            "channels": list(raw.get("channels") or []),
+        })
+    known_ids = {group["id"] for group in groups}
+    for obs in observations:
+        group_id = int(obs.get("group_id", 1))
+        if group_id not in known_ids:
+            groups.append({
+                "id": group_id,
+                "name": str(obs.get("group_name") or f"Group {group_id}"),
+                "channels": list(obs.get("channels") or []),
+            })
+            known_ids.add(group_id)
+    return sorted(groups, key=lambda group: group["id"])
+
+
+def _session_for_channel_group(session: dict, group_id: int) -> dict:
+    """Create a group-scoped view while leaving the loaded session untouched."""
+    scoped = dict(session)
+    scoped["observations"] = [
+        obs for obs in session["observations"]
+        if int(obs.get("group_id", 1)) == int(group_id)
+    ]
+    history = session["history"]
+    if not history.empty and "group_id" in history.columns:
+        ids = pd.to_numeric(history["group_id"], errors="coerce")
+        scoped["history"] = history.loc[ids == int(group_id)].reset_index(drop=True)
+    scoped["selected_group_id"] = int(group_id)
+    return scoped
+
+
 def _observation_table(session: dict) -> pd.DataFrame:
     history = session["history"].copy()
-    if not history.empty:
-        return history
     rows = []
     for obs in session["observations"]:
         row = {
             "iteration": obs.get("iteration"),
+            "group_id": obs.get("group_id", 1),
+            "group_name": obs.get("group_name", "Group 1"),
+            "channels": ",".join(str(channel) for channel in obs.get("channels", [])),
             "Q_run": obs.get("Q_run"),
             "objective": obs.get("objective"),
             "completed_at": obs.get("completed_at"),
         }
         row.update(obs.get("params") or {})
-        row.update(obs.get("quality") or {})
+        for key, value in (obs.get("quality") or {}).items():
+            if np.isscalar(value) and not isinstance(value, (str, bytes)):
+                row[key] = value
+        for source_name, prefix in (
+            ("channel_metrics", ""),
+            ("buffer_channel_metrics", "buffer_"),
+            ("target_channel_metrics", "target_"),
+        ):
+            for channel, metrics in (obs.get(source_name) or {}).items():
+                for key, value in (metrics or {}).items():
+                    if np.isscalar(value) and not isinstance(value, (str, bytes)):
+                        row[f"ch{channel}_{prefix}{key}"] = value
+        components = (obs.get("quality") or {}).get("channel_components") or {}
+        for channel, metrics in components.items():
+            for key, value in (metrics or {}).items():
+                if np.isscalar(value) and not isinstance(value, (str, bytes)):
+                    row.setdefault(f"ch{channel}_{key}", value)
         rows.append(row)
-    return pd.DataFrame(rows)
+    observation_frame = pd.DataFrame(rows)
+    if history.empty:
+        return observation_frame
+    if observation_frame.empty:
+        return history
+
+    missing_columns = [
+        column for column in observation_frame.columns
+        if column not in history.columns
+    ]
+    if missing_columns:
+        history = pd.concat(
+            [
+                history,
+                pd.DataFrame(
+                    np.nan,
+                    index=history.index,
+                    columns=missing_columns,
+                ),
+            ],
+            axis=1,
+        )
+    history_group = pd.to_numeric(
+        history.get("group_id", pd.Series(1, index=history.index)),
+        errors="coerce",
+    ).fillna(1).astype(int)
+    history_iteration = pd.to_numeric(history["iteration"], errors="coerce")
+    for _, row in observation_frame.iterrows():
+        mask = (
+            (history_group == int(row.get("group_id", 1)))
+            & (history_iteration == int(row["iteration"]))
+        )
+        matching = history.index[mask]
+        if matching.empty:
+            continue
+        index = matching[0]
+        for column, value in row.items():
+            if pd.notna(value):
+                history.at[index, column] = value
+    return history
 
 
 def _numeric_columns(frame: pd.DataFrame) -> list[str]:
-    excluded = {"iteration", "paired_cycle", "paired_batch_index", "buffer_trace_number", "target_trace_number"}
+    excluded = {
+        "iteration", "group_id", "paired_cycle", "paired_batch_index",
+        "buffer_trace_number", "target_trace_number",
+    }
     return [
         column for column in frame.columns
-        if column not in excluded and pd.to_numeric(frame[column], errors="coerce").notna().any()
+        if (
+            column not in excluded
+            and pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1
+        )
     ]
 
 
@@ -142,7 +261,7 @@ def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
             channel, metric = component_match.group(1), component_match.group(2)
         else:
             continue
-        if pd.to_numeric(frame[column], errors="coerce").notna().any():
+        if pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1:
             metrics.setdefault(metric, {})[channel] = column
     return metrics
 
@@ -151,6 +270,9 @@ def _metric_label(metric: str) -> str:
     replacements = {
         "Q_channel": "Channel Q",
         "Q_run": "Q run",
+        "mean_peak_current_uA": "Peak height (µA)",
+        "median_peak_current_uA": "Peak height (µA)",
+        "snr_unadjusted": "Raw SNR",
         "uA": "µA",
     }
     if metric in replacements:
@@ -158,31 +280,168 @@ def _metric_label(metric: str) -> str:
     return metric.replace("_", " ").strip().title().replace("Ua", "µA").replace("Snr", "SNR")
 
 
-def _plot_trend(frame: pd.DataFrame, metric: str):
+def _plot_trend(
+    frame: pd.DataFrame,
+    metric: str,
+    group_layout: str = "Plot groups overlaid",
+):
+    if metric not in frame.columns:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No changing trend metrics are available.",
+            x=.5, y=.5, xref="paper", yref="paper", showarrow=False,
+        )
+        fig.update_layout(width=650, height=340)
+        return fig
     values = pd.to_numeric(frame[metric], errors="coerce")
     x = pd.to_numeric(frame.get("iteration", pd.Series(range(1, len(frame) + 1))), errors="coerce")
     valid = values.notna() & x.notna()
-    iterations = x[valid].astype(int)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=iterations,
-        y=values[valid],
-        mode="lines+markers",
-        name=metric,
-        line={"color": "#155e63"},
-        marker={"size": 8},
-        customdata=iterations,
-        hovertemplate=f"Iteration %{{x}}<br>{metric}: %{{y:.4g}}<extra></extra>",
-    ))
-    if metric == "Q_run" and valid.any():
+    grouped = "group_id" in frame.columns and frame.loc[valid, "group_id"].nunique() > 1
+    if grouped and group_layout == "Average groups together":
+        averaged = pd.DataFrame({
+            "iteration": x[valid].astype(int),
+            "value": values[valid],
+        }).groupby("iteration", as_index=False)["value"].mean()
+        fig.add_trace(go.Scatter(
+            x=averaged["iteration"],
+            y=averaged["value"],
+            mode="lines+markers",
+            name="Group average",
+            marker={"size": 8},
+            customdata=averaged["iteration"],
+            hovertemplate=(
+                "Iteration %{x}<br>Group average: %{y:.4g}<extra></extra>"
+            ),
+        ))
+        if metric == "Q_run":
+            fig.add_trace(go.Scatter(
+                x=averaged["iteration"],
+                y=averaged["value"].cummax(),
+                mode="lines",
+                name="Group-average best",
+                line={"dash": "dot"},
+                hoverinfo="skip",
+            ))
+        fig.update_layout(
+            title=f"{metric} over BO iterations — average across groups",
+            xaxis_title="BO iteration",
+            yaxis_title=metric,
+            width=650,
+            height=340,
+            margin={"l": 65, "r": 20, "t": 50, "b": 55},
+            clickmode="event+select",
+        )
+        return fig
+    if grouped and group_layout == "Plot groups separately":
+        grouped_rows = list(frame.loc[valid].groupby("group_id", sort=True))
+        columns = 2 if len(grouped_rows) > 1 else 1
+        rows_count = max(1, (len(grouped_rows) + columns - 1) // columns)
+        titles = [
+            (
+                str(rows["group_name"].iloc[0])
+                if "group_name" in rows.columns
+                else f"Group {int(group_id)}"
+            )
+            for group_id, rows in grouped_rows
+        ]
+        fig = make_subplots(
+            rows=rows_count,
+            cols=columns,
+            subplot_titles=titles,
+        )
+        for index, ((_group_id, rows), group_name) in enumerate(
+            zip(grouped_rows, titles)
+        ):
+            subplot_row, subplot_column = divmod(index, columns)
+            rows = rows.sort_values("iteration")
+            iterations = pd.to_numeric(
+                rows["iteration"],
+                errors="coerce",
+            ).astype(int)
+            row_values = pd.to_numeric(rows[metric], errors="coerce")
+            fig.add_trace(
+                go.Scatter(
+                    x=iterations,
+                    y=row_values,
+                    mode="lines+markers",
+                    name=group_name,
+                    customdata=iterations,
+                    hovertemplate=(
+                        f"{group_name}<br>Iteration %{{x}}<br>"
+                        f"{metric}: %{{y:.4g}}<extra></extra>"
+                    ),
+                ),
+                row=subplot_row + 1,
+                col=subplot_column + 1,
+            )
+            if metric == "Q_run":
+                fig.add_trace(
+                    go.Scatter(
+                        x=iterations,
+                        y=row_values.cummax(),
+                        mode="lines",
+                        name=f"{group_name} best",
+                        line={"dash": "dot"},
+                        hoverinfo="skip",
+                    ),
+                    row=subplot_row + 1,
+                    col=subplot_column + 1,
+                )
+            fig.update_xaxes(
+                title_text="BO iteration",
+                row=subplot_row + 1,
+                col=subplot_column + 1,
+            )
+            fig.update_yaxes(
+                title_text=metric,
+                matches="y",
+                row=subplot_row + 1,
+                col=subplot_column + 1,
+            )
+        fig.update_layout(
+            title=f"{metric} over BO iterations — separate groups",
+            width=800,
+            height=max(360, 280 * rows_count),
+            showlegend=False,
+            clickmode="event+select",
+        )
+        return fig
+    group_series = (
+        frame.loc[valid].groupby("group_id", sort=True)
+        if grouped
+        else [(None, frame.loc[valid])]
+    )
+    for group_id, rows in group_series:
+        rows = rows.sort_values("iteration")
+        row_values = pd.to_numeric(rows[metric], errors="coerce")
+        iterations = pd.to_numeric(rows["iteration"], errors="coerce").astype(int)
+        group_name = (
+            str(rows["group_name"].iloc[0])
+            if grouped and "group_name" in rows.columns
+            else metric
+        )
         fig.add_trace(go.Scatter(
             x=iterations,
-            y=values[valid].cummax(),
-            mode="lines",
-            name="Best so far",
-            line={"color": "#d67b32"},
-            hoverinfo="skip",
+            y=row_values,
+            mode="lines+markers",
+            name=group_name,
+            marker={"size": 8},
+            customdata=iterations,
+            hovertemplate=(
+                f"{group_name}<br>Iteration %{{x}}<br>"
+                f"{metric}: %{{y:.4g}}<extra></extra>"
+            ),
         ))
+        if metric == "Q_run":
+            fig.add_trace(go.Scatter(
+                x=iterations,
+                y=row_values.cummax(),
+                mode="lines",
+                name=f"{group_name} best",
+                line={"dash": "dot"},
+                hoverinfo="skip",
+            ))
     fig.update_layout(
         title=f"{metric} over BO iterations",
         xaxis_title="BO iteration",
@@ -201,87 +460,202 @@ def _plot_channel_trend(
     channel_columns: dict[str, str],
     selected_channels: list[str],
     layout: str,
+    group_layout: str = "Plot groups overlaid",
 ):
-    x = pd.to_numeric(
+    iterations = pd.to_numeric(
         frame.get("iteration", pd.Series(range(1, len(frame) + 1))),
         errors="coerce",
     )
     label = _metric_label(metric)
-    if layout == "Separate plots":
-        columns = 2 if len(selected_channels) > 1 else 1
-        rows = max(1, (len(selected_channels) + columns - 1) // columns)
-        titles = [f"Channel {channel}" for channel in selected_channels]
-        fig = make_subplots(rows=rows, cols=columns, subplot_titles=titles)
-        for index, channel in enumerate(selected_channels):
-            row, column = divmod(index, columns)
-            values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
-            valid = x.notna() & values.notna()
-            iterations = x[valid].astype(int)
-            fig.add_trace(
-                go.Scatter(
-                    x=iterations,
-                    y=values[valid],
-                    mode="lines+markers",
-                    name=f"Ch {channel}",
-                    customdata=iterations,
-                    hovertemplate=f"Iteration %{{x}}<br>Ch {channel}: %{{y:.4g}}<extra></extra>",
-                ),
-                row=row + 1,
-                col=column + 1,
-            )
-            fig.update_xaxes(title_text="BO iteration", row=row + 1, col=column + 1)
-            fig.update_yaxes(title_text=label, row=row + 1, col=column + 1)
-        fig.update_layout(
-            title=f"{label} by channel",
-            width=760,
-            height=max(340, 270 * rows),
-            showlegend=False,
-            clickmode="event+select",
+    group_ids = (
+        frame["group_id"]
+        if "group_id" in frame.columns
+        else pd.Series(1, index=frame.index)
+    )
+    group_names = (
+        frame["group_name"].fillna("").astype(str)
+        if "group_name" in frame.columns
+        else pd.Series("", index=frame.index)
+    )
+    records = []
+    for channel in selected_channels:
+        values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
+        valid = iterations.notna() & values.notna()
+        for index in frame.index[valid]:
+            group_id = group_ids.loc[index]
+            group_name = group_names.loc[index] or f"Group {group_id}"
+            records.append({
+                "iteration": int(iterations.loc[index]),
+                "value": float(values.loc[index]),
+                "group_id": group_id,
+                "group_name": group_name,
+                "channel": str(channel),
+            })
+    data = pd.DataFrame(records)
+    if data.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No values are available for the selected channels.",
+            x=.5, y=.5, xref="paper", yref="paper", showarrow=False,
         )
+        fig.update_layout(width=650, height=340)
         return fig
 
-    fig = go.Figure()
+    # Normalize duplicate rows before applying either display-level average.
+    data = data.groupby(
+        ["group_id", "group_name", "channel", "iteration"],
+        as_index=False,
+        dropna=False,
+    )["value"].mean()
+    multiple_groups = data["group_id"].nunique(dropna=False) > 1
+
+    if multiple_groups and group_layout == "Average groups together":
+        data = data.groupby(
+            ["channel", "iteration"],
+            as_index=False,
+        )["value"].mean()
+        data["group_id"] = "__average__"
+        data["group_name"] = "Group average"
+
     if layout == "Average selected channels":
-        values = pd.concat(
-            [
-                pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
-                for channel in selected_channels
-            ],
-            axis=1,
-        ).mean(axis=1)
-        valid = x.notna() & values.notna()
-        iterations = x[valid].astype(int)
-        fig.add_trace(go.Scatter(
-            x=iterations,
-            y=values[valid],
-            mode="lines+markers",
-            name="Selected-channel average",
-            customdata=iterations,
-            line={"color": "#155e63"},
-            hovertemplate="Iteration %{x}<br>Average: %{y:.4g}<extra></extra>",
-        ))
-        title = f"{label}: average across selected channels"
+        data = data.groupby(
+            ["group_id", "group_name", "iteration"],
+            as_index=False,
+            dropna=False,
+        )["value"].mean()
+        data["channel"] = "average"
+
+    separate_groups = (
+        multiple_groups
+        and group_layout == "Plot groups separately"
+    )
+    separate_channels = layout == "Separate plots"
+    if separate_groups and separate_channels:
+        facets = [
+            ((group_id, channel), f"{group_name} — Channel {channel}")
+            for (group_id, group_name, channel), _rows
+            in data.groupby(["group_id", "group_name", "channel"], sort=True)
+        ]
+    elif separate_groups:
+        facets = [
+            (group_id, group_name)
+            for (group_id, group_name), _rows
+            in data.groupby(["group_id", "group_name"], sort=True)
+        ]
+    elif separate_channels:
+        facets = [
+            (channel, f"Channel {channel}")
+            for channel in sorted(data["channel"].unique(), key=_channel_sort_key)
+        ]
     else:
-        for channel in selected_channels:
-            values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
-            valid = x.notna() & values.notna()
-            iterations = x[valid].astype(int)
-            fig.add_trace(go.Scatter(
-                x=iterations,
-                y=values[valid],
+        facets = [(None, "")]
+
+    subplot_columns = 2 if len(facets) > 1 else 1
+    subplot_rows = max(1, (len(facets) + subplot_columns - 1) // subplot_columns)
+    faceted = len(facets) > 1 or facets[0][0] is not None
+    if faceted:
+        fig = make_subplots(
+            rows=subplot_rows,
+            cols=subplot_columns,
+            subplot_titles=[title for _key, title in facets],
+        )
+    else:
+        fig = go.Figure()
+
+    for facet_index, (facet_key, _facet_title) in enumerate(facets):
+        facet_data = data
+        if separate_groups and separate_channels:
+            facet_data = data[
+                (data["group_id"] == facet_key[0])
+                & (data["channel"] == facet_key[1])
+            ]
+        elif separate_groups:
+            facet_data = data[data["group_id"] == facet_key]
+        elif separate_channels:
+            facet_data = data[data["channel"] == facet_key]
+
+        series_columns = []
+        if not separate_groups and facet_data["group_id"].nunique(dropna=False) > 1:
+            series_columns.extend(["group_id", "group_name"])
+        if not separate_channels and facet_data["channel"].nunique() > 1:
+            series_columns.append("channel")
+        series = (
+            facet_data.groupby(series_columns, sort=True, dropna=False)
+            if series_columns
+            else [(None, facet_data)]
+        )
+        for _series_key, rows in series:
+            rows = rows.sort_values("iteration")
+            group_name = str(rows["group_name"].iloc[0])
+            channel = str(rows["channel"].iloc[0])
+            name_parts = []
+            if group_name != "Group average" and (
+                not separate_groups or not separate_channels
+            ):
+                if multiple_groups:
+                    name_parts.append(group_name)
+            elif group_name == "Group average":
+                name_parts.append(group_name)
+            if channel == "average":
+                name_parts.append("channel average")
+            elif not separate_channels:
+                name_parts.append(f"Ch {channel}")
+            trace_name = " · ".join(name_parts) or (
+                f"Ch {channel}" if channel != "average" else "Channel average"
+            )
+            trace = go.Scatter(
+                x=rows["iteration"],
+                y=rows["value"],
                 mode="lines+markers",
-                name=f"Ch {channel}",
-                customdata=iterations,
-                hovertemplate=f"Iteration %{{x}}<br>Ch {channel}: %{{y:.4g}}<extra></extra>",
-            ))
-        title = f"{label}: selected channels overlaid"
+                name=trace_name,
+                customdata=rows["iteration"],
+                hovertemplate=(
+                    f"{trace_name}<br>Iteration %{{x}}<br>"
+                    f"{label}: %{{y:.4g}}<extra></extra>"
+                ),
+            )
+            if faceted:
+                subplot_row, subplot_column = divmod(facet_index, subplot_columns)
+                fig.add_trace(
+                    trace,
+                    row=subplot_row + 1,
+                    col=subplot_column + 1,
+                )
+            else:
+                fig.add_trace(trace)
+
+    if faceted:
+        for facet_index in range(len(facets)):
+            subplot_row, subplot_column = divmod(facet_index, subplot_columns)
+            fig.update_xaxes(
+                title_text="BO iteration",
+                row=subplot_row + 1,
+                col=subplot_column + 1,
+            )
+            fig.update_yaxes(
+                title_text=label,
+                matches="y",
+                row=subplot_row + 1,
+                col=subplot_column + 1,
+            )
+    title = label
+    if layout == "Average selected channels":
+        title += ": average across selected channels"
+    elif layout == "Overlay selected channels":
+        title += ": selected channels overlaid"
+    else:
+        title += " by channel"
+    if multiple_groups and group_layout == "Average groups together":
+        title += " — average across groups"
+    elif separate_groups:
+        title += " — separate groups"
     fig.update_layout(
         title=title,
-        xaxis_title="BO iteration",
-        yaxis_title=label,
-        width=650,
-        height=340,
-        margin={"l": 65, "r": 20, "t": 50, "b": 55},
+        xaxis_title=None if faceted else "BO iteration",
+        yaxis_title=None if faceted else label,
+        width=800 if faceted else 650,
+        height=max(340, 270 * subplot_rows),
+        margin={"l": 65, "r": 20, "t": 65, "b": 55},
         clickmode="event+select",
     )
     return fig
@@ -367,7 +741,12 @@ def _plot_paired_phase_trend(
                     col=column + 1,
                 )
             fig.update_xaxes(title_text="BO iteration", row=row + 1, col=column + 1)
-            fig.update_yaxes(title_text=metric_label, row=row + 1, col=column + 1)
+            fig.update_yaxes(
+                title_text=metric_label,
+                matches="y",
+                row=row + 1,
+                col=column + 1,
+            )
         fig.update_layout(
             title=f"Buffer vs target {metric_label}",
             width=760,
@@ -598,7 +977,12 @@ def _plot_chronological(
                 row=row,
                 col=column,
             )
-            fig.update_yaxes(title_text=metric_label, row=row, col=column)
+            fig.update_yaxes(
+                title_text=metric_label,
+                matches="y",
+                row=row,
+                col=column,
+            )
         fig.update_layout(
             title=f"Chronological buffer/target measurements | {metric_label}",
             width=800,
@@ -742,6 +1126,34 @@ def _real_metric_points(
     return pd.DataFrame(rows)
 
 
+def _real_group_metric_points(
+    observations: list[dict],
+    metric_label: str,
+    phase: str,
+    selected_groups: list[dict],
+) -> pd.DataFrame:
+    """Average member channels into one real-data series per channel group."""
+    frames = []
+    for group in selected_groups:
+        group_id = int(group["id"])
+        group_observations = [
+            observation for observation in observations
+            if int(observation.get("group_id", 1)) == group_id
+        ]
+        points = _real_metric_points(
+            group_observations,
+            metric_label,
+            phase,
+            [str(channel) for channel in group.get("channels", [])],
+            average_channels=True,
+        )
+        if not points.empty:
+            points["channel"] = str(group.get("name") or f"Group {group_id}")
+            points["group_id"] = group_id
+            frames.append(points)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _plot_real_data_landscape(
     points: pd.DataFrame,
     metric_label: str,
@@ -751,6 +1163,14 @@ def _plot_real_data_landscape(
     y_name: str | None,
     z_name: str | None,
 ):
+    def series_label(value: Any) -> str:
+        text = str(value)
+        if text == "Average":
+            return "Channel average"
+        if text.lower().startswith("group"):
+            return text
+        return f"Ch {text}"
+
     hover_data = ["iteration", "channel"]
     if view == "3D tensor":
         fig = go.Figure()
@@ -760,7 +1180,7 @@ def _plot_real_data_landscape(
                 y=group[y_name],
                 z=group[z_name],
                 mode="markers",
-                name=f"Ch {channel}" if channel != "Average" else "Channel average",
+                name=series_label(channel),
                 marker={
                     "size": 6,
                     "color": group["value"],
@@ -772,7 +1192,7 @@ def _plot_real_data_landscape(
                 hovertemplate=(
                     f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
                     f"{z_name}: %{{z:.4g}}<br>{metric_label}: %{{marker.color:.4g}}"
-                    "<br>Iteration %{customdata[0]}<br>Channel %{customdata[1]}<extra></extra>"
+                    "<br>Iteration %{customdata[0]}<br>Series %{customdata[1]}<extra></extra>"
                 ),
             ))
         fig.update_layout(
@@ -835,7 +1255,7 @@ def _plot_real_data_landscape(
                 x=ordered[x_name],
                 y=ordered["value"],
                 mode="lines+markers",
-                name=f"Ch {channel}" if channel != "Average" else "Channel average",
+                name=series_label(channel),
                 customdata=ordered[["iteration", "channel"]],
                 hovertemplate=(
                     f"{x_name}: %{{x:.4g}}<br>{metric_label}: %{{y:.4g}}<br>"
@@ -1376,15 +1796,46 @@ def build_bo_session_pdf(
     objective_equation_label = "Paired Q equation" if paired else "Classic Q equation"
     q_values = [float(obs.get("Q_run", np.nan)) for obs in observations]
     best = observations[int(np.nanargmax(q_values))]
+    multiple_groups = len({
+        int(obs.get("group_id", 1)) for obs in observations
+    }) > 1
+
+    def plot_grouped_history(ax, frame: pd.DataFrame, column: str) -> None:
+        if multiple_groups and "group_id" in frame.columns:
+            for _group_id, rows in frame.groupby("group_id", sort=True):
+                label = (
+                    str(rows["group_name"].iloc[0])
+                    if "group_name" in rows.columns
+                    else f"Group {int(_group_id)}"
+                )
+                ax.plot(
+                    rows["iteration"],
+                    pd.to_numeric(rows[column], errors="coerce"),
+                    marker="o",
+                    label=label,
+                )
+            ax.legend()
+        else:
+            ax.plot(
+                frame["iteration"],
+                pd.to_numeric(frame[column], errors="coerce"),
+                marker="o",
+            )
+
     output = BytesIO()
     with PdfPages(output) as pdf:
         pdf._bo_parameter_context = _session_parameter_context(observations)
         _pdf_text_page(pdf, "Bayesian Optimization Session Report", [
             f"Session: {session['state'].get('session_id', session['root'].name)}",
             f"Objective: {'Paired response' if paired else 'Standard quality'}",
-            f"Completed iterations: {len(observations)}",
+            f"Completed observations: {len(observations)}",
             f"Candidate count: {session['state'].get('candidate_count', 'unknown')}",
-            f"Best iteration: {best.get('iteration')}",
+            (
+                f"Best observation: {best.get('group_name', f'Group {best.get('group_id', 1)}')} "
+                f"iteration {best.get('iteration')}"
+                if multiple_groups
+                else f"Best iteration: {best.get('iteration')}"
+            ),
             f"Best Q_run: {float(best.get('Q_run', 0)):.6g}",
             "",
             "Report order:",
@@ -1427,16 +1878,12 @@ def build_bo_session_pdf(
         ])
 
         # Objective evolution.
-        iterations = [int(obs.get("iteration", index + 1)) for index, obs in enumerate(observations)]
         values = [float(obs.get("Q_run", np.nan)) for obs in observations]
         if _has_numeric_variation(values):
             fig, ax = plt.subplots(figsize=(8, 4.5))
-            ax.plot(iterations, values, marker="o", color="#155e63", label="Q_run")
-            ax.plot(iterations, pd.Series(values).cummax(), color="#d67b32", label="Best so far")
-            ax.scatter([best["iteration"]], [best["Q_run"]], color="#ffd166", edgecolor="black", zorder=4)
+            plot_grouped_history(ax, history, "Q_run")
             ax.set(xlabel="BO iteration", ylabel="Q", title="Objective improvement over time")
             ax.grid(alpha=.25)
-            ax.legend()
             _pdf_equation_footer(fig, objective_equation_label, objective_equation)
             _pdf_save(pdf, fig)
 
@@ -1452,7 +1899,7 @@ def build_bo_session_pdf(
                 squeeze=False,
             )
             for ax, name in zip(axes.flat, parameter_columns):
-                ax.plot(history["iteration"], pd.to_numeric(history[name], errors="coerce"), marker="o")
+                plot_grouped_history(ax, history, name)
                 ax.set(xlabel="Iteration", ylabel=name, title=name)
                 ax.grid(alpha=.25)
             for ax in axes.flat[len(parameter_columns):]:
@@ -1480,11 +1927,7 @@ def build_bo_session_pdf(
             page_columns = global_q_columns[start:start + 6]
             fig, axes = plt.subplots(3, 2, figsize=(8.5, 10), squeeze=False)
             for ax, column in zip(axes.flat, page_columns):
-                ax.plot(
-                    history["iteration"],
-                    pd.to_numeric(history[column], errors="coerce"),
-                    marker="o",
-                )
+                plot_grouped_history(ax, history, column)
                 ax.set(xlabel="Iteration", ylabel=column, title=column)
                 ax.grid(alpha=.25)
             for ax in axes.flat[len(page_columns):]:
@@ -1641,14 +2084,31 @@ def build_bo_session_pdf(
         ])
 
         # Keep each iteration together: trace overlays first, surrogate second.
-        artifacts = _surrogate_files(session["root"])
-        observations_by_iteration = {
-            int(observation.get("iteration", 0)): observation
+        multiple_groups = len({
+            int(observation.get("group_id", 1))
+            for observation in observations
+        }) > 1
+        artifacts = (
+            {}
+            if multiple_groups
+            else _surrogate_files(
+                session["root"], session.get("selected_group_id"),
+            )
+        )
+        observations_by_key = {
+            (
+                (int(observation.get("group_id", 1)), int(observation.get("iteration", 0)))
+                if multiple_groups
+                else int(observation.get("iteration", 0))
+            ): observation
             for observation in observations
         }
-        report_iterations = sorted(set(observations_by_iteration) | set(artifacts))
-        for iteration in report_iterations:
-            observation = observations_by_iteration.get(iteration)
+        report_keys = sorted(observations_by_key)
+        if not multiple_groups:
+            report_keys = sorted(set(report_keys) | set(artifacts))
+        for report_key in report_keys:
+            iteration = report_key[1] if multiple_groups else report_key
+            observation = observations_by_key.get(report_key)
             if observation is not None:
                 trace_rows = _trace_paths(session, observation)
                 trace_channels = sorted(
@@ -1706,22 +2166,61 @@ def _channel_table(observation: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@lru_cache(maxsize=8192)
+def _resolve_recorded_path_cached(
+    root_text: str,
+    raw_text: str,
+) -> str | None:
+    root = Path(root_text)
+    direct = Path(raw_text)
+    try:
+        if direct.is_file():
+            return direct
+    except OSError:
+        # A path recorded on another OS may be interpreted as one invalid local
+        # filename (for example, a long Windows path loaded on macOS).
+        pass
+    name = PureWindowsPath(raw_text).name
+    if not name:
+        return None
+
+    def find_recorded_file(search_root: Path) -> Path | None:
+        match = _recorded_file_index(str(search_root)).get(name)
+        return Path(match) if match is not None else None
+
+    match = find_recorded_file(root)
+    if match is not None:
+        return str(match)
+    # Archived measurements commonly sit beside bo_sessions in the experiment folder.
+    for parent in list(root.parents)[:3]:
+        match = find_recorded_file(parent)
+        if match is not None:
+            return str(match)
+    return None
+
+
+@lru_cache(maxsize=12)
+def _recorded_file_index(root_text: str) -> dict[str, str]:
+    """Index a search root once instead of recursively scanning per trace."""
+    files: dict[str, str] = {}
+
+    def ignore_walk_error(_error: OSError) -> None:
+        return None
+
+    for directory, _subdirectories, names in os.walk(
+        root_text,
+        onerror=ignore_walk_error,
+    ):
+        for name in names:
+            files.setdefault(name, str(Path(directory) / name))
+    return files
+
+
 def _resolve_recorded_path(root: Path, raw: Any) -> Path | None:
     if not raw:
         return None
-    direct = Path(str(raw))
-    if direct.is_file():
-        return direct
-    name = PureWindowsPath(str(raw)).name
-    matches = list(root.rglob(name))
-    if matches:
-        return matches[0]
-    # Archived measurements commonly sit beside bo_sessions in the experiment folder.
-    for parent in list(root.parents)[:3]:
-        matches = list(parent.rglob(name))
-        if matches:
-            return matches[0]
-    return None
+    resolved = _resolve_recorded_path_cached(str(root), str(raw))
+    return Path(resolved) if resolved is not None else None
 
 
 def _channel_from_path(path: Path) -> str:
@@ -1814,6 +2313,81 @@ def _channel_sort_key(channel: str):
     return (0, int(channel)) if str(channel).isdigit() else (1, str(channel))
 
 
+@st.cache_data(show_spinner=False)
+def _cached_swv_arrays(
+    path_text: str,
+    modified_ns: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load an unchanged SWV file once per Streamlit process."""
+    del modified_ns  # Included in the cache key to invalidate changed files.
+    return load_swv_csv(path_text)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_corrected_swv_arrays(
+    path_text: str,
+    modified_ns: int,
+    crop_min_v: float,
+    crop_max_v: float,
+    smooth_window: int,
+    smooth_polyorder: int,
+    minima_search_window_v: float,
+    use_prominent_minima: bool,
+    use_double_correction: bool,
+    min_peak_height_uA: float | None,
+    compute_wavelet_denoised_trace: bool,
+    use_wavelet_for_correction: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    voltage, current = _cached_swv_arrays(path_text, modified_ns)
+    result = analyze_swv_arrays(
+        voltage,
+        current,
+        crop_range=(crop_min_v, crop_max_v),
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        minima_search_window_V=minima_search_window_v,
+        use_prominent_minima=use_prominent_minima,
+        use_double_correction=use_double_correction,
+        min_peak_height_uA=min_peak_height_uA,
+        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+        use_wavelet_for_correction=use_wavelet_for_correction,
+    )
+    corrected_voltage = result.get(
+        "cropped_voltage",
+        result.get("voltage", voltage),
+    )
+    corrected_current = result.get(
+        "smoothed_corrected_current",
+        result.get("corrected_current"),
+    )
+    return corrected_voltage, corrected_current
+
+
+def _swv_trace_arrays(
+    path: Path,
+    corrected: bool,
+    analysis: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    modified_ns = path.stat().st_mtime_ns
+    if not corrected:
+        return _cached_swv_arrays(str(path), modified_ns)
+    minimum_peak = analysis.get("min_peak_height_uA")
+    return _cached_corrected_swv_arrays(
+        str(path),
+        modified_ns,
+        float(analysis.get("crop_min_v", -.45)),
+        float(analysis.get("crop_max_v", 0)),
+        int(analysis.get("smooth_window", 3)),
+        int(analysis.get("smooth_polyorder", 2)),
+        float(analysis.get("minima_search_window_v", .3)),
+        bool(analysis.get("use_prominent_minima", False)),
+        bool(analysis.get("use_double_correction", True)),
+        float(minimum_peak) if minimum_peak is not None else None,
+        bool(analysis.get("compute_wavelet_denoised_trace", False)),
+        bool(analysis.get("use_wavelet_for_correction", False)),
+    )
+
+
 def _plot_traces(
     session: dict,
     observation: dict,
@@ -1822,54 +2396,42 @@ def _plot_traces(
     analysis: dict,
     correction_label: str,
     overlaid: bool,
+    trace_items: list[dict] | None = None,
 ):
     traces = [
-        item for item in _trace_paths(session, observation)
+        item for item in (
+            trace_items
+            if trace_items is not None
+            else _trace_paths(session, observation)
+        )
         if item["channel"] in selected_channels
     ]
     fig, ax = plt.subplots(figsize=(8, 4))
     errors = []
-    phase_colors = {
-        "buffer": "#1f77b4",
-        "target": "#ff7f0e",
-        "measurement": "#155e63",
-        "unknown": "#7f7f7f",
+    trace_colors = plt.get_cmap("turbo")(
+        np.linspace(.03, .97, max(len(traces), 2))
+    )
+    phase_styles = {
+        "buffer": "--",
+        "target": "-",
+        "measurement": "-",
+        "unknown": ":",
     }
-    for item in traces:
+    for trace_index, item in enumerate(traces):
         phase, path, channel = item["phase"], item["path"], item["channel"]
         try:
-            voltage, current = load_swv_csv(str(path))
-            y = current
-            if corrected:
-                result = analyze_swv_arrays(
-                    voltage, current,
-                    crop_range=(float(analysis.get("crop_min_v", -.45)), float(analysis.get("crop_max_v", 0))),
-                    smooth_window=int(analysis.get("smooth_window", 3)),
-                    smooth_polyorder=int(analysis.get("smooth_polyorder", 2)),
-                    minima_search_window_V=float(analysis.get("minima_search_window_v", .3)),
-                    use_prominent_minima=bool(analysis.get("use_prominent_minima", False)),
-                    use_double_correction=bool(analysis.get("use_double_correction", True)),
-                    min_peak_height_uA=analysis.get("min_peak_height_uA"),
-                    compute_wavelet_denoised_trace=bool(
-                        analysis.get("compute_wavelet_denoised_trace", False)
-                    ),
-                    use_wavelet_for_correction=bool(
-                        analysis.get("use_wavelet_for_correction", False)
-                    ),
-                )
-                voltage = result.get("cropped_voltage", result.get("voltage", voltage))
-                y = result.get("smoothed_corrected_current", result.get("corrected_current"))
+            voltage, y = _swv_trace_arrays(path, corrected, analysis)
             channel_label = f"Ch {channel}" if channel != "Unknown" else "Unknown channel"
-            trace_label = (
-                str(phase).title()
-                if overlaid and len(selected_channels) > 4
-                else f"{phase} {channel_label}: {path.stem}"
-            )
+            trace_label = f"{phase} {channel_label}: {path.stem}"
             ax.plot(
                 voltage,
                 y,
                 linewidth=1.1,
-                color=phase_colors.get(str(phase).lower(), phase_colors["unknown"]),
+                color=trace_colors[trace_index],
+                linestyle=phase_styles.get(
+                    str(phase).lower(),
+                    phase_styles["unknown"],
+                ),
                 label=trace_label,
             )
         except Exception as exc:
@@ -1913,10 +2475,170 @@ def _plot_traces(
             ),
         )
         ax.grid(alpha=.25)
-        if len(traces) <= 16 or (overlaid and len(selected_channels) > 4):
-            handles, labels = ax.get_legend_handles_labels()
-            unique = dict(zip(labels, handles))
-            ax.legend(unique.values(), unique.keys(), fontsize=7)
+        if len(traces) <= 16:
+            ax.legend(fontsize=7)
+    fig.tight_layout()
+    return fig, errors
+
+
+def _plot_iteration_trace_overlay(
+    trace_entries: list[tuple[dict, dict]],
+    corrected: bool,
+    selected_channels: list[str],
+    analysis: dict,
+    correction_label: str,
+    selection_label: str,
+):
+    """Overlay traces from many observations with channel-aware colors."""
+    entries = [
+        (observation, item)
+        for observation, item in trace_entries
+        if item["channel"] in selected_channels
+    ]
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    errors = []
+    iterations = [
+        int(observation.get("iteration", 0))
+        for observation, _item in entries
+    ]
+    plotted_channels = sorted(
+        {item["channel"] for _observation, item in entries},
+        key=_channel_sort_key,
+    )
+    single_channel = len(plotted_channels) <= 1
+    if single_channel:
+        iteration_minimum = min(iterations, default=0)
+        iteration_maximum = max(iterations, default=0)
+        iteration_norm = plt.Normalize(
+            vmin=(
+                iteration_minimum
+                if iteration_maximum > iteration_minimum
+                else iteration_minimum - .5
+            ),
+            vmax=(
+                iteration_maximum
+                if iteration_maximum > iteration_minimum
+                else iteration_maximum + .5
+            ),
+        )
+        iteration_cmap = plt.get_cmap("viridis")
+        channel_colors = {}
+    else:
+        categorical_colors = plt.get_cmap("turbo")(
+            np.linspace(.03, .97, max(len(plotted_channels), 2))
+        )
+        channel_colors = {
+            channel: categorical_colors[index]
+            for index, channel in enumerate(plotted_channels)
+        }
+        iteration_norm = None
+        iteration_cmap = None
+    phase_styles = {
+        "buffer": "--",
+        "target": "-",
+        "measurement": "-",
+        "unknown": ":",
+    }
+    for observation, item in entries:
+        phase, path, channel = item["phase"], item["path"], item["channel"]
+        iteration = int(observation.get("iteration", 0))
+        try:
+            voltage, y = _swv_trace_arrays(path, corrected, analysis)
+            ax.plot(
+                voltage,
+                y,
+                linewidth=1.0,
+                alpha=.72,
+                color=(
+                    iteration_cmap(iteration_norm(iteration))
+                    if single_channel
+                    else channel_colors[channel]
+                ),
+                linestyle=phase_styles.get(
+                    str(phase).lower(),
+                    phase_styles["unknown"],
+                ),
+                label=(
+                    f"Iter {iteration} · {str(phase).title()} · "
+                    f"{'Ch ' + channel if channel != 'Unknown' else 'Unknown channel'}"
+                    f": {path.stem}"
+                ),
+            )
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+    if not entries:
+        ax.text(
+            .5,
+            .5,
+            "No traces match the selected channels.",
+            ha="center",
+            va="center",
+        )
+        ax.set_axis_off()
+    else:
+        channel_text = ", ".join(
+            f"Ch {channel}" if channel != "Unknown" else "Unknown"
+            for channel in selected_channels
+        )
+        ax.set(
+            xlabel="Voltage (V)",
+            ylabel="Current (µA)",
+            title=(
+                f"{selection_label}\n"
+                f"{'Smoothed corrected' if corrected else 'Raw'} SWV traces"
+                f"{f' ({correction_label})' if corrected else ''}"
+                f" | {channel_text}"
+            ),
+        )
+        ax.grid(alpha=.25)
+        if single_channel:
+            unique_iterations = sorted(set(iterations))
+            colorbar_ticks = (
+                unique_iterations
+                if len(unique_iterations) <= 10
+                else sorted({
+                    int(round(value))
+                    for value in np.linspace(
+                        iteration_minimum,
+                        iteration_maximum,
+                        8,
+                    )
+                })
+            )
+            scalar_map = plt.cm.ScalarMappable(
+                norm=iteration_norm,
+                cmap=iteration_cmap,
+            )
+            scalar_map.set_array([])
+            fig.colorbar(
+                scalar_map,
+                ax=ax,
+                label="BO iteration",
+                ticks=colorbar_ticks,
+            )
+        if not single_channel:
+            channel_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    color=channel_colors[channel],
+                    linewidth=2,
+                    label=(
+                        f"Ch {channel}"
+                        if channel != "Unknown"
+                        else "Unknown channel"
+                    ),
+                )
+                for channel in plotted_channels
+            ]
+            ax.legend(
+                handles=channel_handles,
+                title="Channel color",
+                fontsize=7,
+                title_fontsize=8,
+            )
+        elif len(entries) <= 16:
+            ax.legend(fontsize=7)
     fig.tight_layout()
     return fig, errors
 
@@ -2227,11 +2949,18 @@ def _q_relevant_metrics(
     ]
 
 
-def _surrogate_files(root: Path) -> dict[int, Path]:
+def _surrogate_files(root: Path, group_id: int | None = None) -> dict[int, Path]:
     result = {}
-    for path in (root / "surrogate").glob("iter_*_candidate_predictions.csv"):
+    surrogate_dir = root / "surrogate"
+    pattern = (
+        f"group_{group_id:02d}_iter_*_candidate_predictions.csv"
+        if group_id is not None
+        else "iter_*_candidate_predictions.csv"
+    )
+    for path in surrogate_dir.glob(pattern):
         try:
-            result[int(path.name.split("_")[1])] = path
+            iteration_index = 3 if group_id is not None else 1
+            result[int(path.name.split("_")[iteration_index])] = path
         except (ValueError, IndexError):
             continue
     return result
@@ -2266,18 +2995,67 @@ def _iteration_parameter_text(observation: dict | None) -> str:
 
 def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: str, view: str,
                     x_name: str, y_name: str | None, z_name: str | None):
+    current_observation = next(
+        (
+            observation for observation in session["observations"]
+            if int(observation.get("iteration", 0)) == int(iteration)
+        ),
+        None,
+    )
+    title = (
+        f"{view} | {value} | artifact iteration {iteration}<br>"
+        f"{_iteration_parameter_text(current_observation)}"
+    )
     if view == "3D tensor":
-        fig = plt.figure(figsize=(6.4, 4.4))
-        ax = fig.add_subplot(111, projection="3d")
         valid = frame[[x_name, y_name, z_name, value]].apply(pd.to_numeric, errors="coerce").dropna()
-        scatter = ax.scatter(valid[x_name], valid[y_name], valid[z_name], c=valid[value], cmap="viridis", s=8, alpha=.4)
+        fig = go.Figure(go.Scatter3d(
+            x=valid[x_name],
+            y=valid[y_name],
+            z=valid[z_name],
+            mode="markers",
+            name="Candidate predictions",
+            marker={
+                "size": 4,
+                "color": valid[value],
+                "colorscale": "Viridis",
+                "opacity": 0.55,
+                "showscale": True,
+                "colorbar": {"title": value},
+            },
+            customdata=valid[value],
+            hovertemplate=(
+                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                f"{z_name}: %{{z:.4g}}<br>{value}: %{{customdata:.4g}}"
+                "<extra></extra>"
+            ),
+        ))
         observed = _observed_points(session, iteration, [x_name, y_name, z_name])
         if observed:
-            xyz = [[float(obs["params"][axis]) for obs in observed] for axis in (x_name, y_name, z_name)]
-            ax.plot(*xyz, color="#d67b32", marker="o", label="observed path")
-            ax.legend()
-        ax.set(xlabel=x_name, ylabel=y_name, zlabel=z_name)
-        fig.colorbar(scatter, ax=ax, label=value, shrink=.75)
+            fig.add_trace(go.Scatter3d(
+                x=[float(obs["params"][x_name]) for obs in observed],
+                y=[float(obs["params"][y_name]) for obs in observed],
+                z=[float(obs["params"][z_name]) for obs in observed],
+                mode="lines+markers",
+                name="Observed path",
+                line={"color": "#d67b32", "width": 5},
+                marker={"color": "#d67b32", "size": 5},
+                hovertemplate=(
+                    f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                    f"{z_name}: %{{z:.4g}}<extra>Observed</extra>"
+                ),
+            ))
+        fig.update_layout(
+            title=title,
+            scene={
+                "xaxis_title": x_name,
+                "yaxis_title": y_name,
+                "zaxis_title": z_name,
+            },
+            width=760,
+            height=620,
+            margin={"l": 0, "r": 0, "t": 80, "b": 0},
+        )
+        return fig
     elif view == "2D map":
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
         valid = frame[[x_name, y_name, value]].apply(pd.to_numeric, errors="coerce").dropna()
@@ -2313,13 +3091,6 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             )
         ax.set(xlabel=x_name, ylabel=value)
         ax.legend()
-    current_observation = next(
-        (
-            observation for observation in session["observations"]
-            if int(observation.get("iteration", 0)) == int(iteration)
-        ),
-        None,
-    )
     ax.set_title(
         f"{view} | {value} | artifact iteration {iteration}\n"
         f"{_iteration_parameter_text(current_observation)}"
@@ -2365,8 +3136,28 @@ def render_bo_session_app() -> None:
         st.error(str(exc))
         return
 
+    full_session = session
+    groups = _session_channel_groups(session)
     with st.sidebar:
         st.divider()
+        if len(groups) > 1:
+            group_ids = [group["id"] for group in groups]
+            selected_group_scope = st.selectbox(
+                "Channel groups",
+                ["all", *group_ids],
+                format_func=lambda group_id: next(
+                    (
+                        f"{group['name']} (channels "
+                        f"{', '.join(map(str, group['channels']))})"
+                        for group in groups
+                        if group["id"] == group_id
+                    ),
+                    "All channel groups" if group_id == "all" else f"Group {group_id}",
+                ),
+                key="bo_channel_group_scope",
+            )
+            if selected_group_scope != "all":
+                session = _session_for_channel_group(session, selected_group_scope)
         correction_source = st.radio(
             "Corrected trace processing",
             ["BO session settings", "Analysis app settings"],
@@ -2389,8 +3180,17 @@ def render_bo_session_app() -> None:
     observations = session["observations"]
     history = _observation_table(session)
     if not observations:
-        st.warning("This BO session has no completed observations.")
+        st.warning("This channel group has no completed observations.")
         return
+    selected_group_id = session.get("selected_group_id")
+    if selected_group_id is not None:
+        selected_group = next(
+            group for group in groups if group["id"] == selected_group_id
+        )
+        st.caption(
+            f"Showing {selected_group['name']} — channels "
+            f"{', '.join(map(str, selected_group['channels']))}"
+        )
     paired_objective = any(
         str(obs.get("objective", "")).lower() == "paired_response"
         for obs in observations
@@ -2399,22 +3199,70 @@ def render_bo_session_app() -> None:
     best_index = int(np.nanargmax(q_values))
     best = observations[best_index]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Completed iterations", len(observations))
+    c1.metric("Completed observations", len(observations))
     c2.metric("Best Q", f"{best.get('Q_run', 0):.4g}")
-    c3.metric("Best iteration", best.get("iteration"))
+    best_group_name = best.get("group_name") or f"Group {best.get('group_id', 1)}"
+    best_label = (
+        f"{best_group_name} iter {best.get('iteration')}"
+        if len(groups) > 1 and selected_group_id is None
+        else best.get("iteration")
+    )
+    c3.metric("Best observation", best_label)
     c4.metric("Candidates", session["state"].get("candidate_count", "—"))
 
-    iteration_options = [int(obs["iteration"]) for obs in observations]
-    requested_iteration = st.session_state.get("bo_requested_iteration")
-    if requested_iteration not in iteration_options:
-        requested_iteration = iteration_options[-1]
-    selected_iteration = st.selectbox(
-        "Selected iteration",
-        iteration_options,
-        index=iteration_options.index(requested_iteration),
-    )
-    st.session_state.bo_requested_iteration = selected_iteration
-    observation = next(obs for obs in observations if int(obs["iteration"]) == selected_iteration)
+    all_groups_scope = len(groups) > 1 and selected_group_id is None
+    observation_group_ids = sorted({
+        int(obs.get("group_id", 1)) for obs in observations
+    })
+    observation_selector_columns = st.columns(2)
+    with observation_selector_columns[0]:
+        selected_observation_group_scope = st.selectbox(
+            "Observation group",
+            [*observation_group_ids, "all"],
+            format_func=lambda group_id: next(
+                (
+                    f"{group['name']} (channels "
+                    f"{', '.join(map(str, group['channels']))})"
+                    for group in groups
+                    if group["id"] == group_id
+                ),
+                "All groups" if group_id == "all" else f"Group {group_id}",
+            ),
+            key="bo_observation_group_scope",
+        )
+    group_scoped_observations = [
+        obs for obs in observations
+        if (
+            selected_observation_group_scope == "all"
+            or int(obs.get("group_id", 1)) == int(selected_observation_group_scope)
+        )
+    ]
+    scoped_iterations = sorted({
+        int(obs["iteration"]) for obs in group_scoped_observations
+    })
+    with observation_selector_columns[1]:
+        selected_iteration_scope = st.selectbox(
+            "Observation iteration",
+            [*scoped_iterations, "all"],
+            index=max(0, len(scoped_iterations) - 1),
+            format_func=lambda iteration: (
+                "All iterations" if iteration == "all" else f"Iteration {iteration}"
+            ),
+            key=f"bo_observation_iteration_{selected_observation_group_scope}",
+        )
+    selected_observations = [
+        obs for obs in group_scoped_observations
+        if (
+            selected_iteration_scope == "all"
+            or int(obs["iteration"]) == int(selected_iteration_scope)
+        )
+    ]
+    observation = selected_observations[-1]
+    selected_observation_group = int(observation.get("group_id", 1))
+    selected_iteration = int(observation["iteration"])
+    observation_is_single = len(selected_observations) == 1
+    iteration_options = scoped_iterations
+    iteration_state_key = "bo_requested_observation_iteration"
     overview, traces, real_data, surrogate, pdf_export = st.tabs(
         [
             "History & scores",
@@ -2426,41 +3274,125 @@ def render_bo_session_app() -> None:
     )
 
     with overview:
-        channel_metrics = {
-            metric: columns
-            for metric, columns in _channel_metric_columns(history).items()
-            if _history_metric_impacts_q(metric, session["config"], paired_objective)
-        }
+        trend_history = history
+        if (
+            selected_observation_group_scope != "all"
+            and "group_id" in history.columns
+        ):
+            history_group_ids = pd.to_numeric(
+                history["group_id"],
+                errors="coerce",
+            )
+            trend_history = history.loc[
+                history_group_ids == int(selected_observation_group_scope)
+            ].reset_index(drop=True)
+        trend_scope_key = str(selected_observation_group_scope)
+        channel_metrics = _channel_metric_columns(trend_history)
+        if selected_observation_group_scope != "all":
+            selected_trend_group = next(
+                (
+                    group for group in groups
+                    if group["id"] == int(selected_observation_group_scope)
+                ),
+                None,
+            )
+            configured_channels = {
+                str(channel)
+                for channel in (
+                    selected_trend_group.get("channels", [])
+                    if selected_trend_group is not None
+                    else []
+                )
+            }
+            if configured_channels:
+                channel_metrics = {
+                    metric_name: {
+                        channel: column
+                        for channel, column in columns.items()
+                        if channel in configured_channels
+                    }
+                    for metric_name, columns in channel_metrics.items()
+                }
+                channel_metrics = {
+                    metric_name: columns
+                    for metric_name, columns in channel_metrics.items()
+                    if columns
+                }
         channel_column_names = {
-            column
-            for columns in channel_metrics.values()
-            for column in columns.values()
+            column for column in trend_history.columns
+            if (
+                re.fullmatch(r"Q_ch\d+", str(column), re.IGNORECASE)
+                or re.fullmatch(r"ch\d+_.+", str(column), re.IGNORECASE)
+            )
         }
         global_metrics = [
-            metric for metric in _numeric_columns(history)
-            if (
-                metric not in channel_column_names
-                and _history_metric_impacts_q(
-                    metric, session["config"], paired_objective,
-                )
-            )
+            metric for metric in _numeric_columns(trend_history)
+            if metric not in channel_column_names
         ]
         metric_options = (
             [f"global::{metric}" for metric in global_metrics]
             + [f"channel::{metric}" for metric in channel_metrics]
         )
-        default_metric = "global::Q_run" if "Q_run" in global_metrics else metric_options[0]
-        metric_choice = st.selectbox(
-            "Trend metric",
-            metric_options,
-            index=metric_options.index(default_metric),
-            format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
-        )
+        if metric_options:
+            default_metric = (
+                "global::Q_run"
+                if "Q_run" in global_metrics
+                else metric_options[0]
+            )
+            metric_choice = st.selectbox(
+                "Trend metric",
+                metric_options,
+                index=metric_options.index(default_metric),
+                format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
+                key=f"bo_trend_metric_{trend_scope_key}",
+            )
+        else:
+            st.info("No trend metrics change within the current group scope.")
+            metric_choice = "global::__no_changing_metric__"
         metric_kind, metric = metric_choice.split("::", 1)
+        plot_metric_kind = metric_kind
+        plot_metric = metric
+        q_run_channel_view = None
+        if (
+            metric_kind == "global"
+            and metric == "Q_run"
+            and "Q_channel" in channel_metrics
+        ):
+            q_run_channel_view = st.radio(
+                "Q display",
+                [
+                    "Run-level Q",
+                    "Average channel Q",
+                    "Overlay channel Q",
+                    "Separate channel Q plots",
+                ],
+                horizontal=True,
+                key=f"bo_q_run_display_{trend_scope_key}",
+            )
+            if q_run_channel_view != "Run-level Q":
+                plot_metric_kind = "channel"
+                plot_metric = "Q_channel"
+        group_layout = "Plot groups overlaid"
+        if (
+            metric in trend_history.columns
+            and
+            "group_id" in trend_history.columns
+            and trend_history["group_id"].nunique(dropna=True) > 1
+        ):
+            group_layout = st.radio(
+                "Group display",
+                [
+                    "Plot groups overlaid",
+                    "Plot groups separately",
+                    "Average groups together",
+                ],
+                horizontal=True,
+                key=f"bo_trend_group_layout_{trend_scope_key}_{metric}",
+            )
         chart_key_suffix = metric
-        if metric_kind == "channel":
+        if plot_metric_kind == "channel":
             available_metric_channels = sorted(
-                channel_metrics[metric],
+                channel_metrics[plot_metric],
                 key=_channel_sort_key,
             )
             trend_channels = st.multiselect(
@@ -2468,21 +3400,29 @@ def render_bo_session_app() -> None:
                 available_metric_channels,
                 default=available_metric_channels,
                 format_func=lambda channel: f"Ch {channel}",
-                key=f"bo_trend_channels_{metric}",
+                key=f"bo_trend_channels_{trend_scope_key}_{plot_metric}",
             )
-            channel_layout = st.radio(
-                "Channel display",
-                ["Overlay selected channels", "Separate plots", "Average selected channels"],
-                horizontal=True,
-                key=f"bo_trend_layout_{metric}",
-            )
+            if q_run_channel_view is None:
+                channel_layout = st.radio(
+                    "Channel display",
+                    ["Overlay selected channels", "Separate plots", "Average selected channels"],
+                    horizontal=True,
+                    key=f"bo_trend_layout_{trend_scope_key}_{plot_metric}",
+                )
+            else:
+                channel_layout = {
+                    "Average channel Q": "Average selected channels",
+                    "Overlay channel Q": "Overlay selected channels",
+                    "Separate channel Q plots": "Separate plots",
+                }[q_run_channel_view]
             if trend_channels:
                 trend_figure = _plot_channel_trend(
-                    history,
-                    metric,
-                    channel_metrics[metric],
+                    trend_history,
+                    plot_metric,
+                    channel_metrics[plot_metric],
                     trend_channels,
                     channel_layout,
+                    group_layout,
                 )
             else:
                 trend_figure = go.Figure()
@@ -2492,52 +3432,20 @@ def render_bo_session_app() -> None:
                 )
                 trend_figure.update_layout(width=650, height=340)
             chart_key_suffix = (
-                f"{metric}_{channel_layout}_{'_'.join(trend_channels) or 'none'}"
+                f"{metric}_{plot_metric}_{channel_layout}_"
+                f"{group_layout}_{'_'.join(trend_channels) or 'none'}"
             )
         else:
-            trend_figure = _plot_trend(history, metric)
-        trend_events = []
-        if (
-            metric_kind == "channel"
-            and channel_layout == "Average selected channels"
-            and trend_channels
-        ):
-            average_column, overlay_column = st.columns(2)
-            trend_events.append(average_column.plotly_chart(
-                trend_figure,
-                use_container_width=True,
-                on_select="rerun",
-                selection_mode="points",
-                key=f"bo_trend_{chart_key_suffix}_average",
-            ))
-            trend_events.append(overlay_column.plotly_chart(
-                _plot_channel_trend(
-                    history, metric, channel_metrics[metric],
-                    trend_channels, "Overlay selected channels",
-                ),
-                use_container_width=True,
-                on_select="rerun",
-                selection_mode="points",
-                key=f"bo_trend_{chart_key_suffix}_overlay",
-            ))
-            trend_events.append(st.plotly_chart(
-                _plot_channel_trend(
-                    history, metric, channel_metrics[metric],
-                    trend_channels, "Separate plots",
-                ),
-                use_container_width=False,
-                on_select="rerun",
-                selection_mode="points",
-                key=f"bo_trend_{chart_key_suffix}_separate",
-            ))
-        else:
-            trend_events.append(st.plotly_chart(
-                trend_figure,
-                use_container_width=False,
-                on_select="rerun",
-                selection_mode="points",
-                key=f"bo_trend_{chart_key_suffix}",
-            ))
+            trend_figure = _plot_trend(trend_history, metric, group_layout)
+            chart_key_suffix = f"{metric}_{group_layout}"
+        chart_key_suffix = f"{trend_scope_key}_{chart_key_suffix}"
+        trend_events = [st.plotly_chart(
+            trend_figure,
+            use_container_width=False,
+            on_select="rerun",
+            selection_mode="points",
+            key=f"bo_trend_{chart_key_suffix}",
+        )]
         trend_q_kind = _metric_q_kind(metric, paired_objective)
         if trend_q_kind:
             _render_q_equation(session["config"], trend_q_kind)
@@ -2551,7 +3459,7 @@ def render_bo_session_app() -> None:
         )
         click_state_key = (
             f"bo_last_trend_click_{session['state'].get('session_id', 'session')}_"
-            f"{chart_key_suffix}"
+            f"{selected_group_id}_{chart_key_suffix}"
         )
         last_clicked_iteration = st.session_state.get(click_state_key)
         if clicked_iteration is not None and clicked_iteration != last_clicked_iteration:
@@ -2561,14 +3469,21 @@ def render_bo_session_app() -> None:
             and clicked_iteration != last_clicked_iteration
         )
         if (
+            not all_groups_scope
+            and
             is_new_plot_click
             and clicked_iteration in iteration_options
             and clicked_iteration != selected_iteration
         ):
-            st.session_state.bo_requested_iteration = clicked_iteration
+            st.session_state[iteration_state_key] = (
+                f"g{selected_observation_group}:i{clicked_iteration}"
+            )
             st.rerun()
 
-        if any(str(obs.get("objective", "")).lower() == "paired_response" for obs in observations):
+        if any(
+            str(obs.get("objective", "")).lower() == "paired_response"
+            for obs in group_scoped_observations
+        ):
             st.divider()
             st.subheader("Buffer vs target trends")
             paired_metric = st.selectbox(
@@ -2580,7 +3495,10 @@ def render_bo_session_app() -> None:
                 ),
                 key="bo_paired_trend_metric",
             )
-            paired_series = _paired_trend_values(observations, paired_metric)
+            paired_series = _paired_trend_values(
+                group_scoped_observations,
+                paired_metric,
+            )
             paired_channels = sorted(paired_series, key=_channel_sort_key)
             selected_paired_channels = st.multiselect(
                 "Buffer/target channels",
@@ -2672,7 +3590,7 @@ def render_bo_session_app() -> None:
             )
             paired_click_key = (
                 f"bo_last_paired_click_{session['state'].get('session_id', 'session')}_"
-                f"{paired_chart_suffix}"
+                f"{selected_group_id}_{paired_chart_suffix}"
             )
             last_paired_click = st.session_state.get(paired_click_key)
             if (
@@ -2681,10 +3599,14 @@ def render_bo_session_app() -> None:
             ):
                 st.session_state[paired_click_key] = paired_clicked_iteration
                 if (
+                    not all_groups_scope
+                    and
                     paired_clicked_iteration in iteration_options
                     and paired_clicked_iteration != selected_iteration
                 ):
-                    st.session_state.bo_requested_iteration = paired_clicked_iteration
+                    st.session_state[iteration_state_key] = (
+                        f"g{selected_observation_group}:i{paired_clicked_iteration}"
+                    )
                     st.rerun()
 
             st.divider()
@@ -2698,7 +3620,9 @@ def render_bo_session_app() -> None:
                 ),
                 key="bo_chronological_metric",
             )
-            chronological_channels = _real_data_channels(observations)
+            chronological_channels = _real_data_channels(
+                group_scoped_observations
+            )
             selected_chronological_channels = st.multiselect(
                 "Chronological channels",
                 chronological_channels,
@@ -2713,7 +3637,7 @@ def render_bo_session_app() -> None:
                 key=f"bo_chronological_mode_{chronological_metric}",
             )
             chronological_points, phase_transitions = _chronological_points(
-                observations,
+                group_scoped_observations,
                 session["config"],
                 chronological_metric,
                 selected_chronological_channels,
@@ -2725,7 +3649,7 @@ def render_bo_session_app() -> None:
                 and selected_chronological_channels
             ):
                 chronological_raw_points, _ = _chronological_points(
-                    observations,
+                    group_scoped_observations,
                     session["config"],
                     chronological_metric,
                     selected_chronological_channels,
@@ -2805,7 +3729,8 @@ def render_bo_session_app() -> None:
                 )
                 chronological_click_key = (
                     f"bo_last_chronological_click_"
-                    f"{session['state'].get('session_id', 'session')}_{chronological_suffix}"
+                    f"{session['state'].get('session_id', 'session')}_"
+                    f"{selected_group_id}_{chronological_suffix}"
                 )
                 last_chronological_click = st.session_state.get(chronological_click_key)
                 if (
@@ -2814,30 +3739,70 @@ def render_bo_session_app() -> None:
                 ):
                     st.session_state[chronological_click_key] = chronological_iteration
                     if (
+                        not all_groups_scope
+                        and
                         chronological_iteration in iteration_options
                         and chronological_iteration != selected_iteration
                     ):
-                        st.session_state.bo_requested_iteration = chronological_iteration
+                        st.session_state[iteration_state_key] = (
+                            f"g{selected_observation_group}:i{chronological_iteration}"
+                        )
                         st.rerun()
 
         st.subheader("History")
         st.dataframe(history, use_container_width=True, hide_index=True)
-        st.subheader(f"Iteration {selected_iteration} per-channel scores")
-        channel_frame = _channel_table(observation)
-        if channel_frame.empty:
-            st.info("No per-channel scores were recorded for this iteration.")
+        if not observation_is_single:
+            st.info(
+                "Select one group and one iteration to inspect per-channel "
+                "scores for a single observation."
+            )
         else:
-            st.dataframe(channel_frame, use_container_width=True, hide_index=True)
+            st.subheader(
+                f"{observation.get('group_name', f'Group {selected_observation_group}')} "
+                f"iteration {selected_iteration} per-channel scores"
+            )
+            channel_frame = _channel_table(observation)
+            if channel_frame.empty:
+                st.info("No per-channel scores were recorded for this iteration.")
+            else:
+                st.dataframe(channel_frame, use_container_width=True, hide_index=True)
 
     with traces:
-        available_traces = _trace_paths(session, observation)
+        trace_observations = selected_observations
+        trace_all_mode = not observation_is_single
+        selected_group_label = (
+            "All groups"
+            if selected_observation_group_scope == "all"
+            else next(
+                (
+                    group["name"] for group in groups
+                    if group["id"] == selected_observation_group_scope
+                ),
+                f"Group {selected_observation_group_scope}",
+            )
+        )
+        selected_iteration_label = (
+            "all iterations"
+            if selected_iteration_scope == "all"
+            else f"iteration {selected_iteration_scope}"
+        )
+        trace_selection_label = (
+            f"{selected_group_label} — {selected_iteration_label}"
+        )
+        with st.spinner("Locating SWV traces..."):
+            trace_entries = [
+                (trace_observation, trace)
+                for trace_observation in trace_observations
+                for trace in _trace_paths(full_session, trace_observation)
+            ]
+        available_traces = [trace for _observation, trace in trace_entries]
         available_channels = sorted(
             {item["channel"] for item in available_traces},
             key=_channel_sort_key,
         )
         if not available_traces:
             st.info(
-                "No locally accessible raw SWV files were found for this iteration. "
+                "No locally accessible raw SWV files were found for this selection. "
                 "The recorded CSVs must remain inside or beside the experiment folder."
             )
         else:
@@ -2846,13 +3811,19 @@ def render_bo_session_app() -> None:
                 available_channels,
                 default=available_channels,
                 format_func=lambda channel: f"Ch {channel}" if channel != "Unknown" else "Unknown channel",
-                key=f"bo_trace_channels_{selected_iteration}",
+                key=(
+                    f"bo_trace_channels_{selected_observation_group_scope}_"
+                    f"{selected_iteration_scope}"
+                ),
             )
             trace_layout = st.radio(
                 "Plot layout",
-                ["Separate plot per channel", "Overlay selected channels"],
+                ["Overlay selected channels", "Separate plot per channel"],
                 horizontal=True,
-                key=f"bo_trace_layout_{selected_iteration}",
+                key=(
+                    f"bo_trace_layout_{selected_observation_group_scope}_"
+                    f"{selected_iteration_scope}"
+                ),
             )
 
             channel_groups = (
@@ -2874,15 +3845,32 @@ def render_bo_session_app() -> None:
                     (corrected_column, True, "Smoothed corrected traces"),
                 ):
                     column.subheader(heading)
-                    figure, errors = _plot_traces(
-                        session,
-                        observation,
-                        corrected,
-                        channel_group,
-                        trace_analysis,
-                        correction_label,
-                        trace_layout == "Overlay selected channels",
-                    )
+                    with column:
+                        with st.spinner(
+                            "Processing corrected traces..."
+                            if corrected
+                            else "Loading raw traces..."
+                        ):
+                            if trace_all_mode:
+                                figure, errors = _plot_iteration_trace_overlay(
+                                    trace_entries,
+                                    corrected,
+                                    channel_group,
+                                    trace_analysis,
+                                    correction_label,
+                                    trace_selection_label,
+                                )
+                            else:
+                                figure, errors = _plot_traces(
+                                    session,
+                                    observation,
+                                    corrected,
+                                    channel_group,
+                                    trace_analysis,
+                                    correction_label,
+                                    trace_layout == "Overlay selected channels",
+                                    available_traces,
+                                )
                     column.pyplot(
                         figure,
                         clear_figure=True,
@@ -2917,28 +3905,72 @@ def render_bo_session_app() -> None:
             ),
             key="bo_real_metric",
         )
-        real_channels = _real_data_channels(observations)
-        selected_real_channels = st.multiselect(
-            "Metric channels",
-            real_channels,
-            default=real_channels,
-            format_func=lambda channel: f"Ch {channel}",
-            key=f"bo_real_channels_{real_metric}_{real_phase}",
-        )
+        observed_group_ids = {
+            int(observation.get("group_id", 1)) for observation in observations
+        }
+        real_groups = [
+            group for group in groups if group["id"] in observed_group_ids
+        ]
+        handling_options = [
+            "Average selected channels",
+            "Plot channels individually",
+        ]
+        if real_groups:
+            handling_options.append("Plot channel groups")
         real_channel_mode = st.radio(
             "Channel handling",
-            ["Average selected channels", "Plot channels individually"],
+            handling_options,
             horizontal=True,
             key=f"bo_real_channel_mode_{real_metric}_{real_phase}",
         )
+        selected_real_groups = []
+        selected_real_channels = []
+        if real_channel_mode == "Plot channel groups":
+            selected_group_ids = st.multiselect(
+                "Metric channel groups",
+                [group["id"] for group in real_groups],
+                default=[group["id"] for group in real_groups],
+                format_func=lambda group_id: next(
+                    (
+                        f"{group['name']} (channels "
+                        f"{', '.join(map(str, group['channels']))})"
+                        for group in real_groups
+                        if group["id"] == group_id
+                    ),
+                    f"Group {group_id}",
+                ),
+                key=f"bo_real_groups_{real_metric}_{real_phase}",
+            )
+            selected_real_groups = [
+                group for group in real_groups
+                if group["id"] in selected_group_ids
+            ]
+        else:
+            real_channels = _real_data_channels(observations)
+            selected_real_channels = st.multiselect(
+                "Metric channels",
+                real_channels,
+                default=real_channels,
+                format_func=lambda channel: f"Ch {channel}",
+                key=f"bo_real_channels_{real_metric}_{real_phase}",
+            )
         requested_phases = ("buffer", "target") if real_phase == "both" else (real_phase,)
         real_points_by_phase = {
-            phase: _real_metric_points(
-                observations,
-                real_metric,
-                phase,
-                selected_real_channels,
-                average_channels=real_channel_mode == "Average selected channels",
+            phase: (
+                _real_group_metric_points(
+                    observations,
+                    real_metric,
+                    phase,
+                    selected_real_groups,
+                )
+                if real_channel_mode == "Plot channel groups"
+                else _real_metric_points(
+                    observations,
+                    real_metric,
+                    phase,
+                    selected_real_channels,
+                    average_channels=real_channel_mode == "Average selected channels",
+                )
             )
             for phase in requested_phases
         }
@@ -2951,7 +3983,10 @@ def render_bo_session_app() -> None:
             ignore_index=True,
         ) if any(not points.empty for points in real_points_by_phase.values()) else pd.DataFrame()
         if combined_real_points.empty:
-            st.info("No recorded values are available for this metric, phase, and channel selection.")
+            st.info(
+                "No recorded values are available for this metric, phase, "
+                "and channel or group selection."
+            )
         else:
             real_dimensions = [
                 parameter
@@ -3010,49 +4045,129 @@ def render_bo_session_app() -> None:
                         if real_points_by_phase[phase].empty:
                             column.info(f"No {phase} values are available.")
                         else:
-                            column.plotly_chart(
-                                _plot_real_data_landscape(
-                                    real_points_by_phase[phase],
-                                    real_metric,
-                                    phase,
-                                    real_view,
-                                    real_x,
-                                    real_y,
-                                    real_z,
-                                ),
-                                use_container_width=True,
-                                key=(
-                                    f"bo_real_plot_{phase}_{real_metric}_{real_view}_"
-                                    f"{real_x}_{real_y}_{real_z}_{real_channel_mode}"
-                                ),
+                            phase_points = real_points_by_phase[phase]
+                            plot_series = (
+                                list(phase_points.groupby("channel", sort=False))
+                                if real_channel_mode == "Plot channel groups"
+                                else [(None, phase_points)]
                             )
+                            for series_name, series_points in plot_series:
+                                if series_name is not None:
+                                    column.markdown(f"**{series_name}**")
+                                column.plotly_chart(
+                                    _plot_real_data_landscape(
+                                        series_points,
+                                        real_metric,
+                                        phase,
+                                        real_view,
+                                        real_x,
+                                        real_y,
+                                        real_z,
+                                    ),
+                                    use_container_width=True,
+                                    key=(
+                                        f"bo_real_plot_{phase}_{series_name}_{real_metric}_"
+                                        f"{real_view}_{real_x}_{real_y}_{real_z}_"
+                                        f"{real_channel_mode}"
+                                    ),
+                                )
                 else:
-                    st.plotly_chart(
-                        _plot_real_data_landscape(
-                            real_points_by_phase[real_phase],
-                            real_metric,
-                            real_phase,
-                            real_view,
-                            real_x,
-                            real_y,
-                            real_z,
-                        ),
-                        use_container_width=False,
-                        key=(
-                            f"bo_real_plot_{real_metric}_{real_phase}_{real_view}_"
-                            f"{real_x}_{real_y}_{real_z}_{real_channel_mode}"
-                        ),
+                    phase_points = real_points_by_phase[real_phase]
+                    plot_series = (
+                        list(phase_points.groupby("channel", sort=False))
+                        if (
+                            real_channel_mode == "Plot channel groups"
+                            and real_view != "1D slice"
+                        )
+                        else [(None, phase_points)]
                     )
+                    for series_name, series_points in plot_series:
+                        if series_name is not None:
+                            st.markdown(f"#### {series_name}")
+                        st.plotly_chart(
+                            _plot_real_data_landscape(
+                                series_points,
+                                real_metric,
+                                real_phase,
+                                real_view,
+                                real_x,
+                                real_y,
+                                real_z,
+                            ),
+                            use_container_width=False,
+                            key=(
+                                f"bo_real_plot_{series_name}_{real_metric}_{real_phase}_"
+                                f"{real_view}_{real_x}_{real_y}_{real_z}_"
+                                f"{real_channel_mode}"
+                            ),
+                        )
                 if real_metric == "Classic Q":
                     _render_q_equation(session["config"], "classic")
                 st.dataframe(combined_real_points, use_container_width=True, hide_index=True)
 
     with surrogate:
-        files = _surrogate_files(session["root"])
-        if not files:
-            st.info("No candidate-prediction artifacts were saved for this session.")
+        surrogate_session = session
+        surrogate_group_id = session.get("selected_group_id")
+        grouped_surrogate_files = {
+            group["id"]: _surrogate_files(full_session["root"], group["id"])
+            for group in groups
+        }
+        available_surrogate_groups = [
+            group for group in groups if grouped_surrogate_files[group["id"]]
+        ]
+        if available_surrogate_groups:
+            surrogate_group_options = [
+                group["id"] for group in available_surrogate_groups
+            ]
+            surrogate_group_key = (
+                f"bo_surrogate_group_"
+                f"{session['state'].get('session_id', session['root'].name)}"
+            )
+            requested_surrogate_group = st.session_state.get(
+                surrogate_group_key,
+                surrogate_group_id,
+            )
+            if requested_surrogate_group not in surrogate_group_options:
+                requested_surrogate_group = surrogate_group_options[0]
+            st.session_state[surrogate_group_key] = requested_surrogate_group
+            surrogate_group_id = st.selectbox(
+                "Surrogate channel group",
+                surrogate_group_options,
+                format_func=lambda group_id: next(
+                    (
+                        f"{group['name']} (channels "
+                        f"{', '.join(map(str, group['channels']))})"
+                        for group in available_surrogate_groups
+                        if group["id"] == group_id
+                    ),
+                    f"Group {group_id}",
+                ),
+                key=surrogate_group_key,
+            )
+            surrogate_session = _session_for_channel_group(
+                full_session,
+                surrogate_group_id,
+            )
+            files = grouped_surrogate_files[surrogate_group_id]
         else:
-            artifact_iteration = st.selectbox("Artifact iteration", sorted(files), index=len(files) - 1)
+            files = _surrogate_files(full_session["root"])
+        if not files:
+            if len(groups) > 1:
+                st.info(
+                    "No group-keyed candidate-prediction artifacts were saved for "
+                    "these channel groups. Older grouped sessions reused artifact "
+                    "filenames between groups, so those ambiguous files are not shown."
+                )
+            else:
+                st.info("No candidate-prediction artifacts were saved for this session.")
+        else:
+            artifact_iterations = sorted(files)
+            artifact_iteration = st.selectbox(
+                "Artifact iteration",
+                artifact_iterations,
+                index=len(artifact_iterations) - 1,
+                key=f"bo_surrogate_iteration_group_{surrogate_group_id}",
+            )
             predictions = pd.read_csv(files[artifact_iteration])
             dimensions = [name for name in PARAMETERS if name in predictions.columns and predictions[name].nunique(dropna=True) > 1]
             value = st.selectbox("Value", [name for name in SURROGATE_VALUES if name in predictions.columns])
@@ -3066,14 +4181,25 @@ def render_bo_session_app() -> None:
             y_name = st.selectbox("Y", [name for name in dimensions if name != x_name], index=0) if view != "1D slice" else None
             z_options = [name for name in dimensions if name not in (x_name, y_name)]
             z_name = st.selectbox("Z", z_options, index=0) if view == "3D tensor" else None
-            st.pyplot(
-                _plot_surrogate(
-                    session, predictions, artifact_iteration, value, view,
-                    x_name, y_name, z_name,
-                ),
-                clear_figure=True,
-                use_container_width=False,
+            surrogate_figure = _plot_surrogate(
+                surrogate_session, predictions, artifact_iteration, value, view,
+                x_name, y_name, z_name,
             )
+            if view == "3D tensor":
+                st.plotly_chart(
+                    surrogate_figure,
+                    use_container_width=True,
+                    key=(
+                        f"bo_surrogate_3d_{surrogate_group_id}_"
+                        f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}"
+                    ),
+                )
+            else:
+                st.pyplot(
+                    surrogate_figure,
+                    clear_figure=True,
+                    use_container_width=False,
+                )
             _render_q_equation(
                 session["config"],
                 "paired" if paired_objective else "classic",
@@ -3092,7 +4218,8 @@ def render_bo_session_app() -> None:
             "long reports and may take several minutes to render."
         )
         report_key = (
-            f"bo_pdf_bytes_{session['state'].get('session_id', session['root'].name)}"
+            f"bo_pdf_bytes_{session['state'].get('session_id', session['root'].name)}_"
+            f"{selected_group_id}"
         )
         if st.button(
             "Build exhaustive PDF",
