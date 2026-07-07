@@ -2184,7 +2184,7 @@ if view == "Overlays":
                     st.warning("No plottable traces for this channel.")
     else:
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
-        trace_type_options = ["Corrected", "Smoothed Corrected", "Raw", "Smoothed"]
+        trace_type_options = ["Corrected", "Smoothed Corrected", "Normalized Smoothed Corrected", "Raw", "Smoothed"]
         if has_wavelet_denoised_trace:
             trace_type_options.append("Wavelet Denoised")
         trace_type   = ov_c1.radio("Trace type", trace_type_options,
@@ -2202,11 +2202,14 @@ if view == "Overlays":
         key_map = {
             "Corrected": "corrected_current",
             "Smoothed Corrected": "smoothed_corrected_current",
+            "Normalized Smoothed Corrected": "smoothed_corrected_current",
             "Raw": "raw_current",
             "Smoothed": "smoothed_current",
             "Wavelet Denoised": "wavelet_denoised_current",
         }
         y_key = key_map[trace_type]
+        normalize_to_peak = trace_type == "Normalized Smoothed Corrected"
+        overlay_ylabel = "Normalized current (peak = 1)" if normalize_to_peak else "Current (uA)"
 
         for ch in channels_display:
             ch_res = ok_plot_results_by_channel.get(ch, [])
@@ -2216,11 +2219,12 @@ if view == "Overlays":
                 fig = plot_overlaid_traces(
                     ch_res, y_key=y_key,
                     title=f"{trace_type}  Ch{ch}",
-                    ylabel="Current (uA)",
+                    ylabel=overlay_ylabel,
                     colormap_name=cmap_name,
                     show_anchors=show_anchors,
                     show_peak_markers=(show_peak_markers and y_key != "wavelet_denoised_current"),
                     show_zero_baseline=(show_baseline and y_key in ("corrected_current", "smoothed_corrected_current")),
+                    normalize_to_peak=normalize_to_peak,
                 )
                 if fig:
                     st.pyplot(fig)
@@ -3060,16 +3064,25 @@ if view == "Export":
                             _save(fig, f"overlays/ch{ch}_{lbl}.{fig_format}")
                 else:
                     export_overlay_keys = [
-                        ("corrected_current", "corrected"),
-                        ("smoothed_corrected_current", "smoothed_corrected"),
-                        ("raw_current", "raw"),
+                        ("corrected_current", "corrected", False, "Current (uA)"),
+                        ("smoothed_corrected_current", "smoothed_corrected", False, "Current (uA)"),
+                        (
+                            "smoothed_corrected_current",
+                            "normalized_smoothed_corrected",
+                            True,
+                            "Normalized current (peak = 1)",
+                        ),
+                        ("raw_current", "raw", False, "Current (uA)"),
                     ]
                     if has_wavelet_denoised_trace:
-                        export_overlay_keys.append(("wavelet_denoised_current", "wavelet_denoised"))
-                    for yk, lbl in export_overlay_keys:
+                        export_overlay_keys.append(("wavelet_denoised_current", "wavelet_denoised", False, "Current (uA)"))
+                    for yk, lbl, normalize_to_peak, ylabel in export_overlay_keys:
                         fig = plot_overlaid_traces(ch_res, y_key=yk,
                                                    title=f"Ch{ch}  {lbl}",
-                                                   show_anchors=(yk == "corrected_current"))
+                                                   ylabel=ylabel,
+                                                   show_anchors=(yk == "corrected_current"),
+                                                   show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),
+                                                   normalize_to_peak=normalize_to_peak)
                         if fig:
                             _save(fig, f"overlays/ch{ch}_{lbl}.{fig_format}")
 

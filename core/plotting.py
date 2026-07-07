@@ -107,6 +107,8 @@ def _cmap_fig(
 
     show_minima_candidates: bool = False,
 
+    normalize_to_peak: bool = False,
+
 ) -> plt.Figure:
 
     n = len(results)
@@ -128,8 +130,23 @@ def _cmap_fig(
 
             continue
 
+        y_plot = np.asarray(r[y_key], dtype=float)
+        peak_idx_key = (
+            "peak_idx_corr"
+            if y_key in ("corrected_current", "smoothed_corrected_current")
+            else "peak_idx"
+        )
+        if normalize_to_peak:
+            peak_idx = r.get(peak_idx_key)
+            if peak_idx is None or not 0 <= peak_idx < len(y_plot):
+                continue
+            peak_height = float(y_plot[peak_idx])
+            if not np.isfinite(peak_height) or np.isclose(peak_height, 0.0):
+                continue
+            y_plot = y_plot / peak_height
+
         color = cmap(norm(i))
-        ax.plot(r["voltage"], r[y_key], color=color, lw=linewidth, alpha=alpha)
+        ax.plot(r["voltage"], y_plot, color=color, lw=linewidth, alpha=alpha)
 
 
 
@@ -238,13 +255,8 @@ def _cmap_fig(
 
             v = r["voltage"]
 
-            y = r[y_key]
+            y = y_plot
 
-            peak_idx_key = (
-                "peak_idx_corr"
-                if y_key in ("corrected_current", "smoothed_corrected_current")
-                else "peak_idx"
-            )
             peak_idx = r.get(peak_idx_key)
 
             if peak_idx is not None and 0 <= peak_idx < len(v):
@@ -272,6 +284,10 @@ def _cmap_fig(
     ax.set_xlabel("Voltage (V)")
 
     ax.set_ylabel(ylabel)
+
+    if normalize_to_peak:
+
+        ax.set_ylim(-0.2, 1.2)
 
     ax.grid(False)
 
@@ -807,8 +823,27 @@ def plot_overlaid_traces(
 
     show_minima_candidates: bool = False,
 
+    normalize_to_peak: bool = False,
+
 ) -> Optional[plt.Figure]:
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
+
+    if normalize_to_peak:
+        peak_idx_key = (
+            "peak_idx_corr"
+            if y_key in ("corrected_current", "smoothed_corrected_current")
+            else "peak_idx"
+        )
+        filtered = []
+        for r in usable:
+            peak_idx = r.get(peak_idx_key)
+            y = np.asarray(r.get(y_key), dtype=float)
+            if peak_idx is None or not 0 <= peak_idx < len(y):
+                continue
+            peak_height = float(y[peak_idx])
+            if np.isfinite(peak_height) and not np.isclose(peak_height, 0.0):
+                filtered.append(r)
+        usable = filtered
 
     if not usable:
 
@@ -824,7 +859,9 @@ def plot_overlaid_traces(
 
                      show_local_baselines=show_local_baselines,
 
-                     show_minima_candidates=show_minima_candidates)
+                     show_minima_candidates=show_minima_candidates,
+
+                     normalize_to_peak=normalize_to_peak)
 
 
 
@@ -1785,4 +1822,3 @@ def plot_single_trace(result: dict) -> plt.Figure:
     fig.suptitle(result.get("file_name", ""), fontsize=9, y=1.01)
     fig.tight_layout()
     return fig
-
