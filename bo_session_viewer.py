@@ -7,6 +7,7 @@ import itertools
 import base64
 from functools import lru_cache
 from io import BytesIO
+import math
 import os
 from pathlib import Path, PureWindowsPath
 import re
@@ -3363,7 +3364,12 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
     paths: list[dict] = []
     root = session["root"]
 
-    def add(raw_path: Any, phase: str | None = None, channel: Any = None) -> None:
+    def add(
+        raw_path: Any,
+        phase: str | None = None,
+        channel: Any = None,
+        source_rank: int = 0,
+    ) -> None:
         path = _resolve_recorded_path(root, raw_path)
         if not path or not path.is_file() or path.suffix.lower() != ".csv":
             return
@@ -3375,15 +3381,20 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
         existing = next((item for item in paths if item["path"] == path), None)
         if existing is not None:
             # Explicit analysis-record metadata is more reliable than path inference.
-            if phase in ("buffer", "target"):
+            if phase in ("buffer", "target", "measurement"):
                 existing["phase"] = phase
             if resolved_channel != "Unknown":
                 existing["channel"] = resolved_channel
+            existing["source_rank"] = max(
+                int(existing.get("source_rank", 0)),
+                int(source_rank),
+            )
             return
         paths.append({
             "phase": resolved_phase,
             "path": path,
             "channel": resolved_channel,
+            "source_rank": int(source_rank),
         })
 
     # Paired records explicitly identify buffer versus target. Standard BO
@@ -3417,16 +3428,46 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
                         recorded_path,
                         phase=phase,
                         channel=row.get("channel"),
+                        source_rank=30,
                     )
             except Exception:
                 pass
         for raw in payload.get("folders") or []:
-            add(raw, phase=phase)
+            add(raw, phase=phase, source_rank=20)
 
     for raw in observation.get("archived_measurements") or []:
-        add(raw, phase=_phase_from_path(raw))
+        add(
+            raw,
+            phase=_phase_from_path(raw) if paired else "measurement",
+            source_rank=10,
+        )
 
-    return paths
+    deduped: dict[tuple[str, str], dict] = {}
+    for item in paths:
+        key = (str(item["phase"]).lower(), str(item["channel"]))
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = item
+            continue
+        item_rank = int(item.get("source_rank", 0))
+        existing_rank = int(existing.get("source_rank", 0))
+        if item_rank > existing_rank:
+            deduped[key] = item
+            continue
+        if item_rank == existing_rank:
+            try:
+                if item["path"].stat().st_mtime_ns > existing["path"].stat().st_mtime_ns:
+                    deduped[key] = item
+            except OSError:
+                pass
+    cleaned = []
+    for item in deduped.values():
+        cleaned.append({
+            "phase": item["phase"],
+            "path": item["path"],
+            "channel": item["channel"],
+        })
+    return cleaned
 
 
 def _channel_sort_key(channel: str):
@@ -3917,6 +3958,267 @@ def _plot_iteration_trace_overlay(
         elif len(entries) <= 16:
             ax.legend(fontsize=7)
     fig.subplots_adjust(left=.12, right=.97, bottom=.14, top=.78)
+    return fig, errors
+
+
+def _plot_chronological_swv_stack(
+    trace_entries: list[tuple[dict, dict]],
+    corrected: bool,
+    selected_channels: list[str],
+    analysis: dict,
+    correction_label: str,
+    selection_label: str,
+    normalize_to_peak: bool = False,
+    corrected_trace_key: str = "smoothed_corrected_current",
+    x_offset_per_iteration: float | None = None,
+    y_offset_per_iteration: float | None = None,
+    trace_height_scale: float = 1.0,
+):
+    """Render SWVs as a diagonal chronological stack."""
+    entries = sorted(
+        [
+            (observation, item)
+            for observation, item in trace_entries
+            if _trace_channel_key(item) in selected_channels
+        ],
+        key=lambda pair: (
+            int(pair[0].get("group_id", 1)),
+            int(pair[0].get("iteration", 0)),
+            _channel_sort_key(_trace_channel_key(pair[1])),
+            str(pair[1].get("phase", "")),
+        ),
+    )
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    errors = []
+    loaded = []
+    for observation, item in entries:
+        phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
+        try:
+            voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                path,
+                corrected,
+                analysis,
+                corrected_trace_key,
+            )
+            if normalize_to_peak:
+                y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+            voltage = np.asarray(voltage, dtype=float)
+            y = np.asarray(y, dtype=float)
+            finite = np.isfinite(voltage) & np.isfinite(y)
+            if not finite.any():
+                raise ValueError("Trace has no finite voltage/current values.")
+            loaded.append({
+                "iteration": int(observation.get("iteration", 0)),
+                "phase": str(phase),
+                "channel": channel,
+                "voltage": voltage[finite],
+            "current": y[finite] * float(trace_height_scale),
+        })
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+
+    if not loaded:
+        ax.text(.5, .5, "No traces match the selected channels.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, errors
+
+    iteration_values = [row["iteration"] for row in loaded]
+    iteration_minimum = min(iteration_values)
+    iteration_maximum = max(iteration_values)
+    iteration_span = max(1, iteration_maximum - iteration_minimum)
+    voltage_values = np.concatenate([row["voltage"] for row in loaded])
+    current_values = np.concatenate([row["current"] for row in loaded])
+    voltage_range = float(np.nanmax(voltage_values) - np.nanmin(voltage_values))
+    current_range = float(np.nanmax(current_values) - np.nanmin(current_values))
+    x_step = (
+        float(x_offset_per_iteration)
+        if x_offset_per_iteration is not None
+        else voltage_range * 0.035 if voltage_range > 0 else 0.01
+    )
+    y_step = (
+        float(y_offset_per_iteration)
+        if y_offset_per_iteration is not None
+        else current_range * 0.10 if current_range > 0 else 0.08
+    )
+    phase_styles = {
+        "buffer": "--",
+        "target": "-",
+        "measurement": "-",
+        "unknown": ":",
+    }
+    channel_values = sorted(
+        {_trace_channel_key(row) for _obs, row in entries},
+        key=_channel_sort_key,
+    )
+    channel_colors = {
+        channel: plt.get_cmap("turbo")(position)
+        for channel, position in zip(
+            channel_values,
+            np.linspace(.03, .97, max(len(channel_values), 2)),
+        )
+    }
+    for row in loaded:
+        age = (row["iteration"] - iteration_minimum) / iteration_span
+        offset_index = row["iteration"] - iteration_minimum
+        alpha = 0.18 + 0.82 * age
+        ax.plot(
+            row["voltage"] + offset_index * x_step,
+            row["current"] + offset_index * y_step,
+            color=channel_colors.get(row["channel"], "#155e63"),
+            linestyle=phase_styles.get(row["phase"].lower(), phase_styles["unknown"]),
+            linewidth=1.05 + 0.45 * age,
+            alpha=alpha,
+        )
+
+    plotted_x_values = np.concatenate([
+        row["voltage"] + (row["iteration"] - iteration_minimum) * x_step
+        for row in loaded
+    ])
+    plotted_y_values = np.concatenate([
+        row["current"] + (row["iteration"] - iteration_minimum) * y_step
+        for row in loaded
+    ])
+    plotted_x_min = float(np.nanmin(plotted_x_values))
+    plotted_x_max = float(np.nanmax(plotted_x_values))
+    plotted_y_min = float(np.nanmin(plotted_y_values))
+    plotted_y_max = float(np.nanmax(plotted_y_values))
+    plotted_x_span = max(plotted_x_max - plotted_x_min, abs(x_step), 1e-9)
+    plotted_y_span = max(plotted_y_max - plotted_y_min, abs(y_step), 1e-9)
+    oldest_iteration = min(iteration_values)
+    newest_iteration = max(iteration_values)
+
+    def iteration_left_edge(iteration: int) -> tuple[float, float]:
+        rows = [row for row in loaded if row["iteration"] == iteration]
+        offset_index = iteration - iteration_minimum
+        edge_points = []
+        for row in rows:
+            shifted_x = row["voltage"] + offset_index * x_step
+            shifted_y = row["current"] + offset_index * y_step
+            left_index = int(np.nanargmin(shifted_x))
+            edge_points.append((float(shifted_x[left_index]), float(shifted_y[left_index])))
+        return (
+            float(np.nanmean([point[0] for point in edge_points])),
+            float(np.nanmean([point[1] for point in edge_points])),
+        )
+
+    oldest_edge = iteration_left_edge(oldest_iteration)
+    newest_edge = iteration_left_edge(newest_iteration)
+    axis_dx = newest_edge[0] - oldest_edge[0]
+    axis_dy = newest_edge[1] - oldest_edge[1]
+    if np.isclose(axis_dx, 0.0) and np.isclose(axis_dy, 0.0):
+        axis_dx = plotted_x_span * 0.18
+    axis_length = math.hypot(axis_dx, axis_dy)
+    normal_x = -axis_dy / axis_length if axis_length > 0 else -1.0
+    normal_y = axis_dx / axis_length if axis_length > 0 else 0.0
+    if normal_x > 0:
+        normal_x *= -1
+        normal_y *= -1
+    side_gap = plotted_x_span * 0.055
+    axis_start = (
+        oldest_edge[0] - 0.04 * axis_dx + normal_x * side_gap,
+        oldest_edge[1] - 0.04 * axis_dy + normal_y * side_gap,
+    )
+    axis_end = (
+        newest_edge[0] + 0.04 * axis_dx + normal_x * side_gap,
+        newest_edge[1] + 0.04 * axis_dy + normal_y * side_gap,
+    )
+    ax.annotate(
+        "",
+        xy=axis_end,
+        xytext=axis_start,
+        arrowprops={
+            "arrowstyle": "-|>",
+            "color": "#222222",
+            "linewidth": 1.8,
+            "shrinkA": 0,
+            "shrinkB": 0,
+            "mutation_scale": 12,
+        },
+        zorder=8,
+    )
+    ax.text(
+        axis_end[0],
+        axis_end[1],
+        " increasing iteration",
+        fontsize=8,
+        color="#222222",
+        ha="left" if axis_dx >= 0 else "right",
+        va="bottom" if axis_dy >= 0 else "top",
+        zorder=8,
+    )
+
+    newest = max(loaded, key=lambda row: row["iteration"])
+    oldest = min(loaded, key=lambda row: row["iteration"])
+    ax.annotate(
+        f"Oldest: iter {oldest['iteration']}",
+        xy=(
+            float(np.nanmin(oldest["voltage"])),
+            float(np.nanmin(oldest["current"])),
+        ),
+        xytext=(8, 8),
+        textcoords="offset points",
+        fontsize=8,
+        color="#666666",
+    )
+    ax.annotate(
+        f"Newest: iter {newest['iteration']}",
+        xy=(
+            float(np.nanmax(newest["voltage"])) + (newest["iteration"] - iteration_minimum) * x_step,
+            float(np.nanmax(newest["current"])) + (newest["iteration"] - iteration_minimum) * y_step,
+        ),
+        xytext=(-88, 8),
+        textcoords="offset points",
+        fontsize=8,
+        color="#111111",
+    )
+    channel_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=channel_colors[channel],
+            linewidth=2,
+            label=f"Ch {channel}" if channel != "Unknown" else "Unknown channel",
+        )
+        for channel in channel_values
+    ]
+    if channel_handles:
+        ax.legend(
+            handles=channel_handles,
+            title="Channel",
+            loc="upper left",
+            fontsize=7,
+            title_fontsize=8,
+        )
+    ax.set(
+        title=(
+            f"{selection_label}\n"
+            f"Chronological diagonal stack | "
+            f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key)}"
+            f"{f' ({correction_label})' if corrected else ''}"
+        ),
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_facecolor("white")
+    fig.patch.set_alpha(1)
+    fig.add_artist(Line2D([.22, .91], [.055, .055], transform=fig.transFigure, color="#222222", linewidth=1.1))
+    fig.text(.50, .025, "Voltage (V)", ha="center", va="center", fontsize=9)
+    fig.add_artist(Line2D([.955, .955], [.18, .78], transform=fig.transFigure, color="#222222", linewidth=1.1))
+    fig.text(
+        .985,
+        .46,
+        "z: Normalized current (peak = 1)" if normalize_to_peak else "z: Current (uA)",
+        ha="center",
+        va="center",
+        rotation=90,
+        fontsize=9,
+    )
+    fig.subplots_adjust(left=.03, right=.96, bottom=.08, top=.84)
     return fig, errors
 
 
@@ -4780,6 +5082,246 @@ def _plot_surrogate_2d_control_style(
     return mesh
 
 
+def _plot_chronological_surrogate_2d_stack(
+    session: dict,
+    group_files: dict[int, Path],
+    artifact_iteration: int,
+    value: str,
+    x_name: str,
+    y_name: str,
+    *,
+    x_offset_fraction: float = 0.02,
+    y_offset_fraction: float = 0.05,
+    map_alpha: float = 0.55,
+    log_frequency: bool = False,
+):
+    """Render saved 2D surrogate maps as a diagonal chronological stack."""
+    frame_iterations = [
+        iteration
+        for iteration in sorted(group_files)
+        if int(iteration) <= int(artifact_iteration)
+    ]
+    maps = []
+    errors = []
+
+    def axis_values(values, axis_name):
+        output = np.asarray(values, dtype=float)
+        if log_frequency and axis_name == "frequency":
+            return np.log10(np.clip(output, 1e-12, None))
+        return output
+
+    for frame_iteration in frame_iterations:
+        try:
+            predictions = pd.read_csv(group_files[frame_iteration])
+            predictions = _recompute_group_surrogate(
+                session,
+                predictions,
+                frame_iteration,
+            )
+            if not all(
+                name in predictions.columns
+                for name in (x_name, y_name, value)
+            ):
+                continue
+            display_frame = _surrogate_display_frame(predictions, value)
+            base_params = _surrogate_slice_base_params(session, frame_iteration)
+            grid = _surrogate_regular_2d_grid(
+                session,
+                display_frame,
+                frame_iteration,
+                value,
+                x_name,
+                y_name,
+                base_params,
+            )
+            if grid is None:
+                valid = display_frame[[x_name, y_name, value]].apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                ).dropna()
+                if valid.empty:
+                    continue
+                maps.append({
+                    "iteration": int(frame_iteration),
+                    "kind": "scatter",
+                    "x": axis_values(valid[x_name], x_name),
+                    "y": axis_values(valid[y_name], y_name),
+                    "z": valid[value].to_numpy(dtype=float),
+                })
+            else:
+                x_values, y_values, z_values = grid
+                maps.append({
+                    "iteration": int(frame_iteration),
+                    "kind": "grid",
+                    "x": axis_values(x_values, x_name),
+                    "y": axis_values(y_values, y_name),
+                    "z": z_values,
+                })
+        except Exception as exc:
+            errors.append(f"Artifact iteration {frame_iteration}: {exc}")
+
+    fig, ax = plt.subplots(figsize=(9, 5.8))
+    if not maps:
+        ax.text(.5, .5, "No plottable 2D surrogate maps.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, errors
+
+    x_min = min(float(np.nanmin(item["x"])) for item in maps)
+    x_max = max(float(np.nanmax(item["x"])) for item in maps)
+    y_min = min(float(np.nanmin(item["y"])) for item in maps)
+    y_max = max(float(np.nanmax(item["y"])) for item in maps)
+    x_span = max(x_max - x_min, 1e-9)
+    y_span = max(y_max - y_min, 1e-9)
+    z_values = np.concatenate([
+        np.asarray(item["z"], dtype=float).ravel()
+        for item in maps
+    ])
+    z_values = z_values[np.isfinite(z_values)]
+    z_min = float(np.nanmin(z_values)) if len(z_values) else 0.0
+    z_max = float(np.nanmax(z_values)) if len(z_values) else 1.0
+    if np.isclose(z_min, z_max):
+        z_max = z_min + 1.0
+    value_norm = Normalize(z_min, z_max)
+    cmap = plt.get_cmap("viridis")
+    iteration_minimum = min(item["iteration"] for item in maps)
+    iteration_maximum = max(item["iteration"] for item in maps)
+    iteration_span = max(1, iteration_maximum - iteration_minimum)
+    x_step = x_span * float(x_offset_fraction)
+    y_step = y_span * float(y_offset_fraction)
+
+    for item in maps:
+        offset_index = item["iteration"] - iteration_minimum
+        age = offset_index / iteration_span
+        alpha = max(0.05, min(1.0, 0.12 + float(map_alpha) * age))
+        shifted_x = item["x"] + offset_index * x_step
+        shifted_y = item["y"] + offset_index * y_step
+        if item["kind"] == "grid":
+            ax.pcolormesh(
+                shifted_x,
+                shifted_y,
+                np.ma.masked_invalid(item["z"]),
+                cmap=cmap,
+                norm=value_norm,
+                shading="auto",
+                alpha=alpha,
+                linewidth=0,
+            )
+        else:
+            ax.scatter(
+                shifted_x,
+                shifted_y,
+                c=item["z"],
+                cmap=cmap,
+                norm=value_norm,
+                s=10,
+                alpha=alpha,
+                linewidths=0,
+            )
+
+    shifted_left_edges = [
+        (
+            float(np.nanmin(item["x"])) + (item["iteration"] - iteration_minimum) * x_step,
+            float(np.nanmean(item["y"])) + (item["iteration"] - iteration_minimum) * y_step,
+            item["iteration"],
+        )
+        for item in maps
+    ]
+    oldest_edge = min(shifted_left_edges, key=lambda item: item[2])
+    newest_edge = max(shifted_left_edges, key=lambda item: item[2])
+    axis_dx = newest_edge[0] - oldest_edge[0]
+    axis_dy = newest_edge[1] - oldest_edge[1]
+    if np.isclose(axis_dx, 0.0) and np.isclose(axis_dy, 0.0):
+        axis_dx = x_span * 0.18
+    axis_length = math.hypot(axis_dx, axis_dy)
+    normal_x = -axis_dy / axis_length if axis_length > 0 else -1.0
+    normal_y = axis_dx / axis_length if axis_length > 0 else 0.0
+    if normal_x > 0:
+        normal_x *= -1
+        normal_y *= -1
+    side_gap = x_span * 0.06
+    axis_start = (
+        oldest_edge[0] - 0.04 * axis_dx + normal_x * side_gap,
+        oldest_edge[1] - 0.04 * axis_dy + normal_y * side_gap,
+    )
+    axis_end = (
+        newest_edge[0] + 0.04 * axis_dx + normal_x * side_gap,
+        newest_edge[1] + 0.04 * axis_dy + normal_y * side_gap,
+    )
+    ax.annotate(
+        "",
+        xy=axis_end,
+        xytext=axis_start,
+        arrowprops={
+            "arrowstyle": "-|>",
+            "color": "#222222",
+            "linewidth": 1.8,
+            "shrinkA": 0,
+            "shrinkB": 0,
+            "mutation_scale": 12,
+        },
+        zorder=8,
+    )
+    ax.text(
+        axis_end[0],
+        axis_end[1],
+        " increasing iteration",
+        fontsize=8,
+        color="#222222",
+        ha="left" if axis_dx >= 0 else "right",
+        va="bottom" if axis_dy >= 0 else "top",
+        zorder=8,
+    )
+    ax.text(
+        oldest_edge[0],
+        oldest_edge[1],
+        f"Oldest: iter {oldest_edge[2]}",
+        fontsize=8,
+        color="#666666",
+    )
+    ax.text(
+        newest_edge[0],
+        newest_edge[1],
+        f"Newest: iter {newest_edge[2]}",
+        fontsize=8,
+        color="#111111",
+    )
+
+    colorbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=value_norm, cmap=cmap),
+        ax=ax,
+        pad=.02,
+        shrink=.72,
+    )
+    colorbar.set_label(SURROGATE_VALUE_LABELS.get(value, value))
+    ax.set_title(
+        f"Chronological diagonal 2D map stack | {value}",
+        fontsize=12,
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_facecolor("white")
+    fig.patch.set_alpha(1)
+    fig.add_artist(Line2D([.22, .86], [.055, .055], transform=fig.transFigure, color="#222222", linewidth=1.1))
+    fig.text(.50, .025, x_name, ha="center", va="center", fontsize=9)
+    fig.add_artist(Line2D([.955, .955], [.18, .78], transform=fig.transFigure, color="#222222", linewidth=1.1))
+    fig.text(
+        .985,
+        .46,
+        y_name,
+        ha="center",
+        va="center",
+        rotation=90,
+        fontsize=9,
+    )
+    fig.subplots_adjust(left=.03, right=.90, bottom=.08, top=.88)
+    return fig, errors
+
+
 def _iteration_parameter_text(observation: dict | None) -> str:
     params = (observation or {}).get("params") or {}
     parts = []
@@ -4796,11 +5338,19 @@ def _iteration_parameter_text(observation: dict | None) -> str:
     return " | ".join(parts)
 
 
-def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: str, view: str,
-                    x_name: str, y_name: str | None, z_name: str | None,
-                    tensor_height: int = 620, dot_size: int = 6,
-                    log_frequency: bool = False,
-                    show_iteration_path: bool = True):
+def _surrogate_display_frame(frame: pd.DataFrame, value: str) -> pd.DataFrame:
+    if value != "acquisition_value" or "already_tested" not in frame.columns:
+        return frame
+    eligible = ~frame["already_tested"].fillna(False).astype(bool)
+    if "selected_next" in frame.columns:
+        eligible |= frame["selected_next"].fillna(False).astype(bool)
+    return frame.loc[eligible].copy()
+
+
+def _surrogate_parameter_context(
+    session: dict,
+    iteration: int,
+) -> str:
     selected_observation = next(
         (
             observation for observation in session["observations"]
@@ -4816,26 +5366,28 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         None,
     )
     if selected_observation is not None:
-        parameter_context = (
+        return (
             f"selected iteration {iteration + 1}: "
             f"{_iteration_parameter_text(selected_observation)}"
         )
-    else:
-        parameter_context = (
-            f"no completed iteration {iteration + 1}; "
-            f"artifact iteration {iteration}: "
-            f"{_iteration_parameter_text(artifact_observation)}"
-        )
+    return (
+        f"no completed iteration {iteration + 1}; "
+        f"artifact iteration {iteration}: "
+        f"{_iteration_parameter_text(artifact_observation)}"
+    )
+
+
+def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: str, view: str,
+                    x_name: str, y_name: str | None, z_name: str | None,
+                    tensor_height: int = 620, dot_size: int = 6,
+                    log_frequency: bool = False,
+                    show_iteration_path: bool = True):
+    parameter_context = _surrogate_parameter_context(session, iteration)
     title = (
         f"{view} | {value} | artifact iteration {iteration}<br>"
         f"{parameter_context}"
     )
-    display_frame = frame
-    if value == "acquisition_value" and "already_tested" in frame.columns:
-        eligible = ~frame["already_tested"].fillna(False).astype(bool)
-        if "selected_next" in frame.columns:
-            eligible |= frame["selected_next"].fillna(False).astype(bool)
-        display_frame = frame.loc[eligible].copy()
+    display_frame = _surrogate_display_frame(frame, value)
     selected_next_frame = (
         display_frame.loc[
             display_frame["selected_next"].fillna(False).astype(bool)
@@ -5088,6 +5640,103 @@ def _sized_plot_container(container, width_percent: int):
     return plot_column
 
 
+def _safe_download_stem(label: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("_")
+    return stem or "plot"
+
+
+def _matplotlib_png_bytes(fig, *, dpi: int = 150) -> bytes:
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
+    return buffer.getvalue()
+
+
+def _render_downloadable_pyplot(
+    container,
+    fig,
+    *,
+    key: str,
+    file_stem: str,
+    width_percent: int,
+    dpi: int = 150,
+) -> None:
+    plot_column = _sized_plot_container(container, width_percent)
+    png_bytes = _matplotlib_png_bytes(fig, dpi=dpi)
+    plot_column.pyplot(
+        fig,
+        clear_figure=False,
+        use_container_width=True,
+        bbox_inches=None,
+    )
+    plot_column.download_button(
+        "Download plot",
+        data=png_bytes,
+        file_name=f"{_safe_download_stem(file_stem)}.png",
+        mime="image/png",
+        key=f"{key}_download",
+    )
+    plt.close(fig)
+
+
+def _plotly_png_bytes(
+    fig: go.Figure,
+    *,
+    width: int = 1200,
+    height: int = 800,
+    scale: float = 2,
+) -> bytes:
+    try:
+        return fig.to_image(
+            format="png",
+            width=width,
+            height=height,
+            scale=scale,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Plotly PNG export requires kaleido==0.2.1. "
+            "Install the updated requirements and restart the app."
+        ) from exc
+
+
+def _render_downloadable_plotly(
+    container,
+    fig: go.Figure,
+    *,
+    key: str,
+    file_stem: str,
+    width_percent: int,
+    export_width: int = 1200,
+    export_height: int | None = None,
+    on_select: str = "ignore",
+    selection_mode: str | tuple[str, ...] = "points",
+) -> Any:
+    plot_column = _sized_plot_container(container, width_percent)
+    event = plot_column.plotly_chart(
+        fig,
+        use_container_width=True,
+        on_select=on_select,
+        selection_mode=selection_mode,
+        key=key,
+    )
+    try:
+        png_bytes = _plotly_png_bytes(
+            fig,
+            width=export_width,
+            height=export_height or int(fig.layout.height or 800),
+        )
+        plot_column.download_button(
+            "Download plot",
+            data=png_bytes,
+            file_name=f"{_safe_download_stem(file_stem)}.png",
+            mime="image/png",
+            key=f"{key}_download",
+        )
+    except RuntimeError as exc:
+        plot_column.caption(str(exc))
+    return event
+
+
 def _preserve_valid_widget_value(
     key: str,
     options: list,
@@ -5100,6 +5749,51 @@ def _preserve_valid_widget_value(
     if current not in options:
         st.session_state[key] = (
             default if default in options else options[0]
+        )
+
+
+def _stabilize_gif_figure_layout(figure) -> None:
+    """Pin legends before GIF rasterization so they do not jump per frame."""
+    if isinstance(figure, go.Figure):
+        base_margin = (
+            figure.layout.margin.to_plotly_json()
+            if figure.layout.margin is not None
+            else {}
+        )
+        base_margin["b"] = max(int(base_margin.get("b") or 0), 120)
+        figure.update_layout(
+            margin=base_margin,
+            legend={
+                "orientation": "h",
+                "x": 0.0,
+                "xanchor": "left",
+                "y": -0.16,
+                "yanchor": "top",
+                "traceorder": "normal",
+            },
+        )
+        return
+
+    axes = getattr(figure, "axes", [])
+    for ax in axes:
+        legend = ax.get_legend()
+        if legend is None:
+            continue
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            continue
+        title = legend.get_title().get_text()
+        fontsize = legend.get_texts()[0].get_fontsize() if legend.get_texts() else 7
+        title_fontsize = legend.get_title().get_fontsize()
+        legend.remove()
+        ax.legend(
+            handles,
+            labels,
+            title=title or None,
+            loc="upper right",
+            bbox_to_anchor=(1.0, 1.0),
+            fontsize=fontsize,
+            title_fontsize=title_fontsize,
         )
 
 
@@ -5117,6 +5811,7 @@ def _figures_to_gif(
 
     frames = []
     for frame_index, figure in enumerate(figures, start=1):
+        _stabilize_gif_figure_layout(figure)
         buffer = BytesIO()
         if isinstance(figure, go.Figure):
             try:
@@ -5455,7 +6150,28 @@ def render_bo_session_app() -> None:
             st.info("No GP falloff fractions were saved for this session.")
 
         st.markdown("#### Starting points and parameter details")
+        first_observations_by_group = {}
+        for recorded_observation in full_session["observations"]:
+            try:
+                group_id = int(recorded_observation.get("group_id", 1))
+                iteration = int(recorded_observation.get("iteration", 0))
+            except (TypeError, ValueError):
+                continue
+            current = first_observations_by_group.get(group_id)
+            if current is None or iteration < int(current.get("iteration", 0)):
+                first_observations_by_group[group_id] = recorded_observation
         for item in optimization_metadata:
+            first_observation = first_observations_by_group.get(int(item["id"]))
+            first_iteration_params = (
+                dict(first_observation.get("params") or {})
+                if first_observation is not None
+                else {}
+            )
+            first_iteration_label = (
+                f"iteration {first_observation.get('iteration')}"
+                if first_observation is not None
+                else "no completed iteration"
+            )
             with st.expander(
                 f"{item['name']} parameter metadata "
                 f"(channels {', '.join(map(str, item['channels']))})"
@@ -5464,6 +6180,7 @@ def render_bo_session_app() -> None:
                     name for name in PARAMETERS
                     if (
                         name in item["initial_parameters"]
+                        or name in first_iteration_params
                         or name in item["gp_falloff_fractions"]
                         or name in item["gp_length_scales"]
                     )
@@ -5475,6 +6192,7 @@ def render_bo_session_app() -> None:
                         "Parameter": definition.get("label") or name,
                         "Mode": definition.get("mode"),
                         "Start": item["initial_parameters"].get(name),
+                        "First iteration": first_iteration_params.get(name),
                         "Unit": definition.get("unit"),
                         "Minimum": definition.get("min"),
                         "Maximum": definition.get("max"),
@@ -5488,6 +6206,9 @@ def render_bo_session_app() -> None:
                         pd.DataFrame(parameter_rows),
                         use_container_width=True,
                         hide_index=True,
+                    )
+                    st.caption(
+                        f"First iteration values are the actual parameters recorded for {first_iteration_label}."
                     )
                 else:
                     st.caption(
@@ -6238,9 +6959,15 @@ def render_bo_session_app() -> None:
                 format_func=_trace_channel_label,
                 key=trace_channels_key,
             )
+            trace_layout_options = [
+                "Overlay selected channels",
+                "Separate plot per channel",
+            ]
+            if trace_all_mode:
+                trace_layout_options.append("Chronological diagonal stack")
             trace_layout = st.radio(
                 "Plot layout",
-                ["Overlay selected channels", "Separate plot per channel"],
+                trace_layout_options,
                 horizontal=True,
                 key=(
                     f"bo_trace_layout_{selected_observation_group_scope}_"
@@ -6266,6 +6993,47 @@ def render_bo_session_app() -> None:
                 if selected_trace_type == "Normalized raw"
                 else "smoothed_corrected_current"
             )
+            stack_x_offset = None
+            stack_y_offset = None
+            stack_trace_height = 1.0
+            if trace_layout == "Chronological diagonal stack":
+                offset_columns = st.columns(3)
+                stack_x_offset = offset_columns[0].number_input(
+                    "X offset per iteration (V)",
+                    value=0.002,
+                    step=0.001,
+                    format="%.4f",
+                    key=(
+                        f"bo_trace_stack_x_offset_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                    ),
+                    help="Positive values shift newer traces to the right; negative values shift them left.",
+                )
+                stack_y_offset = offset_columns[1].number_input(
+                    "Y offset per iteration",
+                    value=0.02 if normalize_to_peak else 0.1,
+                    step=0.01,
+                    format="%.4f",
+                    key=(
+                        f"bo_trace_stack_y_offset_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{normalize_to_peak}"
+                    ),
+                    help="Positive values shift newer traces upward; negative values shift them downward.",
+                )
+                stack_trace_height = offset_columns[2].slider(
+                    "Trace height",
+                    min_value=0.1,
+                    max_value=5.0,
+                    value=1.0,
+                    step=0.1,
+                    key=(
+                        f"bo_trace_stack_height_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{normalize_to_peak}"
+                    ),
+                    help="Scales each SWV vertically before applying the chronological offset.",
+                )
             trace_gif_duration = st.slider(
                 "SWV GIF frame duration (ms)",
                 min_value=100,
@@ -6281,13 +7049,19 @@ def render_bo_session_app() -> None:
 
             channel_groups = (
                 [[channel] for channel in selected_channels]
-                if trace_layout == "Separate plot per channel"
+                if trace_layout in (
+                    "Separate plot per channel",
+                    "Chronological diagonal stack",
+                )
                 else [selected_channels]
             )
             if not selected_channels:
                 st.info("Select at least one channel to display traces.")
             for channel_group in channel_groups:
-                if trace_layout == "Separate plot per channel":
+                if trace_layout in (
+                    "Separate plot per channel",
+                    "Chronological diagonal stack",
+                ):
                     channel = channel_group[0]
                     st.markdown(
                         f"#### {_trace_channel_label(channel)}"
@@ -6297,7 +7071,21 @@ def render_bo_session_app() -> None:
                     if corrected
                     else "Loading raw traces..."
                 ):
-                    if trace_all_mode:
+                    if trace_layout == "Chronological diagonal stack":
+                        figure, errors = _plot_chronological_swv_stack(
+                            trace_entries,
+                            corrected,
+                            channel_group,
+                            trace_analysis,
+                            correction_label,
+                            trace_selection_label,
+                            normalize_to_peak,
+                            corrected_trace_key,
+                            stack_x_offset,
+                            stack_y_offset,
+                            stack_trace_height,
+                        )
+                    elif trace_all_mode:
                         figure, errors = _plot_iteration_trace_overlay(
                             trace_entries,
                             corrected,
@@ -6321,10 +7109,21 @@ def render_bo_session_app() -> None:
                             normalize_to_peak,
                             corrected_trace_key,
                         )
-                _sized_plot_container(st, plot_width_percent).pyplot(
+                trace_file_stem = (
+                    f"swv_traces_{selected_trace_type}_{trace_layout}_"
+                    f"{selected_group_label}_{selected_iteration_label}_"
+                    f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
+                )
+                _render_downloadable_pyplot(
+                    st,
                     figure,
-                    clear_figure=True,
-                    use_container_width=True,
+                    key=(
+                        f"bo_trace_plot_{selected_observation_group_scope}_"
+                        f"{selected_iteration_scope}_{trace_layout}_"
+                        f"{selected_trace_type}_{'_'.join(map(str, channel_group))}"
+                    ),
+                    file_stem=trace_file_stem,
+                    width_percent=plot_width_percent,
                 )
                 for error in errors:
                     st.warning(error)
@@ -7567,22 +8366,121 @@ def render_bo_session_app() -> None:
                     show_iteration_path=surrogate_show_iteration_path,
                 )
                 if view == "3D tensor":
-                    _sized_plot_container(
-                        st, plot_width_percent
-                    ).plotly_chart(
+                    _render_downloadable_plotly(
+                        st,
                         surrogate_figure,
-                        use_container_width=True,
                         key=(
                             f"bo_surrogate_3d_{surrogate_group_id}_"
                             f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}"
                         ),
+                        file_stem=(
+                            f"surrogate_{group_name}_{artifact_iteration}_"
+                            f"{value}_3d_tensor_{x_name}_{y_name}_{z_name}"
+                        ),
+                        width_percent=plot_width_percent,
+                        export_height=plot_3d_height,
                     )
                 else:
-                    _sized_plot_container(st, plot_width_percent).pyplot(
+                    _render_downloadable_pyplot(
+                        st,
                         surrogate_figure,
-                        clear_figure=True,
-                        use_container_width=True,
+                        key=(
+                            f"bo_surrogate_plot_{surrogate_group_id}_"
+                            f"{artifact_iteration}_{value}_{view}_"
+                            f"{x_name}_{y_name}_{z_name}"
+                        ),
+                        file_stem=(
+                            f"surrogate_{group_name}_{artifact_iteration}_"
+                            f"{value}_{view}_{x_name}_{y_name or 'none'}"
+                        ),
+                        width_percent=plot_width_percent,
                     )
+                    if view == "2D map":
+                        with st.expander(
+                            f"{group_name} chronological 2D map stack",
+                            expanded=False,
+                        ):
+                            show_map_stack = st.checkbox(
+                                "Render chronological 2D map stack",
+                                value=False,
+                                key=(
+                                    f"bo_surrogate_2d_stack_show_{surrogate_group_id}_"
+                                    f"{value}_{x_name}_{y_name}"
+                                ),
+                            )
+                            stack_columns = st.columns(3)
+                            map_stack_x_offset = stack_columns[0].slider(
+                                "X offset per iteration",
+                                min_value=-0.10,
+                                max_value=0.10,
+                                value=0.02,
+                                step=0.005,
+                                format="%.3f",
+                                key=(
+                                    f"bo_surrogate_2d_stack_x_{surrogate_group_id}_"
+                                    f"{value}_{x_name}_{y_name}"
+                                ),
+                                help="Fraction of map width. Positive values shift newer maps right.",
+                            )
+                            map_stack_y_offset = stack_columns[1].slider(
+                                "Y offset per iteration",
+                                min_value=-0.10,
+                                max_value=0.10,
+                                value=0.05,
+                                step=0.005,
+                                format="%.3f",
+                                key=(
+                                    f"bo_surrogate_2d_stack_y_{surrogate_group_id}_"
+                                    f"{value}_{x_name}_{y_name}"
+                                ),
+                                help="Fraction of map height. Positive values shift newer maps upward.",
+                            )
+                            map_stack_alpha = stack_columns[2].slider(
+                                "Newest map opacity",
+                                min_value=0.1,
+                                max_value=1.0,
+                                value=0.55,
+                                step=0.05,
+                                key=(
+                                    f"bo_surrogate_2d_stack_alpha_{surrogate_group_id}_"
+                                    f"{value}_{x_name}_{y_name}"
+                                ),
+                                help="Older maps fade below this value.",
+                            )
+                            if show_map_stack:
+                                stack_figure, stack_errors = (
+                                    _plot_chronological_surrogate_2d_stack(
+                                        surrogate_session,
+                                        group_files,
+                                        artifact_iteration,
+                                        value,
+                                        x_name,
+                                        y_name,
+                                        x_offset_fraction=map_stack_x_offset,
+                                        y_offset_fraction=map_stack_y_offset,
+                                        map_alpha=map_stack_alpha,
+                                        log_frequency=surrogate_log_frequency,
+                                    )
+                                )
+                                _render_downloadable_pyplot(
+                                    st,
+                                    stack_figure,
+                                    key=(
+                                        f"bo_surrogate_2d_stack_{surrogate_group_id}_"
+                                        f"{artifact_iteration}_{value}_{x_name}_{y_name}"
+                                    ),
+                                    file_stem=(
+                                        f"surrogate_{group_name}_{artifact_iteration}_"
+                                        f"{value}_chronological_2d_stack_{x_name}_{y_name}"
+                                    ),
+                                    width_percent=plot_width_percent,
+                                )
+                                for error in stack_errors[:5]:
+                                    st.warning(error)
+                                if len(stack_errors) > 5:
+                                    st.caption(
+                                        f"{len(stack_errors) - 5} additional map stack warnings hidden."
+                                    )
                 if (
                     value == "acquisition_value"
                     and "selected_next" in predictions.columns
@@ -7872,12 +8770,12 @@ def render_bo_session_app() -> None:
                             "Surrogate tensor Q",
                             "Surrogate tensor acquisition",
                             *[
-                                f"2D Q {x_name} vs {y_name}"
+                                name
                                 for x_name, y_name in gif_pairs
-                            ],
-                            *[
-                                f"2D acquisition {x_name} vs {y_name}"
-                                for x_name, y_name in gif_pairs
+                                for name in (
+                                    f"2D Q {x_name} vs {y_name}",
+                                    f"2D acquisition {x_name} vs {y_name}",
+                                )
                             ],
                         ]
                         total_target_frames = max(1, len(gif_targets) * len(gif_iterations))
@@ -8001,11 +8899,11 @@ def render_bo_session_app() -> None:
                             )
                             completed_target_frames += len(gif_iterations)
 
-                        for label_prefix, value_key in (
-                            ("2D Q", "predicted_mean_Q"),
-                            ("2D acquisition", "acquisition_value"),
-                        ):
-                            for pair_x, pair_y in gif_pairs:
+                        for pair_x, pair_y in gif_pairs:
+                            for label_prefix, value_key in (
+                                ("2D Q", "predicted_mean_Q"),
+                                ("2D acquisition", "acquisition_value"),
+                            ):
                                 name = f"{label_prefix} {pair_x} vs {pair_y}"
                                 generated_gifs[name] = _figures_to_gif(
                                     surrogate_frames(value_key, "2D map", pair_x, pair_y),
@@ -8030,12 +8928,36 @@ def render_bo_session_app() -> None:
 
                 generated_gifs = st.session_state.get(batch_key, {})
                 if generated_gifs:
+                    gif_display_order = [
+                        "Raw SWVs",
+                        "Raw normalized SWVs",
+                        "Surrogate tensor Q",
+                        "Surrogate tensor acquisition",
+                        *[
+                            name
+                            for x_name, y_name in gif_pairs
+                            for name in (
+                                f"2D Q {x_name} vs {y_name}",
+                                f"2D acquisition {x_name} vs {y_name}",
+                            )
+                        ],
+                    ]
+                    ordered_generated_gifs = {
+                        name: generated_gifs[name]
+                        for name in gif_display_order
+                        if name in generated_gifs
+                    }
+                    ordered_generated_gifs.update({
+                        name: gif_bytes
+                        for name, gif_bytes in generated_gifs.items()
+                        if name not in ordered_generated_gifs
+                    })
                     encoded = [
                         (
                             name,
                             base64.b64encode(gif_bytes).decode("ascii"),
                         )
-                        for name, gif_bytes in generated_gifs.items()
+                        for name, gif_bytes in ordered_generated_gifs.items()
                     ]
                     cards = "\n".join(
                         (
@@ -8082,7 +9004,7 @@ def render_bo_session_app() -> None:
                         height=max(520, 360 * ((len(encoded) + 1) // 2)),
                         scrolling=True,
                     )
-                    for name, gif_bytes in generated_gifs.items():
+                    for name, gif_bytes in ordered_generated_gifs.items():
                         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
                         st.download_button(
                             f"Download {name}",

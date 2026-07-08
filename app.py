@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import zipfile
@@ -100,6 +101,32 @@ def _measurement_voltage_bounds(
     if not (math.isfinite(lower) and math.isfinite(upper)) or lower >= upper:
         return None
     return lower, upper
+
+
+def safe_download_stem(label: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("_")
+    return stem or "plot"
+
+
+def render_downloadable_pyplot(
+    container,
+    fig: plt.Figure,
+    *,
+    key: str,
+    file_stem: str,
+    dpi: int = 150,
+) -> None:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
+    container.pyplot(fig)
+    container.download_button(
+        "Download plot",
+        data=buffer.getvalue(),
+        file_name=f"{safe_download_stem(file_stem)}.png",
+        mime="image/png",
+        key=f"{key}_download",
+    )
+    plt.close(fig)
 
 # 
 # Page config
@@ -2178,8 +2205,12 @@ if view == "Overlays":
                     show_peak_reference_vlines=show_peak_reference_vlines,
                 )
                 if fig:
-                    st.pyplot(fig)
-                    plt.close(fig)
+                    render_downloadable_pyplot(
+                        st,
+                        fig,
+                        key=f"cv_overlay_{ch}_{y_key}",
+                        file_stem=f"cv_overlay_ch{ch}_{trace_type}",
+                    )
                 else:
                     st.warning("No plottable traces for this channel.")
     else:
@@ -2227,8 +2258,12 @@ if view == "Overlays":
                     normalize_to_peak=normalize_to_peak,
                 )
                 if fig:
-                    st.pyplot(fig)
-                    plt.close(fig)
+                    render_downloadable_pyplot(
+                        st,
+                        fig,
+                        key=f"swv_overlay_{ch}_{y_key}_{normalize_to_peak}",
+                        file_stem=f"swv_overlay_ch{ch}_{trace_type}",
+                    )
                 else:
                     st.warning("No plottable traces for this channel.")
 
@@ -2294,8 +2329,12 @@ if view == "Metrics":
                 scan_range=plot_scan_range, highlight_channel=highlight_ch, xlabel=x_axis_label,
             )
             if fig:
-                st.pyplot(fig)
-                plt.close(fig)
+                render_downloadable_pyplot(
+                    st,
+                    fig,
+                    key=f"metric_combined_{metric}_{highlight_ch or 'all'}",
+                    file_stem=f"metric_{label}_combined",
+                )
         else:
             cols = st.columns(min(len(channels_display), 3))
             for i, ch in enumerate(channels_display):
@@ -2306,8 +2345,12 @@ if view == "Metrics":
                 )
                 if fig:
                     with cols[i % min(len(channels_display), 3)]:
-                        st.pyplot(fig)
-                    plt.close(fig)
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=f"metric_ch{ch}_{metric}",
+                            file_stem=f"metric_{label}_ch{ch}",
+                        )
 
         if titration_ready:
             st.caption("Titration plateaus")
@@ -2325,8 +2368,12 @@ if view == "Metrics":
                     highlight_channel=highlight_ch,
                 )
                 if fig:
-                    st.pyplot(fig)
-                    plt.close(fig)
+                    render_downloadable_pyplot(
+                        st,
+                        fig,
+                        key=f"titration_plateau_combined_{metric}_{highlight_ch or 'all'}",
+                        file_stem=f"titration_plateau_{label}_combined",
+                    )
             else:
                 cols = st.columns(min(len(channels_display), 3))
                 for i, ch in enumerate(channels_display):
@@ -2344,8 +2391,12 @@ if view == "Metrics":
                     )
                     if fig:
                         with cols[i % min(len(channels_display), 3)]:
-                            st.pyplot(fig)
-                        plt.close(fig)
+                            render_downloadable_pyplot(
+                                st,
+                                fig,
+                                key=f"titration_plateau_ch{ch}_{metric}",
+                                file_stem=f"titration_plateau_{label}_ch{ch}",
+                            )
 
             if fit_titration_langmuir and supports_langmuir(metric):
                 fit_caption = "Langmuir-style fit of plateau midpoints"
@@ -2369,8 +2420,12 @@ if view == "Metrics":
                         concentration_unit=titration_concentration_unit,
                     )
                     if fig:
-                        st.pyplot(fig)
-                        plt.close(fig)
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=f"titration_langmuir_combined_{metric}_{highlight_ch or 'all'}",
+                            file_stem=f"titration_langmuir_{label}_combined",
+                        )
                 else:
                     cols = st.columns(min(len(channels_display), 3))
                     for i, ch in enumerate(channels_display):
@@ -2390,8 +2445,12 @@ if view == "Metrics":
                         )
                         if fig:
                             with cols[i % min(len(channels_display), 3)]:
-                                st.pyplot(fig)
-                            plt.close(fig)
+                                render_downloadable_pyplot(
+                                    st,
+                                    fig,
+                                    key=f"titration_langmuir_ch{ch}_{metric}",
+                                    file_stem=f"titration_langmuir_{label}_ch{ch}",
+                                )
 
         st.divider()
 
@@ -2453,8 +2512,12 @@ if view == "Drift":
                 scan_range=plot_scan_range, highlight_channel=drift_highlight, xlabel=x_axis_label,
             )
             if fig:
-                st.pyplot(fig)
-                plt.close(fig)
+                render_downloadable_pyplot(
+                    st,
+                    fig,
+                    key=f"drift_combined_{drift_key}_{drift_highlight or 'all'}",
+                    file_stem=f"drift_{label}_combined",
+                )
             else:
                 st.warning(f"No data available for {label}.")
         else:
@@ -2467,8 +2530,12 @@ if view == "Drift":
                 )
                 if fig:
                     with cols[i % min(len(channels_display), 3)]:
-                        st.pyplot(fig)
-                    plt.close(fig)
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=f"drift_ch{ch}_{drift_key}",
+                            file_stem=f"drift_{label}_ch{ch}",
+                        )
 
         st.divider()
 
@@ -2521,8 +2588,12 @@ if view == "Failures":
                             show_peak_reference_vlines=False,
                         )
                         if fig:
-                            st.pyplot(fig)
-                            plt.close(fig)
+                            render_downloadable_pyplot(
+                                st,
+                                fig,
+                                key=f"cv_failed_overlay_ch{ch}_{yk}",
+                                file_stem=f"cv_failed_ch{ch}_{title_suffix}",
+                            )
 
             st.divider()
             st.markdown("#### Failed-cycle inspector")
@@ -2538,8 +2609,18 @@ if view == "Failures":
                     st.caption(f"Partial trace note: {chosen.get('partial_error')}")
                 fig = plot_cv_trace(chosen)
                 if fig:
-                    st.pyplot(fig)
-                    plt.close(fig)
+                    render_downloadable_pyplot(
+                        st,
+                        fig,
+                        key=(
+                            f"cv_failed_trace_ch{chosen.get('channel')}_"
+                            f"{chosen.get('scan_number')}"
+                        ),
+                        file_stem=(
+                            f"cv_failed_trace_ch{chosen.get('channel')}_"
+                            f"cycle_{chosen.get('scan_number')}"
+                        ),
+                    )
                 else:
                     st.warning("No trace data available for this failed cycle.")
         else:
@@ -2575,8 +2656,12 @@ if view == "Failures":
                             show_minima_candidates=(yk == "smoothed_current"),
                         )
                         if fig:
-                            st.pyplot(fig)
-                            plt.close(fig)
+                            render_downloadable_pyplot(
+                                st,
+                                fig,
+                                key=f"swv_failed_overlay_ch{ch}_{yk}",
+                                file_stem=f"swv_failed_ch{ch}_{yk}",
+                            )
 
             st.divider()
             st.markdown("####  Single-trace inspector")
@@ -2590,8 +2675,18 @@ if view == "Failures":
                 st.caption(f"Error: {chosen.get('error', '')}")
                 if chosen.get("voltage") is not None:
                     fig = plot_single_trace(chosen)
-                    st.pyplot(fig)
-                    plt.close(fig)
+                    render_downloadable_pyplot(
+                        st,
+                        fig,
+                        key=(
+                            f"swv_failed_trace_ch{chosen.get('channel')}_"
+                            f"{chosen.get('scan_number')}"
+                        ),
+                        file_stem=(
+                            f"swv_failed_trace_ch{chosen.get('channel')}_"
+                            f"scan_{chosen.get('scan_number')}"
+                        ),
+                    )
                 else:
                     st.warning("No trace data available for this file.")
 
@@ -2768,8 +2863,18 @@ if view == "Data Table":
 
             if chosen.get("voltage") is not None:
                 fig = plot_single_trace(chosen)
-                st.pyplot(fig)
-                plt.close(fig)
+                render_downloadable_pyplot(
+                    st,
+                    fig,
+                    key=(
+                        f"table_swv_trace_ch{chosen.get('channel')}_"
+                        f"{chosen.get('scan_number')}_{chosen.get('status')}"
+                    ),
+                    file_stem=(
+                        f"swv_trace_ch{chosen.get('channel')}_"
+                        f"scan_{chosen.get('scan_number')}"
+                    ),
+                )
             else:
                 st.warning("No trace data available for this measurement.")
     elif filtered_results:
@@ -2784,8 +2889,18 @@ if view == "Data Table":
                 st.caption(f"Error: {chosen.get('error')}")
             fig = plot_cv_trace(chosen)
             if fig:
-                st.pyplot(fig)
-                plt.close(fig)
+                render_downloadable_pyplot(
+                    st,
+                    fig,
+                    key=(
+                        f"table_cv_trace_ch{chosen.get('channel')}_"
+                        f"{chosen.get('scan_number')}_{chosen.get('status')}"
+                    ),
+                    file_stem=(
+                        f"cv_trace_ch{chosen.get('channel')}_"
+                        f"cycle_{chosen.get('scan_number')}"
+                    ),
+                )
 
 
 # 
