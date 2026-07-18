@@ -74,8 +74,10 @@ swv_app/
 
 ## Bayesian-optimization sessions
 
-Choose **BO Session** under **Analysis mode**, then enter the
-`bo_session_<name>` folder containing `bo_state.json`. The viewer reconstructs
+Choose **BO Session** under **Analysis mode**, then enter either an experiment
+folder containing BO session subfolders or a specific `bo_session_<name>` folder
+containing `bo_state.json`. If multiple sessions are found, choose the session
+to inspect from the sidebar dropdown. The viewer reconstructs
 both standard and paired-response BO sessions, including selectable metric
 trends and history, per-channel scores, raw and corrected traces, 1D/2D/3D
 surrogate views, measured-data landscapes, and candidate tables. Measured-data
@@ -87,7 +89,19 @@ parameters or editable native SWV processing settings in the sidebar.
 Sessions with independently optimized channel groups are analyzed together by
 default. Group-level trends remain separate, and observations are selected by
 group plus iteration. The sidebar can optionally scope the analysis to one
-group.
+group. Simulated sweep comparisons and loaded sweep-session trend plots can
+color runs by the number of initial random/maximin points or by swept GP
+falloff values, making it easier to compare convergence metrics versus
+iteration. The simulation tab also supports compact multi-parameter sweeps:
+enter separate lists for exploration, initial random/maximin points, GP falloff,
+and repeats per hyperparameter point, then preview the generated Cartesian
+product before running. Compact exports write only metadata, run summary, and
+history CSV files, omitting generated SWV, analysis, surrogate, and tensor
+artifacts. In **History & scores**, compact and sweep sessions expose a
+hyperparameter response view that summarizes each run and plots the same
+metrics available to the trend plot against two or three selected
+hyperparameters, for example GP falloff versus exploration or a 3D
+voxel hyperparameter response map.
 
 The **PDF Export** tab builds a shareable, chronological report containing Q
 definitions, objective and parameter evolution, channel and phase trends,

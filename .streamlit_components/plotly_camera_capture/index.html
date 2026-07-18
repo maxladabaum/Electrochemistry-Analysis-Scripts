@@ -1,0 +1,199 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="./plotly.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+    #plot {
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="plot"></div>
+  <script>
+    const STREAMLIT_READY = "streamlit:componentReady";
+    const STREAMLIT_RENDER = "streamlit:render";
+    const STREAMLIT_SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
+    const SHARED_CAMERA_KEY = "bo_viewer_camera:latest_3d_perspective";
+    const graph = document.getElementById("plot");
+    let latestArgs = null;
+    let sendTimer = null;
+    let suppressCameraEvents = false;
+
+    function streamlitMessage(type, data) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: type,
+        ...data,
+      }, "*");
+    }
+
+    function setFrameHeight(height) {
+      streamlitMessage(STREAMLIT_SET_FRAME_HEIGHT, {height: height});
+    }
+
+    function setComponentValue(value) {
+      streamlitMessage("streamlit:setComponentValue", {value: value});
+    }
+
+    function loadCamera(storageKey) {
+      try {
+        const raw = window.localStorage.getItem(storageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function saveCamera(storageKey, camera) {
+      if (!storageKey || !camera || !camera.eye) {
+        return;
+      }
+      try {
+        window.localStorage.setItem(storageKey, JSON.stringify(camera));
+      } catch (error) {}
+    }
+
+    function loadNumber(storageKey) {
+      try {
+        const value = Number(window.localStorage.getItem(storageKey) || 0);
+        return Number.isFinite(value) ? value : 0;
+      } catch (error) {
+        return 0;
+      }
+    }
+
+    function saveNumber(storageKey, value) {
+      try {
+        window.localStorage.setItem(storageKey, String(Number(value) || 0));
+      } catch (error) {}
+    }
+
+    function mergeCameraUpdate(update) {
+      const current = (
+        graph.layout &&
+        graph.layout.scene &&
+        graph.layout.scene.camera
+      ) ? JSON.parse(JSON.stringify(graph.layout.scene.camera)) : {};
+      if (update && update["scene.camera"]) {
+        return update["scene.camera"];
+      }
+      ["eye", "center", "up"].forEach(function(part) {
+        ["x", "y", "z"].forEach(function(axis) {
+          const key = "scene.camera." + part + "." + axis;
+          if (update && Object.prototype.hasOwnProperty.call(update, key)) {
+            current[part] = current[part] || {};
+            current[part][axis] = update[key];
+          }
+        });
+      });
+      return current;
+    }
+
+    function hasCameraUpdate(update) {
+      if (!update) {
+        return false;
+      }
+      if (Object.prototype.hasOwnProperty.call(update, "scene.camera")) {
+        return true;
+      }
+      return Object.keys(update).some(function(key) {
+        return key.indexOf("scene.camera.") === 0;
+      });
+    }
+
+    function persistUserCamera(camera) {
+      if (!latestArgs || !camera || !camera.eye) {
+        return;
+      }
+      saveCamera(latestArgs.storage_key, camera);
+      saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
+      setComponentValue(camera);
+    }
+
+    function scheduleCameraSend(camera) {
+      if (latestArgs && latestArgs.storage_key) {
+        saveCamera(latestArgs.storage_key, camera);
+        saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
+      }
+      window.clearTimeout(sendTimer);
+      sendTimer = window.setTimeout(function() {
+        persistUserCamera(camera);
+      }, 250);
+    }
+
+    function render(args) {
+      latestArgs = args || {};
+      const height = Number(latestArgs.height || 700);
+      graph.style.height = height + "px";
+      setFrameHeight(height);
+      window.clearTimeout(sendTimer);
+
+      const figure = latestArgs.figure || {};
+      figure.layout = figure.layout || {};
+      figure.layout.scene = figure.layout.scene || {};
+      const storedCamera = loadCamera(latestArgs.storage_key);
+      const syncNonce = Number(latestArgs.apply_sync_nonce || 0);
+      const nonceKey = latestArgs.storage_key + ":last_sync_nonce";
+      const lastSyncNonce = loadNumber(nonceKey);
+      const syncedCamera = (
+        syncNonce > lastSyncNonce
+      ) ? loadCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY) : null;
+      if (syncNonce > lastSyncNonce) {
+        saveNumber(nonceKey, syncNonce);
+      }
+      const initialCamera = syncedCamera || latestArgs.camera || storedCamera;
+      if (initialCamera) {
+        figure.layout.scene.camera = initialCamera;
+        saveCamera(latestArgs.storage_key, initialCamera);
+      }
+      const config = {
+        responsive: true,
+        displaylogo: false,
+        scrollZoom: true,
+        modeBarButtonsToRemove: ["toImage"],
+      };
+      suppressCameraEvents = true;
+      Plotly.react(graph, figure.data || [], figure.layout, config).then(function() {
+        if (initialCamera) {
+          return Plotly.relayout(graph, {"scene.camera": initialCamera});
+        }
+        return null;
+      }).finally(function() {
+        window.setTimeout(function() {
+          suppressCameraEvents = false;
+        }, 0);
+      });
+      graph.removeAllListeners && graph.removeAllListeners("plotly_relayout");
+      graph.on("plotly_relayout", function(update) {
+        if (suppressCameraEvents) {
+          return;
+        }
+        if (!hasCameraUpdate(update)) {
+          return;
+        }
+        scheduleCameraSend(mergeCameraUpdate(update));
+      });
+    }
+
+    window.addEventListener("message", function(event) {
+      const data = event.data || {};
+      if (data.type !== STREAMLIT_RENDER) {
+        return;
+      }
+      render((data.args || {}));
+    });
+
+    streamlitMessage(STREAMLIT_READY, {apiVersion: 1});
+    setFrameHeight(700);
+  </script>
+</body>
+</html>

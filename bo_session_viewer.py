@@ -5,16 +5,19 @@ from __future__ import annotations
 import json
 import itertools
 import base64
+import hashlib
+import html
 from functools import lru_cache
-from io import BytesIO
+from io import BytesIO, StringIO
 import math
 import os
 from pathlib import Path, PureWindowsPath
+import random
 import re
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -25,10 +28,25 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.interpolate import griddata
+from plotly.utils import PlotlyJSONEncoder
+from scipy.interpolate import Rbf, RegularGridInterpolator, griddata
 from scipy.special import ndtr
 import streamlit as st
 import streamlit.components.v1 as components
+try:
+    from streamlit_plotly_events import plotly_events
+except Exception:
+    plotly_events = None
+
+_PLOTLY_CAMERA_COMPONENT_DIR = (
+    Path(__file__).parent / ".streamlit_components" / "plotly_camera_capture"
+)
+_plotly_camera_capture = components.declare_component(
+    "plotly_camera_capture",
+    path=str(_PLOTLY_CAMERA_COMPONENT_DIR),
+)
+_SHARED_3D_CAMERA_STORAGE_KEY = "bo_viewer_camera:latest_3d_perspective"
+INTERPOLATION_CACHE_VERSION = "gp_smooth_fixed_length_scales_v2"
 
 from core.analysis import analyze_swv_arrays
 from core.io import load_swv_csv
@@ -38,6 +56,15 @@ PARAMETERS = (
     "begin_potential", "end_potential", "step_potential", "amplitude",
     "frequency", "conditioning_potential", "conditioning_time",
 )
+DEFAULT_INITIAL_METHOD = {
+    "begin_potential": -0.7,
+    "end_potential": -0.1,
+    "step_potential": 0.002,
+    "amplitude": 0.036,
+    "frequency": 200.0,
+    "conditioning_potential": -0.7,
+    "conditioning_time": 0.0,
+}
 SURROGATE_VALUES = ("predicted_mean_Q", "predicted_std_Q", "acquisition_value")
 SURROGATE_VALUE_LABELS = {
     "predicted_mean_Q": "Predicted Q",
@@ -48,6 +75,11 @@ OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 OBSERVED_PATH_CMAP = LinearSegmentedColormap.from_list(
     "observed_iteration", OBSERVED_PATH_COLORS
 )
+GROUP_CATEGORICAL_COLORS = (
+    "#009E73", "#E69F00", "#CC79A7", "#D55E00",
+    "#56B4E9", "#7F3C8D", "#A0B700", "#666666",
+)
+NO_HIGHLIGHTED_SLICE_LABEL = "Do not display highlighted slice"
 PAIRED_TREND_METRICS = {
     "Peak height (µA)": ("channel", "mean_peak_current_uA", "median_peak_current_uA"),
     "Raw SNR": ("channel", "snr_unadjusted", "snr"),
@@ -65,15 +97,48 @@ REAL_DATA_METRICS = {
     "Baseline stability score": ("channel", "baseline_stability_score", None),
     "Replicate consistency score": ("channel", "replicate_consistency_score", None),
     "Success score": ("channel", "success_score", None),
+    "Paired Q": ("observation", "Q_run", None),
     "Classic Q": ("component", "classic_Q", None),
     "SNR score": ("component", "snr_score", None),
 }
 
 
+def _slice_highlight_color(
+    index: int,
+    total: int,
+) -> tuple[tuple[float, float, float], str]:
+    """Return matching matplotlib and Plotly colors for highlighted slices."""
+    if total <= 1:
+        rgb = (1.0, 59.0 / 255.0, 48.0 / 255.0)
+    else:
+        red, green, blue, _alpha = plt.get_cmap("rainbow")(
+            index / max(total - 1, 1)
+        )
+        rgb = (float(red), float(green), float(blue))
+    plotly_color = (
+        f"rgba({rgb[0] * 255:.0f},{rgb[1] * 255:.0f},"
+        f"{rgb[2] * 255:.0f},1)"
+    )
+    return rgb, plotly_color
+
+
+def _apply_slice_perimeter_style(
+    fig,
+    color: tuple[float, float, float],
+) -> None:
+    """Draw a visible border around a matplotlib slice plot."""
+    for axis in fig.axes:
+        if getattr(axis, "name", "") != "rectilinear":
+            continue
+        for spine in axis.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(2.5)
+
+
 def _pick_session_folder() -> str:
     """Open the platform-native folder picker outside the Streamlit thread."""
     if sys.platform == "darwin":
-        script = 'POSIX path of (choose folder with prompt "Select BO session folder")'
+        script = 'POSIX path of (choose folder with prompt "Select BO experiment or session folder")'
         return subprocess.check_output(["osascript", "-e", script], text=True).strip()
     if sys.platform.startswith("win"):
         code = (
@@ -82,7 +147,7 @@ def _pick_session_folder() -> str:
             "root=tk.Tk()\n"
             "root.withdraw()\n"
             "root.wm_attributes('-topmost', True)\n"
-            "p=filedialog.askdirectory(title='Select BO session folder')\n"
+            "p=filedialog.askdirectory(title='Select BO experiment or session folder')\n"
             "root.destroy()\n"
             "print(p or '')\n"
         )
@@ -98,11 +163,183 @@ def _read_json(path: Path) -> dict:
     return value
 
 
+def discover_bo_session_folders(folder: str | Path) -> list[Path]:
+    """Return BO session folders found at or under an experiment folder."""
+    root = Path(folder).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"BO experiment/session folder does not exist: {root}")
+    discovery_root = root
+    if (root / "bo_state.json").is_file():
+        if root.parent.name == "bo_sessions":
+            discovery_root = root.parent
+        elif (root.parent / "bo_sessions").is_dir():
+            discovery_root = root.parent
+
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    for state_path in [
+        discovery_root / "bo_state.json",
+        *discovery_root.rglob("bo_state.json"),
+    ]:
+        if not state_path.is_file():
+            continue
+        session_root = state_path.parent.resolve()
+        if session_root in seen:
+            continue
+        discovered.append(session_root)
+        seen.add(session_root)
+    return sorted(
+        discovered,
+        key=lambda path: (
+            0 if path == root else 1,
+            (
+                len(path.relative_to(discovery_root).parts)
+                if path != discovery_root and path.is_relative_to(discovery_root)
+                else 0
+            ),
+            path.name.lower(),
+            str(path).lower(),
+        ),
+    )
+
+
+def _bo_session_choice_label(path: Path, search_root: Path) -> str:
+    """Build a compact session picker label without requiring a full load."""
+    try:
+        relative = path.relative_to(search_root)
+        folder_label = path.name if str(relative) == "." else str(relative)
+    except ValueError:
+        folder_label = path.name
+    try:
+        state = _read_json(path / "bo_state.json")
+    except Exception:
+        return folder_label
+    session_id = state.get("session_id")
+    observations = state.get("observations") or []
+    metadata = state.get("simulation_metadata") or {}
+    details = []
+    if session_id:
+        details.append(str(session_id))
+    if metadata.get("compact_export"):
+        run_count = metadata.get("run_count")
+        if run_count is not None:
+            details.append(f"{run_count} compact runs")
+        else:
+            history_path = path / "history.csv"
+            if history_path.is_file():
+                try:
+                    details.append(f"{len(pd.read_csv(history_path))} history rows")
+                except Exception:
+                    details.append("compact sweep")
+            else:
+                details.append("compact sweep")
+    elif isinstance(observations, list):
+        details.append(f"{len(observations)} observations")
+    return f"{folder_label} ({', '.join(details)})" if details else folder_label
+
+
+def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list[dict]:
+    """Rebuild lightweight observations for compact simulation exports."""
+    observations = []
+    if history is None or history.empty:
+        return observations
+    for _index, row in history.sort_values(
+        ["group_id", "iteration"],
+        kind="mergesort",
+    ).iterrows():
+        try:
+            iteration = int(row.get("iteration"))
+            group_id = int(row.get("group_id", 1))
+            q_run = float(row.get("Q_run", row.get("observed_value")))
+        except (TypeError, ValueError):
+            continue
+        channel_text = str(row.get("channels", group_id))
+        try:
+            channels = [
+                int(float(part.strip()))
+                for part in channel_text.split(",")
+                if part.strip()
+            ]
+        except ValueError:
+            channels = [group_id]
+        if not channels:
+            channels = [group_id]
+        params = {
+            parameter: float(row[parameter])
+            for parameter in PARAMETERS
+            if parameter in history.columns and pd.notna(row.get(parameter))
+        }
+        channel = str(channels[0])
+        group_name_value = row.get("group_name")
+        group_name = (
+            str(group_name_value)
+            if pd.notna(group_name_value)
+            else f"Group {group_id}"
+        )
+        run_label_value = row.get("run_label")
+        selection_mode_value = row.get("selection_mode")
+        objective_value = row.get("objective")
+        exploration_value = _finite_float(row.get("exploration"))
+        replicate_value = _finite_float(row.get("replicate"))
+        seed_value = _finite_float(row.get("seed"))
+        observations.append({
+            "iteration": iteration,
+            "method_id": f"compact_sim_group_{group_id:02d}_iter_{iteration:03d}",
+            "params": params,
+            "status": "completed",
+            "group_id": group_id,
+            "group_name": group_name,
+            "channels": channels,
+            "objective": (
+                str(objective_value)
+                if pd.notna(objective_value)
+                else "compact_simulation"
+            ),
+            "Q_run": q_run,
+            "quality": {
+                "Q_run": q_run,
+                "simulation_run_label": (
+                    str(run_label_value) if pd.notna(run_label_value) else None
+                ),
+                "simulation_exploration": exploration_value,
+                "simulation_replicate": (
+                    int(replicate_value) if replicate_value is not None else None
+                ),
+                "simulation_seed": int(seed_value) if seed_value is not None else None,
+                "selection_mode": (
+                    str(selection_mode_value)
+                    if pd.notna(selection_mode_value)
+                    else None
+                ),
+                "channel_components": {
+                    channel: {
+                        "Q_channel": q_run,
+                        "classic_Q": q_run,
+                        "snr_score": q_run,
+                        "normalized_SNR": q_run,
+                    }
+                },
+            },
+            "channel_metrics": {
+                channel: {
+                    "Q_channel": q_run,
+                    "classic_Q": q_run,
+                    "snr": max(0.0, q_run),
+                    "snr_unadjusted": max(0.0, q_run),
+                    "success_score": q_run,
+                    "mean_peak_current_uA": q_run,
+                }
+            },
+        })
+    return observations
+
+
 def load_bo_session(folder: str | Path) -> dict:
     """Load a BO record folder without depending on experiment_automation."""
     root = Path(folder).expanduser().resolve()
     state_path = root / "bo_state.json"
     history_path = root / "history.csv"
+    simulation_ground_truth_path = root / "simulation_ground_truth_tensor.csv"
     if not root.is_dir():
         raise ValueError(f"BO session folder does not exist: {root}")
     if not state_path.is_file():
@@ -114,17 +351,39 @@ def load_bo_session(folder: str | Path) -> dict:
     history = pd.read_csv(history_path) if history_path.is_file() else pd.DataFrame()
     config_path = root / "bo_config_snapshot.json"
     config = _read_json(config_path) if config_path.is_file() else {}
+    if not observations and not history.empty:
+        metadata = state.get("simulation_metadata") or {}
+        records = config.get("records") if isinstance(config, dict) else {}
+        if metadata.get("compact_export") or records.get("compact_simulation_export"):
+            observations = _compact_simulation_observations_from_history(history)
+    simulation_ground_truth = (
+        pd.read_csv(simulation_ground_truth_path)
+        if simulation_ground_truth_path.is_file()
+        else pd.DataFrame()
+    )
     return {
         "root": root,
         "state": state,
         "config": config,
         "observations": observations,
         "history": history,
+        "simulation_ground_truth": simulation_ground_truth,
     }
 
 
 def _session_channel_groups(session: dict) -> list[dict]:
     """Return the persisted groups that have observations in this session."""
+    def as_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, set):
+            return sorted(value)
+        return [value]
+
     observations = session["observations"]
     observed_ids = {
         int(obs.get("group_id", 1))
@@ -147,7 +406,7 @@ def _session_channel_groups(session: dict) -> list[dict]:
         groups.append({
             "id": group_id,
             "name": str(raw.get("name") or f"Group {group_id}"),
-            "channels": list(raw.get("channels") or []),
+            "channels": as_list(raw.get("channels")),
         })
     known_ids = {group["id"] for group in groups}
     for obs in observations:
@@ -156,7 +415,7 @@ def _session_channel_groups(session: dict) -> list[dict]:
             groups.append({
                 "id": group_id,
                 "name": str(obs.get("group_name") or f"Group {group_id}"),
-                "channels": list(obs.get("channels") or []),
+                "channels": as_list(obs.get("channels")),
             })
             known_ids.add(group_id)
     return sorted(groups, key=lambda group: group["id"])
@@ -184,9 +443,26 @@ def _channel_group_optimization_metadata(
     """Merge global acquisition defaults with persisted per-group overrides."""
     config = session.get("config") or {}
     acquisition = config.get("acquisition") or {}
+
+    def as_dict(value) -> dict:
+        return dict(value) if isinstance(value, dict) else {}
+
+    def as_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, set):
+            return sorted(value)
+        return [value]
+
     def groups_by_id(raw_groups) -> dict[int, dict]:
         result = {}
         for raw_group in raw_groups or []:
+            if not isinstance(raw_group, dict):
+                continue
             try:
                 result[int(raw_group["id"])] = raw_group
             except (KeyError, TypeError, ValueError):
@@ -199,7 +475,12 @@ def _channel_group_optimization_metadata(
     )
     metadata = []
     for group in groups:
-        group_id = int(group["id"])
+        if not isinstance(group, dict):
+            continue
+        try:
+            group_id = int(group.get("id", 1))
+        except (TypeError, ValueError):
+            continue
         settings = {
             "exploration": acquisition.get(
                 "exploration", config.get("exploration")
@@ -219,24 +500,31 @@ def _channel_group_optimization_metadata(
             "gp_optimizer_restarts": acquisition.get(
                 "gp_optimizer_restarts", config.get("gp_optimizer_restarts")
             ),
-            "gp_falloff_fractions": acquisition.get("gp_falloff_fractions") or {},
-            "gp_length_scales": acquisition.get("gp_length_scales") or {},
-            "initial_parameters": config.get("initial_parameters") or {},
+            "gp_falloff_fractions": as_dict(
+                acquisition.get("gp_falloff_fractions")
+            ),
+            "gp_length_scales": as_dict(acquisition.get("gp_length_scales")),
+            "initial_parameters": as_dict(config.get("initial_parameters")),
         }
-        settings.update(config_groups.get(group_id, {}))
-        settings.update(state_groups.get(group_id, {}))
+        settings.update(as_dict(config_groups.get(group_id)))
+        settings.update(as_dict(state_groups.get(group_id)))
         exploration = settings.get("exploration")
         try:
             exploration = float(exploration)
-            exploitation = (
-                1.0 - exploration if 0.0 <= exploration <= 1.0 else None
-            )
+            if not np.isfinite(exploration):
+                exploration = None
+                exploitation = None
+            else:
+                exploitation = (
+                    1.0 - exploration if 0.0 <= exploration <= 1.0 else None
+                )
         except (TypeError, ValueError):
+            exploration = None
             exploitation = None
         metadata.append({
             "id": group_id,
-            "name": str(settings.get("name") or group["name"]),
-            "channels": list(settings.get("channels") or group["channels"]),
+            "name": str(settings.get("name") or group.get("name") or f"Group {group_id}"),
+            "channels": as_list(settings.get("channels") or group.get("channels")),
             "exploration": exploration,
             "exploitation": exploitation,
             "n_initial_points": settings.get("n_initial_points"),
@@ -247,16 +535,52 @@ def _channel_group_optimization_metadata(
             "initial_point_mode": settings.get("initial_point_mode"),
             "use_gp": settings.get("use_gp"),
             "gp_optimizer_restarts": settings.get("gp_optimizer_restarts"),
-            "gp_falloff_fractions": dict(
-                settings.get("gp_falloff_fractions") or {}
+            "gp_falloff_fractions": as_dict(
+                settings.get("gp_falloff_fractions")
             ),
-            "gp_length_scales": dict(settings.get("gp_length_scales") or {}),
-            "initial_parameters": dict(settings.get("initial_parameters") or {}),
+            "gp_length_scales": as_dict(settings.get("gp_length_scales")),
+            "initial_parameters": as_dict(settings.get("initial_parameters")),
+            "gp_noise_level": settings.get("gp_noise_level"),
+            "simulation_seed": settings.get("simulation_seed"),
+            "simulation_replicate": settings.get("simulation_replicate"),
+            "simulated_session": bool(settings.get("simulated_session", False)),
         })
     return metadata
 
 
 def _observation_table(session: dict) -> pd.DataFrame:
+    def add_best_q_column(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or "Q_run" not in frame.columns:
+            return frame
+        result = frame.copy()
+        q_values = pd.to_numeric(result["Q_run"], errors="coerce")
+        iterations = pd.to_numeric(
+            result.get(
+                "iteration",
+                pd.Series(range(1, len(result) + 1), index=result.index),
+            ),
+            errors="coerce",
+        )
+        group_ids = pd.to_numeric(
+            result.get("group_id", pd.Series(1, index=result.index)),
+            errors="coerce",
+        ).fillna(1)
+        best_q = pd.Series(np.nan, index=result.index, dtype=float)
+        order_frame = pd.DataFrame({
+            "group_id": group_ids,
+            "iteration": iterations,
+            "q_value": q_values,
+            "_source_order": range(len(result)),
+        }, index=result.index)
+        for _group_id, group_rows in order_frame.groupby("group_id", sort=False):
+            ordered = group_rows.sort_values(
+                ["iteration", "_source_order"],
+                kind="mergesort",
+            )
+            best_q.loc[ordered.index] = ordered["q_value"].cummax()
+        result["best_Q"] = best_q
+        return result
+
     history = session["history"].copy()
     rows = []
     for obs in session["observations"]:
@@ -290,9 +614,9 @@ def _observation_table(session: dict) -> pd.DataFrame:
         rows.append(row)
     observation_frame = pd.DataFrame(rows)
     if history.empty:
-        return observation_frame
+        return add_best_q_column(observation_frame)
     if observation_frame.empty:
-        return history
+        return add_best_q_column(history)
 
     missing_columns = [
         column for column in observation_frame.columns
@@ -327,7 +651,7 @@ def _observation_table(session: dict) -> pd.DataFrame:
         for column, value in row.items():
             if pd.notna(value):
                 history.at[index, column] = value
-    return history
+    return add_best_q_column(history)
 
 
 def _numeric_columns(frame: pd.DataFrame) -> list[str]:
@@ -363,6 +687,7 @@ def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
 
 def _metric_label(metric: str) -> str:
     replacements = {
+        "best_Q": "Best Q",
         "Q_channel": "Channel Q",
         "Q_run": "Q run",
         "mean_peak_current_uA": "Peak height (µA)",
@@ -395,6 +720,43 @@ def _metadata_group_color(
     return f"rgb({red * 255:.0f},{green * 255:.0f},{blue * 255:.0f})"
 
 
+def _categorical_group_color(group_id: Any) -> str | None:
+    try:
+        index = int(group_id) - 1
+    except (TypeError, ValueError):
+        return None
+    return GROUP_CATEGORICAL_COLORS[index % len(GROUP_CATEGORICAL_COLORS)]
+
+
+def _metadata_value_color(
+    value: Any,
+    values: dict[int, float] | None,
+) -> str | None:
+    if not values:
+        return None
+    numeric = _finite_float(value)
+    if numeric is None:
+        return None
+    minimum = min(values.values())
+    maximum = max(values.values())
+    fraction = (
+        (numeric - minimum) / (maximum - minimum)
+        if maximum > minimum else .5
+    )
+    fraction = min(1.0, max(0.0, fraction))
+    red, green, blue, _alpha = plt.get_cmap("viridis")(fraction)
+    return f"rgb({red * 255:.0f},{green * 255:.0f},{blue * 255:.0f})"
+
+
+def _metadata_value_label(value: Any) -> str:
+    numeric = _finite_float(value)
+    if numeric is not None:
+        return f"{numeric:g}"
+    if value is None:
+        return "missing"
+    return str(value)
+
+
 def _add_metadata_colorbar(
     fig: go.Figure,
     values: dict[int, float] | None,
@@ -402,10 +764,30 @@ def _add_metadata_colorbar(
 ) -> None:
     if not values or not label:
         return
-    minimum = min(values.values())
-    maximum = max(values.values())
+    finite_values = sorted({
+        float(value)
+        for value in values.values()
+        if _finite_float(value) is not None
+    })
+    if not finite_values:
+        return
+    minimum = min(finite_values)
+    maximum = max(finite_values)
     if minimum == maximum:
         maximum = minimum + 1.0
+    colorbar = {
+        "title": {"text": label, "side": "right"},
+        "tickformat": ".4g",
+        "ticks": "outside",
+        "thickness": 18,
+        "xpad": 8,
+    }
+    if len(finite_values) <= 10:
+        colorbar.update({
+            "tickmode": "array",
+            "tickvals": finite_values,
+            "ticktext": [_metadata_value_label(value) for value in finite_values],
+        })
     fig.add_trace(go.Scatter(
         x=[None, None],
         y=[None, None],
@@ -416,19 +798,323 @@ def _add_metadata_colorbar(
             "cmin": minimum,
             "cmax": maximum,
             "showscale": True,
-            "colorbar": {"title": label},
+            "colorbar": colorbar,
         },
         hoverinfo="skip",
         showlegend=False,
     ))
 
 
+def _apply_metadata_coloraxis(
+    fig: go.Figure,
+    values: dict[int, float] | None,
+    label: str | None,
+) -> None:
+    if not values or not label:
+        return
+    finite_values = sorted({
+        float(value)
+        for value in values.values()
+        if _finite_float(value) is not None
+    })
+    if not finite_values:
+        return
+    minimum = min(finite_values)
+    maximum = max(finite_values)
+    if minimum == maximum:
+        maximum = minimum + 1.0
+    colorbar = {
+        "title": {"text": label, "side": "right"},
+        "tickformat": ".4g",
+        "ticks": "outside",
+        "thickness": 18,
+        "xpad": 8,
+    }
+    if len(finite_values) <= 10:
+        colorbar.update({
+            "tickmode": "array",
+            "tickvals": finite_values,
+            "ticktext": [_metadata_value_label(value) for value in finite_values],
+        })
+    fig.update_layout(
+        coloraxis={
+            "colorscale": "Viridis",
+            "cmin": minimum,
+            "cmax": maximum,
+            "colorbar": colorbar,
+        }
+    )
+
+
+def _strip_plotly_color_references(fig: go.Figure) -> go.Figure:
+    """Remove colorbar/coloraxis state from traces that should be categorical."""
+    for trace in fig.data:
+        marker = getattr(trace, "marker", None)
+        if marker is not None:
+            marker.showscale = False
+            marker.coloraxis = None
+            marker.colorbar = None
+            marker.colorscale = None
+        if hasattr(trace, "showscale"):
+            trace.showscale = False
+        if hasattr(trace, "coloraxis"):
+            trace.coloraxis = None
+        if hasattr(trace, "colorbar"):
+            trace.colorbar = None
+        if hasattr(trace, "colorscale"):
+            trace.colorscale = None
+    fig.update_layout(coloraxis=None)
+    return fig
+
+
+def _strip_categorical_plot_colorbars(fig: go.Figure) -> go.Figure:
+    """Remove accidental continuous colorbars from categorical Plotly traces."""
+    return _strip_plotly_color_references(fig)
+
+
+def _finite_float(value) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _parse_float_sweep_values(
+    text: str,
+    *,
+    minimum: float,
+    maximum: float,
+    label: str,
+) -> list[float]:
+    values = []
+    for token in str(text).replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            parts = [part.strip() for part in token.split(":")]
+            if len(parts) != 3:
+                raise ValueError(f"Invalid {label} range '{token}'. Use start:stop:step.")
+            start, stop, step = map(float, parts)
+            if step <= 0:
+                raise ValueError(f"{label} range step must be positive.")
+            current = start
+            while current <= stop + step * 1e-9:
+                values.append(round(current, 10))
+                current += step
+        else:
+            values.append(float(token))
+    validated = []
+    for value in values:
+        if not minimum <= value <= maximum:
+            raise ValueError(
+                f"{label} values must be between {minimum:g} and {maximum:g}."
+            )
+        validated.append(value)
+    if not validated:
+        raise ValueError(f"Enter at least one {label} value.")
+    return validated
+
+
+def _parse_int_sweep_values(
+    text: str,
+    *,
+    minimum: int,
+    maximum: int,
+    label: str,
+) -> list[int]:
+    values = []
+    for token in str(text).replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            parts = [part.strip() for part in token.split(":")]
+            if len(parts) != 3:
+                raise ValueError(f"Invalid {label} range '{token}'. Use start:stop:step.")
+            start, stop, step = map(int, parts)
+            if step <= 0:
+                raise ValueError(f"{label} range step must be positive.")
+            current = start
+            while current <= stop:
+                values.append(current)
+                current += step
+        else:
+            numeric = float(token)
+            if not numeric.is_integer():
+                raise ValueError(f"{label} values must be whole numbers.")
+            values.append(int(numeric))
+    validated = []
+    for value in values:
+        if not minimum <= value <= maximum:
+            raise ValueError(
+                f"{label} values must be between {minimum:g} and {maximum:g}."
+            )
+        validated.append(value)
+    if not validated:
+        raise ValueError(f"Enter at least one {label} value.")
+    return validated
+
+
+def _simulation_optimum_reference_from_frame(
+    ground_truth: pd.DataFrame,
+    value_column: str = "ground_truth_value",
+) -> dict[str, float] | None:
+    if ground_truth is None or ground_truth.empty:
+        return None
+    frame = ground_truth.copy()
+    if value_column not in frame.columns:
+        numeric_candidates = [
+            column for column in frame.columns
+            if column not in {"source_index", "candidate_index"}
+            and pd.api.types.is_numeric_dtype(frame[column])
+        ]
+        if not numeric_candidates:
+            return None
+        value_column = (
+            "interpolated_value"
+            if "interpolated_value" in numeric_candidates
+            else numeric_candidates[-1]
+        )
+    values = pd.to_numeric(frame[value_column], errors="coerce")
+    if values.notna().sum() == 0:
+        return None
+    best_index = values.idxmax()
+    best_row = frame.loc[best_index]
+    reference = {"Q_run": float(values.loc[best_index])}
+    for parameter in ("frequency", "amplitude", "step_potential"):
+        if parameter in frame.columns:
+            parameter_value = _finite_float(best_row.get(parameter))
+            if parameter_value is not None:
+                reference[parameter] = parameter_value
+    return reference
+
+
+def _simulation_optimum_value_column(frame: pd.DataFrame) -> str | None:
+    for candidate in (
+        "ground_truth_value",
+        "interpolated_value",
+        "Q_run",
+        "value",
+    ):
+        if candidate in frame.columns:
+            return candidate
+    numeric_candidates = [
+        column for column in frame.columns
+        if column not in {
+            "source_index",
+            "candidate_index",
+            "ground_truth_channel",
+        }
+        and pd.api.types.is_numeric_dtype(frame[column])
+    ]
+    return numeric_candidates[-1] if numeric_candidates else None
+
+
+def _simulation_channel_optima_frame(session: dict) -> pd.DataFrame:
+    ground_truth = session.get("simulation_ground_truth")
+    if not isinstance(ground_truth, pd.DataFrame) or ground_truth.empty:
+        return pd.DataFrame()
+    value_column = _simulation_optimum_value_column(ground_truth)
+    if value_column is None:
+        return pd.DataFrame()
+    work = ground_truth.copy()
+    work[value_column] = pd.to_numeric(work[value_column], errors="coerce")
+    work = work.dropna(subset=[value_column])
+    if work.empty:
+        return pd.DataFrame()
+    metadata = (session.get("state") or {}).get("simulation_metadata") or {}
+    if "ground_truth_channel" not in work.columns:
+        channel = metadata.get("ground_truth_channel")
+        if channel is None:
+            return pd.DataFrame()
+        work["ground_truth_channel"] = str(channel)
+    rows = []
+    for channel, channel_rows in work.groupby("ground_truth_channel", dropna=False):
+        if channel_rows.empty:
+            continue
+        best_index = channel_rows[value_column].idxmax()
+        best_row = channel_rows.loc[best_index]
+        row = {
+            "Channel": f"Ch {channel}",
+            "Maximum possible Q": float(best_row[value_column]),
+        }
+        for column, label in (
+            ("frequency", "Best frequency"),
+            ("amplitude", "Best amplitude"),
+            ("step_potential", "Best step size"),
+        ):
+            if column in channel_rows.columns:
+                value = _finite_float(best_row.get(column))
+                if value is not None:
+                    row[label] = value
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        "Channel",
+        key=lambda series: series.map(
+            lambda value: _channel_sort_key(str(value).replace("Ch ", ""))
+        ),
+    ).reset_index(drop=True)
+
+
+def _session_simulation_optimum_reference(session: dict) -> dict[str, float] | None:
+    metadata = (session.get("state") or {}).get("simulation_metadata") or {}
+    reference = metadata.get("ground_truth_optimum")
+    if isinstance(reference, dict):
+        parsed = {
+            str(key): float(value)
+            for key, value in reference.items()
+            if _finite_float(value) is not None
+        }
+        if parsed:
+            return parsed
+    ground_truth = session.get("simulation_ground_truth")
+    if isinstance(ground_truth, pd.DataFrame) and not ground_truth.empty:
+        return _simulation_optimum_reference_from_frame(ground_truth)
+    return None
+
+
+def _add_horizontal_reference_line(
+    fig: go.Figure,
+    y_value: float | None,
+    label: str,
+) -> None:
+    if y_value is None or not np.isfinite(float(y_value)):
+        return
+    try:
+        fig.add_hline(
+            y=float(y_value),
+            line_dash="dash",
+            line_color="#d62728",
+            line_width=2,
+            annotation_text=label,
+            annotation_position="top left",
+        )
+    except Exception:
+        fig.add_trace(go.Scatter(
+            x=[None],
+            y=[float(y_value)],
+            mode="lines",
+            name=label,
+            line={"dash": "dash", "color": "#d62728", "width": 2},
+            hovertemplate=f"{label}: %{{y:.4g}}<extra></extra>",
+        ))
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
 def _plot_trend(
     frame: pd.DataFrame,
     metric: str,
     group_layout: str = "Plot groups overlaid",
     group_color_values: dict[int, float] | None = None,
     group_color_label: str | None = None,
+    group_average_values: dict[int, float] | None = None,
+    group_average_label: str | None = None,
+    reference_value: float | None = None,
+    reference_label: str | None = None,
 ):
     if metric not in frame.columns:
         fig = go.Figure()
@@ -443,6 +1129,88 @@ def _plot_trend(
     valid = values.notna() & x.notna()
     fig = go.Figure()
     grouped = "group_id" in frame.columns and frame.loc[valid, "group_id"].nunique() > 1
+    if grouped and group_average_values:
+        average_data = pd.DataFrame({
+            "iteration": x[valid].astype(int),
+            "value": values[valid],
+            "group_id": pd.to_numeric(
+                frame.loc[valid, "group_id"],
+                errors="coerce",
+            ),
+        }).dropna(subset=["group_id"])
+        average_data["average_value"] = [
+            group_average_values.get(int(group_id))
+            for group_id in average_data["group_id"]
+        ]
+        average_data["color_value"] = [
+            group_color_values.get(int(group_id))
+            if group_color_values else None
+            for group_id in average_data["group_id"]
+        ]
+        average_data = average_data.dropna(subset=["average_value"])
+        if not average_data.empty:
+            averaged = average_data.groupby(
+                ["average_value", "iteration"],
+                as_index=False,
+            ).agg({"value": "mean", "color_value": "mean"})
+            for average_value, rows in averaged.groupby("average_value", sort=True):
+                value_label = _metadata_value_label(average_value)
+                trace_name = (
+                    f"{group_average_label} {value_label}"
+                    if group_average_label else value_label
+                )
+                rows = rows.sort_values("iteration")
+                group_color = _metadata_value_color(
+                    rows["color_value"].iloc[0],
+                    group_color_values,
+                )
+                color_value = _finite_float(rows["color_value"].iloc[0])
+                marker = {"size": 8}
+                if group_color_values and color_value is not None:
+                    marker.update({
+                        "color": [color_value] * len(rows),
+                        "coloraxis": "coloraxis",
+                    })
+                elif group_color:
+                    marker["color"] = group_color
+                fig.add_trace(go.Scatter(
+                    x=rows["iteration"],
+                    y=rows["value"],
+                    mode="lines+markers",
+                    name=trace_name,
+                    marker=marker,
+                    line={"color": group_color} if group_color else None,
+                    customdata=rows["iteration"],
+                    hovertemplate=(
+                        f"{trace_name}<br>Iteration %{{x}}<br>"
+                        f"Average {metric}: %{{y:.4g}}<extra></extra>"
+                    ),
+                ))
+            fig.update_layout(
+                title=(
+                    f"{metric} over BO iterations — average by "
+                    f"{group_average_label or 'group metadata'}"
+                ),
+                xaxis_title="BO iteration",
+                yaxis_title=metric,
+                height=340,
+                margin={"l": 65, "r": 20, "t": 50, "b": 90},
+                legend={
+                    "orientation": "h",
+                    "x": 0,
+                    "xanchor": "left",
+                    "y": -0.22,
+                    "yanchor": "top",
+                },
+                clickmode="event+select",
+            )
+            _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
+            _add_horizontal_reference_line(
+                fig,
+                reference_value,
+                reference_label or "Ground-truth optimum",
+            )
+            return fig
     if grouped and group_layout == "Average groups together":
         averaged = pd.DataFrame({
             "iteration": x[valid].astype(int),
@@ -466,6 +1234,11 @@ def _plot_trend(
             height=340,
             margin={"l": 65, "r": 20, "t": 50, "b": 55},
             clickmode="event+select",
+        )
+        _add_horizontal_reference_line(
+            fig,
+            reference_value,
+            reference_label or "Ground-truth optimum",
         )
         return fig
     if grouped and group_layout == "Plot groups separately":
@@ -499,13 +1272,29 @@ def _plot_trend(
                 group_id,
                 group_color_values,
             )
+            if group_color is None:
+                group_color = _categorical_group_color(group_id)
+            color_value = (
+                group_color_values.get(int(group_id))
+                if group_color_values and _finite_float(group_id) is not None
+                else None
+            )
+            color_value = _finite_float(color_value)
+            marker = {}
+            if group_color_values and color_value is not None:
+                marker.update({
+                    "color": [color_value] * len(rows),
+                    "coloraxis": "coloraxis",
+                })
+            elif group_color:
+                marker["color"] = group_color
             fig.add_trace(
                 go.Scatter(
                     x=iterations,
                     y=row_values,
                     mode="lines+markers",
                     name=group_name,
-                    marker={"color": group_color} if group_color else None,
+                    marker=marker or None,
                     line={"color": group_color} if group_color else None,
                     customdata=iterations,
                     hovertemplate=(
@@ -527,7 +1316,7 @@ def _plot_trend(
                 row=subplot_row + 1,
                 col=subplot_column + 1,
             )
-        _add_metadata_colorbar(
+        _apply_metadata_coloraxis(
             fig,
             group_color_values,
             group_color_label,
@@ -547,6 +1336,11 @@ def _plot_trend(
             showlegend=False,
             clickmode="event+select",
         )
+        _add_horizontal_reference_line(
+            fig,
+            reference_value,
+            reference_label or "Ground-truth optimum",
+        )
         return fig
     group_series = (
         frame.loc[valid].groupby("group_id", sort=True)
@@ -563,15 +1357,28 @@ def _plot_trend(
             else metric
         )
         group_color = _metadata_group_color(group_id, group_color_values)
+        if group_color is None and grouped:
+            group_color = _categorical_group_color(group_id)
+        color_value = (
+            group_color_values.get(int(group_id))
+            if group_color_values and grouped and _finite_float(group_id) is not None
+            else None
+        )
+        color_value = _finite_float(color_value)
+        marker = {"size": 8}
+        if group_color_values and color_value is not None:
+            marker.update({
+                "color": [color_value] * len(rows),
+                "coloraxis": "coloraxis",
+            })
+        elif group_color:
+            marker["color"] = group_color
         fig.add_trace(go.Scatter(
             x=iterations,
             y=row_values,
             mode="lines+markers",
             name=group_name,
-            marker={
-                "size": 8,
-                **({"color": group_color} if group_color else {}),
-            },
+            marker=marker,
             line={"color": group_color} if group_color else None,
             customdata=iterations,
             hovertemplate=(
@@ -580,7 +1387,7 @@ def _plot_trend(
             ),
         ))
     if grouped:
-        _add_metadata_colorbar(fig, group_color_values, group_color_label)
+        _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
     fig.update_layout(
         title=f"{metric} over BO iterations",
         xaxis_title="BO iteration",
@@ -590,7 +1397,7 @@ def _plot_trend(
             "l": 65,
             "r": 80 if group_color_values else 20,
             "t": 50,
-            "b": 115 if group_color_values else 55,
+            "b": 115 if grouped else 55,
         },
         legend=(
             {
@@ -600,13 +1407,573 @@ def _plot_trend(
                 "y": -0.22,
                 "yanchor": "top",
             }
-            if group_color_values else None
+            if grouped else None
         ),
         clickmode="event+select",
     )
-    return fig
+    if grouped and not group_color_values:
+        fig.update_traces(marker_showscale=False)
+    _add_horizontal_reference_line(
+        fig,
+        reference_value,
+        reference_label or "Ground-truth optimum",
+    )
+    return _apply_plotly_colorbar_height(fig)
 
 
+def _hyperparameter_response_columns(frame: pd.DataFrame) -> list[str]:
+    preferred = [
+        "exploration",
+        "initial_random_points",
+        "gp_falloff_value",
+        "candidate_pool_size",
+        "local_candidate_pool_size",
+        "gp_noise_level",
+    ]
+    columns = []
+    for column in preferred:
+        if (
+            column in frame.columns
+            and pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1
+        ):
+            columns.append(column)
+    for column in frame.columns:
+        if (
+            str(column).startswith("falloff_")
+            and column not in columns
+            and pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1
+        ):
+            columns.append(column)
+    return columns
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _hyperparameter_response_frame(
+    frame: pd.DataFrame,
+    metric: str,
+    summary_mode: str,
+    iteration: int | None = None,
+    q_target: float | None = None,
+    include_misses: bool = False,
+) -> pd.DataFrame:
+    if metric not in frame.columns or frame.empty:
+        return pd.DataFrame()
+    hyper_columns = _hyperparameter_response_columns(frame)
+    if len(hyper_columns) < 2:
+        return pd.DataFrame()
+    work = frame.copy()
+    work["_metric_value"] = pd.to_numeric(work[metric], errors="coerce")
+    work["_iteration_value"] = pd.to_numeric(
+        work.get("iteration", pd.Series(range(1, len(work) + 1), index=work.index)),
+        errors="coerce",
+    )
+    for column in hyper_columns:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    valid = work["_metric_value"].notna() & work["_iteration_value"].notna()
+    for column in hyper_columns:
+        valid &= work[column].notna()
+    work = work.loc[valid].copy()
+    if work.empty:
+        return pd.DataFrame()
+    group_columns = [
+        column for column in [
+            "group_id",
+            "group_name",
+            "run_label",
+            "replicate",
+            "repeat_index",
+            "seed",
+            *hyper_columns,
+        ]
+        if column in work.columns
+    ]
+    if not group_columns:
+        group_columns = hyper_columns
+    rows = []
+    for key, rows_for_run in work.groupby(group_columns, dropna=False, sort=False):
+        rows_for_run = rows_for_run.sort_values("_iteration_value")
+        if summary_mode == "Iterations to Q target":
+            if q_target is None or not np.isfinite(float(q_target)):
+                continue
+            metric_series = rows_for_run["_metric_value"]
+            if metric != "best_Q":
+                metric_series = metric_series.cummax()
+            reached = rows_for_run.loc[metric_series >= float(q_target)]
+            if reached.empty:
+                if not include_misses:
+                    continue
+                metric_value = float(rows_for_run["_iteration_value"].max()) + 1.0
+                source_iteration = np.nan
+            else:
+                source_iteration = int(reached["_iteration_value"].iloc[0])
+                metric_value = float(source_iteration)
+        elif summary_mode == "Final iteration":
+            metric_value = float(rows_for_run["_metric_value"].iloc[-1])
+            source_iteration = int(rows_for_run["_iteration_value"].iloc[-1])
+        elif summary_mode == "Best over iterations":
+            idx = rows_for_run["_metric_value"].idxmax()
+            metric_value = float(rows_for_run.loc[idx, "_metric_value"])
+            source_iteration = int(rows_for_run.loc[idx, "_iteration_value"])
+        elif summary_mode == "Mean over iterations":
+            metric_value = float(rows_for_run["_metric_value"].mean())
+            source_iteration = np.nan
+        else:
+            target_iteration = int(iteration or rows_for_run["_iteration_value"].max())
+            at_iteration = rows_for_run[
+                rows_for_run["_iteration_value"].astype(int) == target_iteration
+            ]
+            if at_iteration.empty:
+                continue
+            metric_value = float(at_iteration["_metric_value"].iloc[-1])
+            source_iteration = target_iteration
+        if isinstance(key, tuple):
+            row = dict(zip(group_columns, key))
+        else:
+            row = {group_columns[0]: key}
+        row.update({
+            "metric_value": metric_value,
+            "source_iteration": source_iteration,
+        })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _hyperparameter_response_grouped(
+    response: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str | None,
+    aggregate: str,
+) -> pd.DataFrame:
+    aggregate_func = {
+        "Mean": "mean",
+        "Median": "median",
+        "Maximum": "max",
+        "Minimum": "min",
+    }[aggregate]
+    group_axes = [x_axis, y_axis, *([z_axis] if z_axis else [])]
+    return (
+        response.groupby(group_axes, as_index=False, dropna=False)
+        .agg(
+            metric_value=("metric_value", aggregate_func),
+            repeats=("metric_value", "count"),
+            std=("metric_value", "std"),
+        )
+        .sort_values(group_axes)
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _hyperparameter_response_voxel_bounds(
+    grouped: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str,
+) -> tuple[dict[float, tuple[float, float]], dict[float, tuple[float, float]], dict[float, tuple[float, float]]]:
+    def bounds_for(values: list[float]) -> dict[float, tuple[float, float]]:
+        values = sorted(float(value) for value in values)
+        if len(values) == 1:
+            width = max(1e-6, abs(values[0]) * 0.08, 0.08)
+            return {values[0]: (values[0] - width / 2, values[0] + width / 2)}
+        midpoints = [
+            (left + right) / 2.0 for left, right in zip(values[:-1], values[1:])
+        ]
+        edges = [
+            values[0] - (midpoints[0] - values[0]),
+            *midpoints,
+            values[-1] + (values[-1] - midpoints[-1]),
+        ]
+        return {
+            value: (edges[index], edges[index + 1])
+            for index, value in enumerate(values)
+        }
+
+    x_bounds = bounds_for(grouped[x_axis].dropna().unique().tolist())
+    y_bounds = bounds_for(grouped[y_axis].dropna().unique().tolist())
+    z_bounds = bounds_for(grouped[z_axis].dropna().unique().tolist())
+    return x_bounds, y_bounds, z_bounds
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _hyperparameter_response_voxel_geometry(
+    grouped: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str,
+) -> tuple[
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[int],
+    list[int],
+    list[int],
+]:
+    x_bounds, y_bounds, z_bounds = _hyperparameter_response_voxel_bounds(
+        grouped,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        z_axis=z_axis,
+    )
+    vertices_x: list[float] = []
+    vertices_y: list[float] = []
+    vertices_z: list[float] = []
+    intensities: list[float] = []
+    i_faces: list[int] = []
+    j_faces: list[int] = []
+    k_faces: list[int] = []
+    cube_faces = [
+        (0, 1, 2), (0, 2, 3),
+        (4, 6, 5), (4, 7, 6),
+        (0, 4, 5), (0, 5, 1),
+        (3, 2, 6), (3, 6, 7),
+        (0, 3, 7), (0, 7, 4),
+        (1, 5, 6), (1, 6, 2),
+    ]
+    for _row_index, row in grouped.iterrows():
+        x0, x1 = x_bounds[float(row[x_axis])]
+        y0, y1 = y_bounds[float(row[y_axis])]
+        z0, z1 = z_bounds[float(row[z_axis])]
+        base = len(vertices_x)
+        cube_vertices = [
+            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        ]
+        for vx, vy, vz in cube_vertices:
+            vertices_x.append(vx)
+            vertices_y.append(vy)
+            vertices_z.append(vz)
+            intensities.append(float(row["metric_value"]))
+        for face in cube_faces:
+            i_faces.append(base + face[0])
+            j_faces.append(base + face[1])
+            k_faces.append(base + face[2])
+    return vertices_x, vertices_y, vertices_z, intensities, i_faces, j_faces, k_faces
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _hyperparameter_response_voxel_interior_points(
+    grouped: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str,
+    point_count: int = 27,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    x_bounds, y_bounds, z_bounds = _hyperparameter_response_voxel_bounds(
+        grouped,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        z_axis=z_axis,
+    )
+    if int(point_count) == 1:
+        fraction_points = [(0.5, 0.5, 0.5)]
+    elif int(point_count) == 4:
+        fraction_points = [
+            (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+            (1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0),
+            (2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0),
+            (2.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0),
+        ]
+    else:
+        samples_per_axis = 4 if int(point_count) == 64 else 3
+        fractions = np.linspace(
+            1.0 / (samples_per_axis + 1),
+            samples_per_axis / (samples_per_axis + 1),
+            samples_per_axis,
+        )
+        fraction_points = [
+            (float(xf), float(yf), float(zf))
+            for xf in fractions
+            for yf in fractions
+            for zf in fractions
+        ]
+    interior_x: list[float] = []
+    interior_y: list[float] = []
+    interior_z: list[float] = []
+    interior_values: list[float] = []
+    for _row_index, row in grouped.iterrows():
+        x0, x1 = x_bounds[float(row[x_axis])]
+        y0, y1 = y_bounds[float(row[y_axis])]
+        z0, z1 = z_bounds[float(row[z_axis])]
+        value = float(row["metric_value"])
+        for x_fraction, y_fraction, z_fraction in fraction_points:
+            interior_x.append(float(x0 + x_fraction * (x1 - x0)))
+            interior_y.append(float(y0 + y_fraction * (y1 - y0)))
+            interior_z.append(float(z0 + z_fraction * (z1 - z0)))
+            interior_values.append(value)
+    return interior_x, interior_y, interior_z, interior_values
+
+
+def _add_hyperparameter_slice_plane(
+    fig: go.Figure,
+    grouped: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str,
+    slice_axis: str | None,
+    slice_value: float | None,
+) -> None:
+    if slice_axis not in {x_axis, y_axis, z_axis} or slice_value is None:
+        return
+
+    x_bounds, y_bounds, z_bounds = _hyperparameter_response_voxel_bounds(
+        grouped,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        z_axis=z_axis,
+    )
+    axis_ranges = {
+        x_axis: (
+            min(edge[0] for edge in x_bounds.values()),
+            max(edge[1] for edge in x_bounds.values()),
+        ),
+        y_axis: (
+            min(edge[0] for edge in y_bounds.values()),
+            max(edge[1] for edge in y_bounds.values()),
+        ),
+        z_axis: (
+            min(edge[0] for edge in z_bounds.values()),
+            max(edge[1] for edge in z_bounds.values()),
+        ),
+    }
+
+    x0, x1 = axis_ranges[x_axis]
+    y0, y1 = axis_ranges[y_axis]
+    z0, z1 = axis_ranges[z_axis]
+    value = float(slice_value)
+    if slice_axis == x_axis:
+        x_grid = [[value, value], [value, value]]
+        y_grid = [[y0, y1], [y0, y1]]
+        z_grid = [[z0, z0], [z1, z1]]
+    elif slice_axis == y_axis:
+        x_grid = [[x0, x1], [x0, x1]]
+        y_grid = [[value, value], [value, value]]
+        z_grid = [[z0, z0], [z1, z1]]
+    else:
+        x_grid = [[x0, x1], [x0, x1]]
+        y_grid = [[y0, y0], [y1, y1]]
+        z_grid = [[value, value], [value, value]]
+
+    fig.add_trace(go.Surface(
+        x=x_grid,
+        y=y_grid,
+        z=z_grid,
+        surfacecolor=[[1, 1], [1, 1]],
+        colorscale=[[0, "rgba(220,0,0,1)"], [1, "rgba(220,0,0,1)"]],
+        opacity=0.34,
+        showscale=False,
+        name=f"Selected slice: {slice_axis}={value:g}",
+        hovertemplate=(
+            f"Selected slice<br>{slice_axis}: {value:g}<extra></extra>"
+        ),
+    ))
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _plot_hyperparameter_response(
+    response: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str | None = None,
+    metric_label: str,
+    aggregate: str,
+    voxel_face_opacity: float = 0.72,
+    voxel_internal_opacity: float = 0.0,
+    voxel_internal_point_size: int = 3,
+    voxel_internal_point_count: int = 27,
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
+) -> go.Figure:
+    if response.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No hyperparameter response values are available.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=360)
+        return fig
+    grouped = _hyperparameter_response_grouped(
+        response,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        z_axis=z_axis,
+        aggregate=aggregate,
+    )
+    if z_axis:
+        (
+            vertices_x,
+            vertices_y,
+            vertices_z,
+            intensities,
+            i_faces,
+            j_faces,
+            k_faces,
+        ) = _hyperparameter_response_voxel_geometry(
+            grouped,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            z_axis=z_axis,
+        )
+        fig = go.Figure()
+        if float(voxel_internal_opacity) > 0:
+            interior_x, interior_y, interior_z, interior_values = (
+                _hyperparameter_response_voxel_interior_points(
+                    grouped,
+                    x_axis=x_axis,
+                    y_axis=y_axis,
+                    z_axis=z_axis,
+                    point_count=voxel_internal_point_count,
+                )
+            )
+            fig.add_trace(go.Scatter3d(
+                x=interior_x,
+                y=interior_y,
+                z=interior_z,
+                mode="markers",
+                marker={
+                    "size": int(voxel_internal_point_size),
+                    "color": interior_values,
+                    "colorscale": "Viridis",
+                    "opacity": float(voxel_internal_opacity),
+                    "showscale": False,
+                },
+                name="Response voxel interior",
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+        if float(voxel_face_opacity) > 0:
+            fig.add_trace(go.Mesh3d(
+                x=vertices_x,
+                y=vertices_y,
+                z=vertices_z,
+                i=i_faces,
+                j=j_faces,
+                k=k_faces,
+                intensity=intensities,
+                colorscale="Viridis",
+                showscale=True,
+                colorbar={"title": metric_label},
+                opacity=float(voxel_face_opacity),
+                flatshading=True,
+                name="Response voxels",
+                hoverinfo="skip",
+            ))
+        fig.add_trace(go.Scatter3d(
+            x=grouped[x_axis],
+            y=grouped[y_axis],
+            z=grouped[z_axis],
+            mode="markers",
+            marker={
+                "size": 6,
+                "color": "rgba(0,0,0,0.01)",
+                "opacity": 0.01,
+                "showscale": False,
+            },
+            name="Voxel hover points",
+            showlegend=False,
+            customdata=grouped[["metric_value", "repeats", "std"]],
+            hovertemplate=(
+                f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>{z_axis}: %{{z}}<br>"
+                f"{aggregate} {metric_label}: %{{customdata[0]:.4g}}<br>"
+                "Runs: %{customdata[1]:.0f}<br>"
+                "Std: %{customdata[2]:.4g}<br>"
+                "Click to set highlighted slice<extra></extra>"
+            ),
+        ))
+        _add_hyperparameter_slice_plane(
+            fig,
+            grouped,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            z_axis=z_axis,
+            slice_axis=slice_axis,
+            slice_value=slice_value,
+        )
+        fig.update_layout(
+            title=f"{aggregate} {metric_label} by hyperparameters",
+            scene={
+                "xaxis_title": x_axis,
+                "yaxis_title": y_axis,
+                "zaxis_title": z_axis,
+            },
+            height=560,
+            margin={"l": 0, "r": 0, "t": 55, "b": 20},
+        )
+        return _apply_plotly_colorbar_height(fig)
+    x_values = sorted(grouped[x_axis].dropna().unique())
+    y_values = sorted(grouped[y_axis].dropna().unique())
+    if len(x_values) >= 2 and len(y_values) >= 2:
+        value_grid = (
+            grouped.pivot(index=y_axis, columns=x_axis, values="metric_value")
+            .reindex(index=y_values, columns=x_values)
+        )
+        repeats_grid = (
+            grouped.pivot(index=y_axis, columns=x_axis, values="repeats")
+            .reindex(index=y_values, columns=x_values)
+        )
+        fig = go.Figure(go.Heatmap(
+            x=x_values,
+            y=y_values,
+            z=value_grid.to_numpy(dtype=float),
+            colorscale="Viridis",
+            colorbar={"title": metric_label},
+            customdata=repeats_grid.to_numpy(dtype=float),
+            hovertemplate=(
+                f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>"
+                f"{aggregate} {metric_label}: %{{z:.4g}}<br>"
+                "Runs: %{customdata:.0f}<extra></extra>"
+            ),
+        ))
+        fig.update_layout(
+            title=f"{aggregate} {metric_label} by hyperparameters",
+            xaxis_title=x_axis,
+            yaxis_title=y_axis,
+            height=460,
+            margin={"l": 70, "r": 40, "t": 55, "b": 65},
+        )
+        return _apply_plotly_colorbar_height(fig)
+    fig = go.Figure(go.Scatter(
+        x=grouped[x_axis],
+        y=grouped[y_axis],
+        mode="markers",
+        marker={
+            "color": grouped["metric_value"],
+            "colorscale": "Viridis",
+            "showscale": True,
+            "colorbar": {"title": metric_label},
+            "size": np.maximum(8, np.minimum(26, 6 + grouped["repeats"] * 2)),
+            "line": {"color": "white", "width": 0.7},
+        },
+        customdata=grouped[["metric_value", "repeats", "std"]],
+        hovertemplate=(
+            f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>"
+            f"{aggregate} {metric_label}: %{{customdata[0]:.4g}}<br>"
+            "Runs: %{customdata[1]:.0f}<br>"
+            "Std: %{customdata[2]:.4g}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title=f"{aggregate} {metric_label} by hyperparameters",
+        xaxis_title=x_axis,
+        yaxis_title=y_axis,
+        height=420,
+        margin={"l": 70, "r": 40, "t": 55, "b": 65},
+    )
+    return _apply_plotly_colorbar_height(fig)
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
 def _plot_channel_trend(
     frame: pd.DataFrame,
     metric: str,
@@ -616,6 +1983,8 @@ def _plot_channel_trend(
     group_layout: str = "Plot groups overlaid",
     group_color_values: dict[int, float] | None = None,
     group_color_label: str | None = None,
+    group_average_values: dict[int, float] | None = None,
+    group_average_label: str | None = None,
 ):
     iterations = pd.to_numeric(
         frame.get("iteration", pd.Series(range(1, len(frame) + 1))),
@@ -664,6 +2033,43 @@ def _plot_channel_trend(
     )["value"].mean()
     multiple_groups = data["group_id"].nunique(dropna=False) > 1
 
+    if multiple_groups and group_average_values:
+        data["average_value"] = [
+            group_average_values.get(int(group_id))
+            if _finite_float(group_id) is not None else None
+            for group_id in data["group_id"]
+        ]
+        data["color_value"] = [
+            group_color_values.get(int(group_id))
+            if group_color_values and _finite_float(group_id) is not None else None
+            for group_id in data["group_id"]
+        ]
+        data = data.dropna(subset=["average_value"])
+        if data.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No group metadata values are available for this average.",
+                x=.5, y=.5, xref="paper", yref="paper", showarrow=False,
+            )
+            fig.update_layout(height=340)
+            return fig
+        data = data.groupby(
+            ["average_value", "channel", "iteration"],
+            as_index=False,
+        ).agg({"value": "mean", "color_value": "mean"})
+        data["group_id"] = [
+            f"average::{_metadata_value_label(value)}"
+            for value in data["average_value"]
+        ]
+        data["group_name"] = [
+            (
+                f"{group_average_label} {_metadata_value_label(value)}"
+                if group_average_label else _metadata_value_label(value)
+            )
+            for value in data["average_value"]
+        ]
+        multiple_groups = data["group_id"].nunique(dropna=False) > 1
+
     if multiple_groups and group_layout == "Average groups together":
         data = data.groupby(
             ["channel", "iteration"],
@@ -673,11 +2079,14 @@ def _plot_channel_trend(
         data["group_name"] = "Group average"
 
     if layout == "Average selected channels":
+        value_columns = {"value": "mean"}
+        if "color_value" in data.columns:
+            value_columns["color_value"] = "mean"
         data = data.groupby(
             ["group_id", "group_name", "iteration"],
             as_index=False,
             dropna=False,
-        )["value"].mean()
+        ).agg(value_columns)
         data["channel"] = "average"
 
     separate_groups = (
@@ -762,12 +2171,34 @@ def _plot_channel_trend(
                 rows["group_id"].iloc[0],
                 group_color_values,
             )
+            if group_color is None and "color_value" in rows.columns:
+                group_color = _metadata_value_color(
+                    rows["color_value"].iloc[0],
+                    group_color_values,
+                )
+            if group_color is None and multiple_groups:
+                group_color = _categorical_group_color(rows["group_id"].iloc[0])
+            color_value = None
+            if "color_value" in rows.columns:
+                color_value = _finite_float(rows["color_value"].iloc[0])
+            elif group_color_values and _finite_float(rows["group_id"].iloc[0]) is not None:
+                color_value = _finite_float(
+                    group_color_values.get(int(rows["group_id"].iloc[0]))
+                )
+            marker = {}
+            if group_color_values and color_value is not None:
+                marker.update({
+                    "color": [color_value] * len(rows),
+                    "coloraxis": "coloraxis",
+                })
+            elif group_color:
+                marker["color"] = group_color
             trace = go.Scatter(
                 x=rows["iteration"],
                 y=rows["value"],
                 mode="lines+markers",
                 name=trace_name,
-                marker={"color": group_color} if group_color else None,
+                marker=marker or None,
                 line={"color": group_color} if group_color else None,
                 customdata=rows["iteration"],
                 hovertemplate=(
@@ -786,7 +2217,7 @@ def _plot_channel_trend(
                 fig.add_trace(trace)
 
     if multiple_groups:
-        _add_metadata_colorbar(fig, group_color_values, group_color_label)
+        _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
 
     if faceted:
         for facet_index in range(len(facets)):
@@ -809,7 +2240,9 @@ def _plot_channel_trend(
         title += ": selected channels overlaid"
     else:
         title += " by channel"
-    if multiple_groups and group_layout == "Average groups together":
+    if group_average_values:
+        title += f" — average by {group_average_label or 'group metadata'}"
+    elif multiple_groups and group_layout == "Average groups together":
         title += " — average across groups"
     elif separate_groups:
         title += " — separate groups"
@@ -822,7 +2255,7 @@ def _plot_channel_trend(
             "l": 65,
             "r": 80 if group_color_values else 20,
             "t": 65,
-            "b": 115 if group_color_values else 55,
+            "b": 115 if multiple_groups else 55,
         },
         legend=(
             {
@@ -832,11 +2265,75 @@ def _plot_channel_trend(
                 "y": -0.22,
                 "yanchor": "top",
             }
-            if group_color_values else None
+            if multiple_groups else None
         ),
         clickmode="event+select",
     )
-    return fig
+    if multiple_groups and not group_color_values:
+        fig.update_traces(marker_showscale=False)
+    return _apply_plotly_colorbar_height(fig)
+
+
+def _figure_y_bounds(fig: go.Figure) -> tuple[float, float] | None:
+    values = []
+    for trace in fig.data:
+        y_values = getattr(trace, "y", None)
+        if y_values is None:
+            continue
+        numeric = pd.to_numeric(pd.Series(y_values), errors="coerce")
+        values.extend(numeric[np.isfinite(numeric)].tolist())
+    if not values:
+        return None
+    return float(min(values)), float(max(values))
+
+
+def _apply_y_axis_range(fig: go.Figure, y_min: float, y_max: float) -> None:
+    fig.update_yaxes(range=[y_min, y_max], autorange=False)
+
+
+def _manual_y_axis_range_control(
+    label: str,
+    key_prefix: str,
+    figures: list[go.Figure],
+) -> tuple[float, float] | None:
+    bounds = [
+        figure_bounds
+        for figure in figures
+        if (figure_bounds := _figure_y_bounds(figure)) is not None
+    ]
+    if not bounds:
+        return None
+    default_y_min = min(bound[0] for bound in bounds)
+    default_y_max = max(bound[1] for bound in bounds)
+    manual_y_limits = st.checkbox(
+        f"Set {label} y-axis limits manually",
+        key=f"{key_prefix}_manual_y_limits",
+    )
+    if not manual_y_limits:
+        return None
+    if default_y_min == default_y_max:
+        default_y_min -= 0.5
+        default_y_max += 0.5
+    y_limit_columns = st.columns(2)
+    manual_y_min = float(y_limit_columns[0].number_input(
+        f"{label} y-axis minimum",
+        value=default_y_min,
+        key=f"{key_prefix}_y_min",
+        format="%.6g",
+    ))
+    manual_y_max = float(y_limit_columns[1].number_input(
+        f"{label} y-axis maximum",
+        value=default_y_max,
+        key=f"{key_prefix}_y_max",
+        format="%.6g",
+    ))
+    if manual_y_min < manual_y_max:
+        return manual_y_min, manual_y_max
+    st.warning(
+        f"{label} y-axis minimum must be less than the maximum; "
+        "autoscale is being used."
+    )
+    return None
 
 
 def _paired_trend_values(observations: list[dict], metric_label: str) -> dict[str, dict[str, list]]:
@@ -878,6 +2375,7 @@ def _paired_trend_values(observations: list[dict], metric_label: str) -> dict[st
     return result
 
 
+@st.cache_data(show_spinner=False, max_entries=128)
 def _plot_paired_phase_trend(
     series_by_channel: dict[str, dict[str, list]],
     metric_label: str,
@@ -930,7 +2428,7 @@ def _plot_paired_phase_trend(
             height=max(340, 270 * rows),
             clickmode="event+select",
         )
-        return fig
+        return _strip_categorical_plot_colorbars(fig)
 
     fig = go.Figure()
     if layout == "Average selected channels":
@@ -992,7 +2490,7 @@ def _plot_paired_phase_trend(
         height=360,
         clickmode="event+select",
     )
-    return fig
+    return _strip_categorical_plot_colorbars(fig)
 
 
 def _chronological_points(
@@ -1079,6 +2577,7 @@ def _chronological_points(
     return pd.DataFrame(rows), transitions
 
 
+@st.cache_data(show_spinner=False, max_entries=128)
 def _plot_chronological(
     points: pd.DataFrame,
     transitions: list[tuple[float, str]],
@@ -1090,6 +2589,21 @@ def _plot_chronological(
     if layout == "Separate plots":
         columns = 2 if len(channels) > 1 else 1
         rows = max(1, (len(channels) + columns - 1) // columns)
+        transition_line_y = pd.to_numeric(points["value"], errors="coerce")
+        transition_line_y = transition_line_y[np.isfinite(transition_line_y)]
+        if transition_line_y.empty:
+            transition_y_min, transition_y_max = 0.0, 1.0
+        else:
+            transition_y_min = float(transition_line_y.min())
+            transition_y_max = float(transition_line_y.max())
+            if transition_y_min == transition_y_max:
+                transition_y_min -= 0.5
+                transition_y_max += 0.5
+        transition_x = []
+        transition_y = []
+        for x_position, _label in transitions:
+            transition_x.extend([x_position, x_position, None])
+            transition_y.extend([transition_y_min, transition_y_max, None])
         fig = make_subplots(
             rows=rows,
             cols=columns,
@@ -1104,6 +2618,23 @@ def _plot_chronological(
             channel_points = points[
                 points["channel"].astype(str) == channel
             ].sort_values("position")
+            if transition_x:
+                fig.add_trace(
+                    go.Scatter(
+                        x=transition_x,
+                        y=transition_y,
+                        mode="lines",
+                        line={
+                            "color": "rgba(90,107,132,0.45)",
+                            "dash": "dash",
+                            "width": 1.2,
+                        },
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ),
+                    row=row,
+                    col=column,
+                )
             fig.add_trace(
                 go.Scatter(
                     x=channel_points["position"],
@@ -1139,15 +2670,6 @@ def _plot_chronological(
                     row=row,
                     col=column,
                 )
-            for x_position, _label in transitions:
-                fig.add_vline(
-                    x=x_position,
-                    line_dash="dash",
-                    line_color="#5a6b84",
-                    line_width=1.2,
-                    row=row,
-                    col=column,
-                )
             fig.update_xaxes(
                 title_text="Chronological order",
                 row=row,
@@ -1164,7 +2686,7 @@ def _plot_chronological(
             height=max(400, 280 * rows),
             margin={"l": 65, "r": 30, "t": 60, "b": 55},
         )
-        return fig
+        return _strip_categorical_plot_colorbars(fig)
 
     fig = go.Figure()
     generic_legend = len(channels) > 4
@@ -1227,7 +2749,7 @@ def _plot_chronological(
         height=400,
         margin={"l": 65, "r": 30, "t": 60, "b": 55},
     )
-    return fig
+    return _strip_categorical_plot_colorbars(fig)
 
 
 def _real_data_channels(observations: list[dict]) -> list[str]:
@@ -1254,6 +2776,77 @@ def _real_metric_points(
     rows = []
     for observation in observations:
         params = observation.get("params") or {}
+        if source == "observation":
+            per_iteration = []
+            quality = observation.get("quality") or {}
+            q_channels = quality.get("Q_channels") or {}
+            components = quality.get("channel_components") or {}
+            for channel in selected_channels:
+                component = components.get(str(channel), {}) or components.get(channel, {}) or {}
+                value = (
+                    q_channels.get(str(channel))
+                    if isinstance(q_channels, dict)
+                    else None
+                )
+                if value is None and isinstance(q_channels, dict):
+                    value = q_channels.get(channel)
+                if value is None:
+                    value = component.get("Q_channel")
+                if value is None:
+                    value = component.get("paired_Q_channel")
+                if value is None:
+                    value = component.get("paired_Q")
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                row = {
+                    "iteration": int(observation.get("iteration", 0)),
+                    "channel": str(channel),
+                    "group_id": int(observation.get("group_id", 1)),
+                    "group_name": str(
+                        observation.get("group_name")
+                        or f"Group {observation.get('group_id', 1)}"
+                    ),
+                    "value": numeric_value,
+                }
+                row.update({
+                    name: float(params[name])
+                    for name in PARAMETERS
+                    if params.get(name) is not None
+                })
+                per_iteration.append(row)
+            if average_channels and per_iteration:
+                averaged = dict(per_iteration[0])
+                averaged["channel"] = "Average"
+                averaged["value"] = float(
+                    np.mean([row["value"] for row in per_iteration])
+                )
+                rows.append(averaged)
+            elif per_iteration:
+                rows.extend(per_iteration)
+            else:
+                try:
+                    numeric_value = float(observation.get(primary_key))
+                except (TypeError, ValueError):
+                    continue
+                row = {
+                    "iteration": int(observation.get("iteration", 0)),
+                    "channel": "Run",
+                    "group_id": int(observation.get("group_id", 1)),
+                    "group_name": str(
+                        observation.get("group_name")
+                        or f"Group {observation.get('group_id', 1)}"
+                    ),
+                    "value": numeric_value,
+                }
+                row.update({
+                    name: float(params[name])
+                    for name in PARAMETERS
+                    if params.get(name) is not None
+                })
+                rows.append(row)
+            continue
         per_iteration = []
         phase_metrics = (
             observation.get("channel_metrics") or {}
@@ -1496,6 +3089,7 @@ def _add_plotly_iteration_path(
         fig.add_trace(scatter_type(**invisible_kwargs))
 
 
+@st.cache_data(show_spinner=False, max_entries=64)
 def _plot_real_data_landscape(
     points: pd.DataFrame,
     metric_label: str,
@@ -1506,6 +3100,7 @@ def _plot_real_data_landscape(
     z_name: str | None,
     tensor_height: int = 480,
     dot_size: int = 6,
+    dot_opacity: float = 0.45,
     log_frequency: bool = False,
     color_by: str = "Measured value",
     group_color_values: dict[int, float] | None = None,
@@ -1515,6 +3110,7 @@ def _plot_real_data_landscape(
     count_bin_sizes: dict[str, float] | None = None,
     axis_ranges: dict[str, tuple[float, float]] | None = None,
     value_range: tuple[float, float] | None = None,
+    title_note: str | None = None,
 ):
     def series_label(value: Any) -> str:
         text = str(value)
@@ -1561,6 +3157,14 @@ def _plot_real_data_landscape(
             f"{group_name} · {channel_label}"
             if multiple_groups else channel_label
         )
+
+    def metadata_color_value(group_id: Any) -> float | None:
+        if not group_color_values:
+            return None
+        numeric_group_id = _finite_float(group_id)
+        if numeric_group_id is None:
+            return None
+        return _finite_float(group_color_values.get(int(numeric_group_id)))
 
     if metric_label == "Count" and view == "3D tensor":
         fig = go.Figure()
@@ -1627,7 +3231,7 @@ def _plot_real_data_landscape(
                 cmax=value_max,
                 showscale=trace_index == 0,
                 colorbar={"title": "Count"},
-                opacity=.82,
+                opacity=dot_opacity,
                 flatshading=True,
                 name=trace_label(group_name, channel),
                 text=hover_text,
@@ -1738,7 +3342,7 @@ def _plot_real_data_landscape(
         if value_min == value_max:
             value_max = value_min + 1.0
         for group_id, group_name, channel, group, series_color in colored_series():
-            marker = {"size": dot_size}
+            marker = {"size": dot_size, "opacity": dot_opacity}
             if color_by == "Measured value":
                 marker.update({
                     "color": group["value"],
@@ -1842,10 +3446,19 @@ def _plot_real_data_landscape(
                 ),
             ))
         else:
-            for _group_id, group_name, channel, group, series_color in colored_series():
+            for group_id, group_name, channel, group, series_color in colored_series():
+                marker = {"size": 8}
+                color_value = metadata_color_value(group_id)
+                if group_color_values and color_value is not None:
+                    marker.update({
+                        "color": [color_value] * len(group),
+                        "coloraxis": "coloraxis",
+                    })
+                else:
+                    marker["color"] = series_color
                 fig.add_trace(go.Scatter(
                     x=group[x_name], y=group[y_name], mode="markers",
-                    marker={"size": 8, "color": series_color},
+                    marker=marker,
                     name=trace_label(group_name, channel),
                     customdata=group[["iteration", "channel", "value"]],
                     hovertemplate=(
@@ -1854,7 +3467,7 @@ def _plot_real_data_landscape(
                     ),
                 ))
             if group_color_values:
-                _add_metadata_colorbar(fig, group_color_values, group_color_label)
+                _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
         if (
             show_iteration_path
             and iteration_path is not None
@@ -1884,27 +3497,34 @@ def _plot_real_data_landscape(
         )
     else:
         fig = go.Figure()
-        for _group_id, group_name, channel, group, series_color in colored_series():
+        for group_id, group_name, channel, group, series_color in colored_series():
             ordered = group.sort_values(x_name)
-            line_marker = (
-                {"color": series_color}
-                if color_by != "Measured value" else {}
-            )
+            marker = {"size": dot_size, "opacity": dot_opacity}
+            line = None
+            if color_by != "Measured value":
+                color_value = metadata_color_value(group_id)
+                if series_color:
+                    marker["color"] = series_color
+                elif group_color_values and color_value is not None:
+                    marker["color"] = _metadata_group_color(
+                        group_id,
+                        group_color_values,
+                    )
+                if series_color:
+                    line = {"color": series_color}
             fig.add_trace(go.Scatter(
                 x=ordered[x_name],
                 y=ordered["value"],
                 mode="lines+markers",
                 name=trace_label(group_name, channel),
-                marker={"size": dot_size, **line_marker},
-                line=line_marker or None,
+                marker=marker,
+                line=line,
                 customdata=ordered[["iteration", "channel"]],
                 hovertemplate=(
                     f"{x_name}: %{{x:.4g}}<br>{metric_label}: %{{y:.4g}}<br>"
                     "Iteration %{customdata[0]}<br>Channel %{customdata[1]}<extra></extra>"
                 ),
             ))
-        if group_color_values:
-            _add_metadata_colorbar(fig, group_color_values, group_color_label)
         if show_iteration_path and metric_label != "Count":
             path_colorbar_added = False
             for (
@@ -1931,8 +3551,11 @@ def _plot_real_data_landscape(
             xaxis_type="log" if log_frequency and x_name == "frequency" else "linear",
             height=360,
         )
+    figure_title = f"Measured {phase} {metric_label} | {view}"
+    if title_note:
+        figure_title = f"{figure_title}<br>{title_note}"
     fig.update_layout(
-        title=f"Measured {phase} {metric_label} | {view}",
+        title=figure_title,
         margin={
             "l": 65,
             "r": (
@@ -1980,19 +3603,21 @@ def _plot_real_data_landscape(
             )
         else:
             fig.update_xaxes(range=display_range(x_name))
-            if view == "2D map":
+            if view in ("2D map", "3D tensor"):
                 fig.update_yaxes(range=display_range(y_name))
             elif value_range is not None:
                 fig.update_yaxes(range=list(map(float, value_range)))
     return fig
 
 
+@st.cache_data(show_spinner=False, max_entries=64)
 def _plot_real_data_both_1d(
     buffer_points: pd.DataFrame,
     target_points: pd.DataFrame,
     metric_label: str,
     x_name: str,
     dot_size: int = 6,
+    dot_opacity: float = 0.45,
     log_frequency: bool = False,
     color_by: str = "Measured value",
     group_color_values: dict[int, float] | None = None,
@@ -2052,7 +3677,11 @@ def _plot_real_data_both_1d(
                     "color": series_color,
                     "dash": "dash" if phase == "buffer" else "solid",
                 },
-                marker={"color": series_color, "size": dot_size},
+                marker={
+                    "color": series_color,
+                    "size": dot_size,
+                    "opacity": dot_opacity,
+                },
                 customdata=ordered[["iteration", "channel"]],
                 hovertemplate=(
                     f"{phase.title()}<br>{x_name}: %{{x:.4g}}<br>"
@@ -2060,8 +3689,6 @@ def _plot_real_data_both_1d(
                     "Iteration %{customdata[0]}<br>Channel %{customdata[1]}<extra></extra>"
                 ),
             ))
-    if group_color_values:
-        _add_metadata_colorbar(fig, group_color_values, group_color_label)
     if show_iteration_path:
         path_colorbar_added = False
         for _phase, points in (("buffer", buffer_points), ("target", target_points)):
@@ -2136,6 +3763,43 @@ def _clicked_iteration(event: Any) -> int | None:
         return None
 
 
+def _selected_3d_coordinate(event: Any, selected_axis: str, axes: tuple[str, str, str]) -> float | None:
+    """Extract one displayed coordinate from a Streamlit Plotly 3D point selection."""
+    try:
+        points = event.selection.points
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if not points or selected_axis not in axes:
+        return None
+    point = points[-1]
+    plotly_axis = ("x", "y", "z")[axes.index(selected_axis)]
+    try:
+        value = float(point.get(plotly_axis))
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _clicked_3d_coordinate(
+    clicked_points: list[dict] | None,
+    selected_axis: str,
+    axes: tuple[str, str, str],
+) -> float | None:
+    """Extract one displayed coordinate from streamlit-plotly-events click data."""
+    if not clicked_points or selected_axis not in axes:
+        return None
+    point = clicked_points[-1]
+    plotly_axis = ("x", "y", "z")[axes.index(selected_axis)]
+    raw = point.get(plotly_axis)
+    if raw is None and isinstance(point.get("point"), dict):
+        raw = point["point"].get(plotly_axis)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
 def _pdf_text_page(pdf: PdfPages, title: str, lines: list[str]) -> None:
     fig = plt.figure(figsize=(8.5, 11))
     fig.text(.08, .94, title, fontsize=20, weight="bold", va="top")
@@ -2204,7 +3868,7 @@ def _interpolated_2d_grid(
     y_name: str,
     resolution: int = 120,
 ) -> tuple[pd.DataFrame, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
-    """Interpolate measured points and fill the complete rectangular grid."""
+    """Build an RBF-smoothed measured map on a complete rectangular grid."""
     columns = [x_name, y_name, "value"]
     metadata = [name for name in ("iteration", "channel") if name in points.columns]
     valid = points[columns + metadata].copy()
@@ -2225,26 +3889,12 @@ def _interpolated_2d_grid(
     try:
         coordinates = unique[[x_name, y_name]].to_numpy()
         values = unique["value"].to_numpy()
-        grid_values = griddata(
+        query_coordinates = np.column_stack([mesh_x.ravel(), mesh_y.ravel()])
+        grid_values = _rbf_interpolation_values(
             coordinates,
             values,
-            (mesh_x, mesh_y),
-            method="linear",
-            rescale=True,
-        )
-        if not np.isfinite(grid_values).all():
-            nearest_values = griddata(
-                coordinates,
-                values,
-                (mesh_x, mesh_y),
-                method="nearest",
-                rescale=True,
-            )
-            grid_values = np.where(
-                np.isfinite(grid_values),
-                grid_values,
-                nearest_values,
-            )
+            query_coordinates,
+        ).reshape(mesh_x.shape)
     except Exception:
         try:
             grid_values = griddata(
@@ -2259,6 +3909,3272 @@ def _interpolated_2d_grid(
     if not np.isfinite(grid_values).any():
         return valid, None
     return valid, (grid_x, grid_y, grid_values)
+
+
+def _interpolation_axis_values(
+    values: pd.Series,
+    name: str,
+    resolution: int,
+    log_frequency: bool,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return None
+    if log_frequency and name == "frequency":
+        numeric = numeric[numeric > 0]
+        if numeric.empty:
+            return None
+        transformed = np.log10(numeric.to_numpy(dtype=float))
+        grid_transformed = np.linspace(
+            float(np.min(transformed)),
+            float(np.max(transformed)),
+            resolution,
+        )
+        return grid_transformed, np.power(10.0, grid_transformed)
+    grid_values = np.linspace(
+        float(numeric.min()),
+        float(numeric.max()),
+        resolution,
+    )
+    return grid_values, grid_values
+
+
+def _transform_interpolation_values(
+    values: pd.Series,
+    name: str,
+    log_frequency: bool,
+) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if log_frequency and name == "frequency":
+        numeric = numeric.where(numeric > 0)
+        return np.log10(numeric)
+    return numeric
+
+
+def _normalized_interpolation_coordinates(
+    coordinates: np.ndarray,
+    query_coordinates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower = np.nanmin(coordinates, axis=0)
+    upper = np.nanmax(coordinates, axis=0)
+    span = np.where(np.abs(upper - lower) < 1e-12, 1.0, upper - lower)
+    return (coordinates - lower) / span, (query_coordinates - lower) / span
+
+
+def _rbf_interpolation_values(
+    coordinates: np.ndarray,
+    values: np.ndarray,
+    query_coordinates: np.ndarray,
+) -> np.ndarray:
+    normalized_coordinates, normalized_query = _normalized_interpolation_coordinates(
+        coordinates,
+        query_coordinates,
+    )
+    try:
+        rbf = Rbf(
+            *[normalized_coordinates[:, index] for index in range(coordinates.shape[1])],
+            values,
+            function="multiquadric",
+            smooth=max(float(np.nanstd(values)) * 0.02, 1e-9),
+        )
+        return np.asarray(
+            rbf(*[normalized_query[:, index] for index in range(coordinates.shape[1])]),
+            dtype=float,
+        )
+    except Exception:
+        rbf = Rbf(
+            *[normalized_coordinates[:, index] for index in range(coordinates.shape[1])],
+            values,
+            function="linear",
+            smooth=max(float(np.nanstd(values)) * 0.02, 1e-9),
+        )
+        return np.asarray(
+            rbf(*[normalized_query[:, index] for index in range(coordinates.shape[1])]),
+            dtype=float,
+        )
+
+
+def _gp_smoothed_interpolation_values(
+    coordinates: np.ndarray,
+    values: np.ndarray,
+    query_coordinates: np.ndarray,
+    *,
+    noise: float = 1e-4,
+) -> np.ndarray:
+    normalized_coordinates, normalized_query = _normalized_interpolation_coordinates(
+        coordinates,
+        query_coordinates,
+    )
+    try:
+        source_scale = float(np.nanstd(values))
+        means, _stds = _simulation_gp_predict(
+            normalized_coordinates,
+            values,
+            normalized_query,
+            np.full(normalized_coordinates.shape[1], 0.25, dtype=float),
+            max(float(noise), 1e-10),
+            config={
+                "random_seed": 42,
+                "acquisition": {"gp_optimizer_restarts": 1},
+            },
+            fixed_length_scales=True,
+        )
+        means = np.asarray(means, dtype=float)
+        if (
+            source_scale > 1e-9
+            and float(np.nanstd(means)) < max(1e-9, source_scale * 1e-3)
+        ):
+            return _rbf_interpolation_values(
+                coordinates,
+                values,
+                query_coordinates,
+            )
+        return means
+    except Exception:
+        return _rbf_interpolation_values(
+            coordinates,
+            values,
+            query_coordinates,
+        )
+
+
+def _interpolated_3d_grid(
+    points: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    z_name: str,
+    *,
+    resolution: int = 25,
+    method: str = "linear",
+    fill_nearest: bool = True,
+    log_frequency: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+    """Interpolate measured 3D points onto a regular grid for export/simulation."""
+    columns = [x_name, y_name, z_name, "value"]
+    valid = points[columns].copy()
+    valid[columns] = valid[columns].apply(pd.to_numeric, errors="coerce")
+    valid = valid.dropna(subset=columns)
+    if valid.empty:
+        return valid, pd.DataFrame(), "No numeric observations are available."
+
+    unique = valid.groupby([x_name, y_name, z_name], as_index=False)["value"].mean()
+    if (
+        len(unique) < 4
+        or unique[x_name].nunique() < 2
+        or unique[y_name].nunique() < 2
+        or unique[z_name].nunique() < 2
+    ):
+        return (
+            valid,
+            pd.DataFrame(),
+            "At least four observations with variation on all three axes are required.",
+        )
+
+    size = max(6, min(60, int(resolution)))
+    axis_specs = {
+        name: _interpolation_axis_values(
+            unique[name],
+            name,
+            size,
+            log_frequency,
+        )
+        for name in (x_name, y_name, z_name)
+    }
+    if any(spec is None for spec in axis_specs.values()):
+        return valid, pd.DataFrame(), "Could not build one or more interpolation axes."
+
+    transformed_axes = [axis_specs[name][0] for name in (x_name, y_name, z_name)]
+    display_axes = [axis_specs[name][1] for name in (x_name, y_name, z_name)]
+    mesh_transformed = np.meshgrid(*transformed_axes, indexing="ij")
+    mesh_display = np.meshgrid(*display_axes, indexing="ij")
+    coordinates = np.column_stack([
+        _transform_interpolation_values(
+            unique[name],
+            name,
+            log_frequency,
+        ).to_numpy(dtype=float)
+        for name in (x_name, y_name, z_name)
+    ])
+    values = unique["value"].to_numpy(dtype=float)
+    finite_coordinates = np.isfinite(coordinates).all(axis=1) & np.isfinite(values)
+    coordinates = coordinates[finite_coordinates]
+    values = values[finite_coordinates]
+    if len(values) < 4:
+        return valid, pd.DataFrame(), "Too few finite observations after axis transform."
+
+    query_coordinates = np.column_stack([
+        mesh.ravel()
+        for mesh in mesh_transformed
+    ])
+    grid_method = method if method in {"linear", "nearest", "rbf", "gp_smooth"} else "linear"
+    if grid_method == "rbf":
+        try:
+            grid_values = _rbf_interpolation_values(
+                coordinates,
+                values,
+                query_coordinates,
+            ).reshape(mesh_transformed[0].shape)
+        except Exception as exc:
+            return valid, pd.DataFrame(), f"3D RBF interpolation failed: {exc}"
+    elif grid_method == "gp_smooth":
+        try:
+            grid_values = _gp_smoothed_interpolation_values(
+                coordinates,
+                values,
+                query_coordinates,
+            ).reshape(mesh_transformed[0].shape)
+        except Exception as exc:
+            return valid, pd.DataFrame(), f"3D GP smoothing failed: {exc}"
+    else:
+        try:
+            grid_values = griddata(
+                coordinates,
+                values,
+                tuple(mesh_transformed),
+                method=grid_method,
+                rescale=True,
+            )
+        except Exception:
+            if grid_method == "nearest":
+                return valid, pd.DataFrame(), "3D nearest-neighbor interpolation failed."
+            grid_values = griddata(
+                coordinates,
+                values,
+                tuple(mesh_transformed),
+                method="nearest",
+                rescale=True,
+            )
+            grid_method = "nearest"
+        if fill_nearest and not np.isfinite(grid_values).all():
+            nearest_values = griddata(
+                coordinates,
+                values,
+                tuple(mesh_transformed),
+                method="nearest",
+                rescale=True,
+            )
+            grid_values = np.where(
+                np.isfinite(grid_values),
+                grid_values,
+                nearest_values,
+            )
+    if not np.isfinite(grid_values).any():
+        return valid, pd.DataFrame(), "Interpolation produced no finite grid values."
+
+    grid_frame = pd.DataFrame({
+        x_name: mesh_display[0].ravel(),
+        y_name: mesh_display[1].ravel(),
+        z_name: mesh_display[2].ravel(),
+        "interpolated_value": grid_values.ravel(),
+    })
+    grid_frame = grid_frame[np.isfinite(grid_frame["interpolated_value"])].copy()
+    grid_frame["interpolation_method"] = grid_method
+    grid_frame["grid_resolution_per_axis"] = size
+    return valid, grid_frame, None
+
+
+def _frame_fingerprint(frame: pd.DataFrame, columns: list[str]) -> str:
+    """Stable-enough fingerprint for rerun caches inside one Streamlit session."""
+    if frame.empty:
+        return "empty"
+    available = [column for column in columns if column in frame.columns]
+    if not available:
+        return f"rows:{len(frame)}"
+    normalized = frame[available].copy()
+    normalized = normalized.sort_values(available, kind="mergesort").reset_index(drop=True)
+    hashed = pd.util.hash_pandas_object(normalized, index=True).to_numpy(dtype=np.uint64)
+    return f"{len(normalized)}:{int(hashed.sum(dtype=np.uint64))}:{int(np.bitwise_xor.reduce(hashed))}"
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _plot_interpolated_3d_landscape(
+    observed_points: pd.DataFrame,
+    grid_frame: pd.DataFrame,
+    metric_label: str,
+    x_name: str,
+    y_name: str,
+    z_name: str,
+    *,
+    tensor_height: int = 520,
+    dot_size: int = 5,
+    dot_opacity: float = 0.50,
+    log_frequency: bool = False,
+    value_range: tuple[float, float] | None = None,
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
+) -> go.Figure:
+    """Render interpolated values as a discrete 3D tensor of grid points."""
+    value_min = (
+        float(value_range[0])
+        if value_range is not None
+        else float(grid_frame["interpolated_value"].min())
+    )
+    value_max = (
+        float(value_range[1])
+        if value_range is not None
+        else float(grid_frame["interpolated_value"].max())
+    )
+    if np.isclose(value_min, value_max):
+        value_max = value_min + 1.0
+    fig = go.Figure()
+    plot_grid = grid_frame
+    max_plot_points = 60000
+    if len(plot_grid) > max_plot_points:
+        step = int(math.ceil(len(plot_grid) / max_plot_points))
+        plot_grid = plot_grid.iloc[::step].copy()
+    fig.add_trace(go.Scatter3d(
+        x=plot_grid[x_name],
+        y=plot_grid[y_name],
+        z=plot_grid[z_name],
+        mode="markers",
+        name="Interpolated tensor grid",
+        marker={
+            "size": max(2, dot_size - 1),
+            "color": plot_grid["interpolated_value"],
+            "colorscale": "Viridis",
+            "cmin": value_min,
+            "cmax": value_max,
+            "opacity": dot_opacity,
+            "showscale": True,
+            "colorbar": {
+                "title": f"Interpolated {metric_label}",
+                "x": 0.92,
+                "y": 0.48,
+                "len": 0.68,
+            },
+        },
+        customdata=plot_grid["interpolated_value"],
+        hovertemplate=(
+            f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+            f"{z_name}: %{{z:.4g}}<br>Interpolated {metric_label}: "
+            "%{customdata:.4g}<extra>Grid point</extra>"
+        ),
+    ))
+    if (
+        slice_axis in {x_name, y_name, z_name}
+        and slice_value is not None
+        and np.isfinite(float(slice_value))
+    ):
+        axis_bounds = {}
+        for axis_name in (x_name, y_name, z_name):
+            axis_values = pd.to_numeric(
+                grid_frame[axis_name],
+                errors="coerce",
+            ).dropna()
+            if axis_values.empty:
+                axis_bounds[axis_name] = (0.0, 1.0)
+            else:
+                axis_bounds[axis_name] = (
+                    float(axis_values.min()),
+                    float(axis_values.max()),
+                )
+            if np.isclose(axis_bounds[axis_name][0], axis_bounds[axis_name][1]):
+                center = axis_bounds[axis_name][0]
+                padding = max(abs(center) * 0.05, 1e-9)
+                axis_bounds[axis_name] = (center - padding, center + padding)
+        plane_x = np.array([
+            [axis_bounds[x_name][0], axis_bounds[x_name][1]],
+            [axis_bounds[x_name][0], axis_bounds[x_name][1]],
+        ], dtype=float)
+        plane_y = np.array([
+            [axis_bounds[y_name][0], axis_bounds[y_name][0]],
+            [axis_bounds[y_name][1], axis_bounds[y_name][1]],
+        ], dtype=float)
+        plane_z = np.array([
+            [axis_bounds[z_name][0], axis_bounds[z_name][0]],
+            [axis_bounds[z_name][1], axis_bounds[z_name][1]],
+        ], dtype=float)
+        if slice_axis == x_name:
+            plane_x = np.full_like(plane_x, float(slice_value))
+        elif slice_axis == y_name:
+            plane_y = np.full_like(plane_y, float(slice_value))
+        else:
+            plane_z = np.full_like(plane_z, float(slice_value))
+        fig.add_trace(go.Surface(
+            x=plane_x,
+            y=plane_y,
+            z=plane_z,
+            surfacecolor=np.zeros_like(plane_x),
+            colorscale=[[0, "rgba(255,59,48,1)"], [1, "rgba(255,59,48,1)"]],
+            opacity=0.23,
+            showscale=False,
+            name="Highlighted slice",
+            hovertemplate=(
+                f"{slice_axis}: {float(slice_value):.4g}"
+                "<extra>Highlighted slice</extra>"
+            ),
+        ))
+    observed = observed_points.dropna(subset=[x_name, y_name, z_name, "value"])
+    if not observed.empty:
+        fig.add_trace(go.Scatter3d(
+            x=observed[x_name],
+            y=observed[y_name],
+            z=observed[z_name],
+            mode="markers",
+            name="Observed measurements",
+            showlegend=False,
+            marker={
+                "size": dot_size + 3,
+                "color": observed["value"],
+                "colorscale": "Viridis",
+                "cmin": value_min,
+                "cmax": value_max,
+                "line": {"color": "#111111", "width": 2},
+                "symbol": "diamond",
+                "opacity": min(1.0, dot_opacity + 0.25),
+                "showscale": False,
+            },
+            customdata=observed["value"],
+            hovertemplate=(
+                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                f"{z_name}: %{{z:.4g}}<br>Observed {metric_label}: "
+                "%{customdata:.4g}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(
+        title=f"Interpolated measured {metric_label} tensor grid",
+        scene={
+            "xaxis": {
+                "title": x_name,
+                "type": "log" if log_frequency and x_name == "frequency" else "linear",
+            },
+            "yaxis": {
+                "title": y_name,
+                "type": "log" if log_frequency and y_name == "frequency" else "linear",
+            },
+            "zaxis": {
+                "title": z_name,
+                "type": "log" if log_frequency and z_name == "frequency" else "linear",
+            },
+            "domain": {"x": [0, 0.78], "y": [0.08, 0.92]},
+        },
+        height=tensor_height,
+        margin={"l": 10, "r": 115, "t": 55, "b": 35},
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _plot_interpolated_2d_slice(
+    observed_points: pd.DataFrame,
+    grid_frame: pd.DataFrame,
+    metric_label: str,
+    x_name: str,
+    y_name: str,
+    slice_axis: str,
+    slice_value: float,
+    *,
+    log_frequency: bool = False,
+    value_range: tuple[float, float] | None = None,
+) -> go.Figure:
+    """Render a 2D map from one fixed slice of an interpolated 3D grid."""
+    slice_grid = _apply_numeric_slice(
+        grid_frame,
+        slice_axis,
+        slice_value,
+    ).reset_index(drop=True)
+    fig = go.Figure()
+    if not slice_grid.empty:
+        heatmap_grid = (
+            slice_grid
+            .pivot_table(
+                index=y_name,
+                columns=x_name,
+                values="interpolated_value",
+                aggfunc="mean",
+            )
+            .sort_index()
+            .sort_index(axis=1)
+        )
+        fig.add_trace(go.Heatmap(
+            x=heatmap_grid.columns.to_numpy(dtype=float),
+            y=heatmap_grid.index.to_numpy(dtype=float),
+            z=heatmap_grid.to_numpy(dtype=float),
+            colorscale="Viridis",
+            zmin=value_range[0] if value_range is not None else None,
+            zmax=value_range[1] if value_range is not None else None,
+            colorbar={"title": f"Interpolated {metric_label}"},
+            hovertemplate=(
+                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                f"Interpolated {metric_label}: %{{z:.4g}}<extra></extra>"
+            ),
+            connectgaps=False,
+        ))
+    observed = _apply_numeric_slice(
+        observed_points,
+        slice_axis,
+        slice_value,
+    )
+    observed = observed.dropna(subset=[x_name, y_name, "value"])
+    if not observed.empty:
+        fig.add_trace(go.Scatter(
+            x=observed[x_name],
+            y=observed[y_name],
+            mode="markers",
+            name="Observed measurements",
+            marker={
+                "size": 8,
+                "color": "#111111",
+                "symbol": "diamond",
+                "line": {"color": "white", "width": 1},
+            },
+            customdata=observed["value"],
+            hovertemplate=(
+                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                f"Observed {metric_label}: %{{customdata:.4g}}<extra></extra>"
+            ),
+        ))
+    if slice_grid.empty:
+        fig.add_annotation(
+            text="No interpolated grid values match this highlighted slice.",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+    title_note = _numeric_slice_title_note(slice_axis, slice_value)
+    fig.update_layout(
+        title=(
+            f"Interpolated measured {metric_label} 2D slice"
+            + (f"<br>{title_note}" if title_note else "")
+        ),
+        xaxis_title=x_name,
+        yaxis_title=y_name,
+        xaxis_type="log" if log_frequency and x_name == "frequency" else "linear",
+        yaxis_type="log" if log_frequency and y_name == "frequency" else "linear",
+        height=460,
+        margin={"l": 65, "r": 90, "t": 65, "b": 65},
+    )
+    return fig
+
+
+def _simulation_parameter_bounds(
+    frame: pd.DataFrame,
+    parameters: list[str],
+    config: dict | None = None,
+) -> dict[str, tuple[float, float, str]]:
+    parameter_config = (config or {}).get("parameters") or {}
+    bounds: dict[str, tuple[float, float, str]] = {}
+    for name in parameters:
+        numeric = pd.to_numeric(frame[name], errors="coerce")
+        finite = numeric[np.isfinite(numeric)]
+        definition = parameter_config.get(name) or {}
+        lower = definition.get("min")
+        upper = definition.get("max")
+        try:
+            lower = float(lower)
+            upper = float(upper)
+        except (TypeError, ValueError):
+            if finite.empty:
+                lower, upper = 0.0, 1.0
+            else:
+                lower = float(finite.min())
+                upper = float(finite.max())
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower == upper:
+            if finite.empty:
+                lower, upper = 0.0, 1.0
+            else:
+                lower = float(finite.min())
+                upper = float(finite.max())
+        if lower == upper:
+            upper = lower + 1.0
+        scale = str(
+            definition.get("scale", definition.get("encoding", ""))
+        ).lower()
+        bounds[name] = (lower, upper, scale)
+    return bounds
+
+
+def _simulation_encode_parameters(
+    frame: pd.DataFrame,
+    parameters: list[str],
+    bounds: dict[str, tuple[float, float, str]],
+) -> np.ndarray:
+    encoded = []
+    for name in parameters:
+        lower, upper, scale = bounds[name]
+        values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=float)
+        if scale in ("log", "log10") or name == "frequency":
+            values = np.log10(np.maximum(values, 1e-12))
+            lower = np.log10(max(lower, 1e-12))
+            upper = np.log10(max(upper, 1e-12))
+        encoded.append((values - lower) / (upper - lower + 1e-12))
+    return np.column_stack(encoded)
+
+
+def _simulation_matern52_kernel(
+    left: np.ndarray,
+    right: np.ndarray,
+    length_scales: np.ndarray,
+) -> np.ndarray:
+    scaled = (left[:, None, :] - right[None, :, :]) / length_scales[None, None, :]
+    distance = np.sqrt(np.sum(scaled * scaled, axis=2))
+    root5_distance = np.sqrt(5.0) * distance
+    return (
+        1.0
+        + root5_distance
+        + root5_distance ** 2 / 3.0
+    ) * np.exp(-root5_distance)
+
+
+def _simulation_gp_predict(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_candidates: np.ndarray,
+    length_scales: np.ndarray,
+    noise: float,
+    *,
+    config: dict | None = None,
+    fixed_length_scales: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(y_train) < 2:
+        raise ValueError("At least two observations are required for GP fitting.")
+    if config is not None:
+        try:
+            from sklearn.exceptions import ConvergenceWarning
+            from sklearn.gaussian_process import GaussianProcessRegressor
+            from sklearn.gaussian_process.kernels import ConstantKernel
+            from sklearn.gaussian_process.kernels import Matern as SklearnMatern
+            from sklearn.gaussian_process.kernels import WhiteKernel as SklearnWhiteKernel
+            import warnings
+
+            if fixed_length_scales:
+                matern = SklearnMatern(
+                    length_scale=np.asarray(length_scales, dtype=float),
+                    length_scale_bounds="fixed",
+                    nu=2.5,
+                )
+                restarts = 0
+            else:
+                matern = SklearnMatern(
+                    length_scale=np.ones(x_train.shape[1]),
+                    nu=2.5,
+                )
+                restarts = max(
+                    0,
+                    int(
+                        ((config or {}).get("acquisition") or {}).get(
+                            "gp_optimizer_restarts",
+                            2,
+                        )
+                    ),
+                )
+            kernel = (
+                ConstantKernel(1.0, constant_value_bounds="fixed")
+                * matern
+                + SklearnWhiteKernel(
+                    noise_level=max(float(noise), 1e-10),
+                    noise_level_bounds=(1e-8, 1e-1),
+                )
+            )
+            gp = GaussianProcessRegressor(
+                kernel=kernel,
+                normalize_y=True,
+                random_state=int((config or {}).get("random_seed", 42)),
+                n_restarts_optimizer=restarts,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                gp.fit(x_train, y_train)
+            means, stds = gp.predict(x_candidates, return_std=True)
+            return np.asarray(means, dtype=float), np.asarray(stds, dtype=float)
+        except Exception:
+            pass
+    y_mean = float(np.mean(y_train))
+    y_scale = float(np.std(y_train))
+    if y_scale < 1e-12:
+        y_scale = 1.0
+    normalized_y = (y_train - y_mean) / y_scale
+    covariance = _simulation_matern52_kernel(
+        x_train,
+        x_train,
+        length_scales,
+    )
+    identity = np.eye(len(x_train), dtype=float)
+    jitter = max(1e-10, float(noise))
+    cholesky = None
+    for _attempt in range(8):
+        try:
+            cholesky = np.linalg.cholesky(covariance + identity * jitter)
+            break
+        except np.linalg.LinAlgError:
+            jitter *= 10.0
+    if cholesky is None:
+        raise np.linalg.LinAlgError("GP covariance is not positive definite")
+    alpha = np.linalg.solve(
+        cholesky.T,
+        np.linalg.solve(cholesky, normalized_y),
+    )
+    cross_covariance = _simulation_matern52_kernel(
+        x_candidates,
+        x_train,
+        length_scales,
+    )
+    means = y_mean + y_scale * (cross_covariance @ alpha)
+    projected = np.linalg.solve(cholesky, cross_covariance.T)
+    variance = np.maximum(
+        1.0 + jitter - np.sum(projected * projected, axis=0),
+        1e-12,
+    )
+    return means, y_scale * np.sqrt(variance)
+
+
+def _simulation_clip01(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    return max(0.0, min(1.0, numeric))
+
+
+def _simulation_is_log_parameter(definition: dict) -> bool:
+    scale = str(definition.get("scale", definition.get("encoding", ""))).lower()
+    return scale in ("log", "log10")
+
+
+def _simulation_parameter_discrete_values(definition: dict, name: str) -> list[float]:
+    raw_values = definition.get("values", [definition.get("value")])
+    values = []
+    for value in raw_values:
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        values = [float(definition.get("value", DEFAULT_INITIAL_METHOD.get(name, 0.0)))]
+    step = definition.get("step")
+    if step in (None, "", 0, "0"):
+        return values
+    step_value = float(step)
+    if step_value <= 0:
+        return values
+    lower = float(definition.get("min", min(values)))
+    return [
+        float(f"{lower + round((value - lower) / step_value) * step_value:.12g}")
+        for value in values
+    ]
+
+
+def _simulation_normalized_bo_config(config: dict | None) -> dict:
+    cfg = json.loads(json.dumps(config or {}))
+    cfg.setdefault("n_initial_points", 8)
+    cfg.setdefault("random_seed", 42)
+    cfg.setdefault("initial_parameters", {})
+    for name, default_value in DEFAULT_INITIAL_METHOD.items():
+        cfg["initial_parameters"].setdefault(name, default_value)
+    cfg.setdefault("parameters", {})
+    for name in PARAMETERS:
+        definition = dict(cfg["parameters"].get(name) or {})
+        definition.setdefault("mode", "locked")
+        definition.setdefault("space", "discrete")
+        definition.setdefault("value", cfg["initial_parameters"].get(name, DEFAULT_INITIAL_METHOD[name]))
+        definition.setdefault("values", [definition["value"]])
+        numeric_values = [
+            float(value)
+            for value in definition.get("values", [definition["value"]])
+            if value is not None
+        ]
+        if numeric_values:
+            definition.setdefault("min", min(numeric_values))
+            definition.setdefault("max", max(numeric_values))
+        else:
+            definition.setdefault("min", definition["value"])
+            definition.setdefault("max", definition["value"])
+        definition.setdefault("scale", definition.get("encoding", "linear"))
+        if name == "frequency" and not definition.get("scale"):
+            definition["scale"] = "log"
+        if name == "conditioning_potential":
+            definition.setdefault("tie_to", "begin_potential")
+        cfg["parameters"][name] = definition
+    cfg.setdefault("acquisition", {})
+    acquisition = cfg["acquisition"]
+    acquisition.setdefault("exploration", 0.35)
+    acquisition.setdefault("candidate_pool_size", 600)
+    acquisition.setdefault("local_candidate_pool_size", 120)
+    acquisition.setdefault("initial_point_mode", "specific")
+    acquisition.setdefault("optimization_direction", "maximize")
+    acquisition.setdefault("use_gp", True)
+    acquisition.setdefault("gp_optimizer_restarts", 2)
+    default_falloffs = {name: 0.2 for name in PARAMETERS}
+    acquisition.setdefault("gp_length_scales", dict(default_falloffs))
+    acquisition.setdefault(
+        "gp_falloff_fractions",
+        acquisition.get("gp_length_scales", dict(default_falloffs)),
+    )
+    cfg.setdefault("constraints", {})
+    constraints = cfg["constraints"]
+    constraints.setdefault("min_scan_window", 0.4)
+    constraints.setdefault("max_effective_scan_rate", 5.0)
+    constraints.setdefault("max_amplitude", 0.50)
+    constraints.setdefault("conditioning_must_be_in_scan_window", False)
+    constraints.setdefault("require_end_after_begin", True)
+    return cfg
+
+
+def _simulation_resolve_candidate(candidate: dict, config: dict) -> dict:
+    cfg = _simulation_normalized_bo_config(config)
+    resolved = {
+        name: float(candidate.get(name, cfg["initial_parameters"].get(name, DEFAULT_INITIAL_METHOD[name])))
+        for name in PARAMETERS
+    }
+    for name in PARAMETERS:
+        definition = cfg["parameters"][name]
+        if str(definition.get("mode", "locked")).lower() == "locked":
+            resolved[name] = float(definition.get("value", resolved[name]))
+    for name in PARAMETERS:
+        definition = cfg["parameters"][name]
+        if str(definition.get("mode", "locked")).lower() == "tied":
+            tie_to = definition.get("tie_to") or "begin_potential"
+            resolved[name] = float(resolved[tie_to])
+    return resolved
+
+
+def _simulation_config_with_initial_parameters(
+    config: dict | None,
+    initial_parameters: dict[str, float],
+) -> dict:
+    cfg = json.loads(json.dumps(config or {}))
+    cfg.setdefault("initial_parameters", {})
+    cfg.setdefault("parameters", {})
+    for name, value in initial_parameters.items():
+        if name not in PARAMETERS:
+            continue
+        numeric_value = _finite_float(value)
+        if numeric_value is None:
+            continue
+        cfg["initial_parameters"][name] = numeric_value
+        if name in cfg["parameters"]:
+            definition = dict(cfg["parameters"].get(name) or {})
+            if str(definition.get("mode", "locked")).lower() == "locked":
+                definition["value"] = numeric_value
+            cfg["parameters"][name] = definition
+    return cfg
+
+
+def _simulation_candidate_key(candidate: dict) -> tuple[float, ...]:
+    return tuple(round(float(candidate[name]), 9) for name in PARAMETERS)
+
+
+def _simulation_encode_bo_candidates(candidates: list[dict], config: dict) -> np.ndarray:
+    cfg = _simulation_normalized_bo_config(config)
+    encoded_columns = []
+    for name in PARAMETERS:
+        definition = cfg["parameters"][name]
+        values = np.asarray([float(candidate[name]) for candidate in candidates], dtype=float)
+        if str(definition.get("space", "discrete")).lower() == "continuous":
+            lower = float(definition.get("min", np.nanmin(values)))
+            upper = float(definition.get("max", np.nanmax(values)))
+            if _simulation_is_log_parameter(definition):
+                lower = math.log10(max(lower, 1e-12))
+                upper = math.log10(max(upper, 1e-12))
+                values = np.log10(np.maximum(values, 1e-12))
+        else:
+            discrete_values = _simulation_parameter_discrete_values(definition, name)
+            if _simulation_is_log_parameter(definition):
+                discrete_values = [math.log10(max(value, 1e-12)) for value in discrete_values]
+                values = np.log10(np.maximum(values, 1e-12))
+            lower = min(discrete_values)
+            upper = max(discrete_values)
+        if upper < lower:
+            lower, upper = upper, lower
+        encoded_columns.append((values - lower) / (upper - lower + 1e-12))
+    return np.column_stack(encoded_columns)
+
+
+def _simulation_validate_candidate(candidate: dict, config: dict) -> list[str]:
+    cfg = _simulation_normalized_bo_config(config)
+    constraints = cfg["constraints"]
+    errors = []
+    begin = float(candidate["begin_potential"])
+    end = float(candidate["end_potential"])
+    step = float(candidate["step_potential"])
+    frequency = float(candidate["frequency"])
+    conditioning = float(candidate["conditioning_potential"])
+    amplitude = float(candidate["amplitude"])
+    if constraints.get("require_end_after_begin", True) and end <= begin:
+        errors.append("end_potential must be greater than begin_potential")
+    scan_window = end - begin
+    min_window = float(constraints.get("min_scan_window", 0.4))
+    if scan_window < min_window - 1e-12:
+        errors.append("end_potential - begin_potential is below min_scan_window")
+    max_scan_rate = float(constraints.get("max_effective_scan_rate", 5.0))
+    if step * frequency > max_scan_rate + 1e-12:
+        errors.append("step_potential * frequency exceeds max_effective_scan_rate")
+    max_amplitude = float(constraints.get("max_amplitude", 0.50))
+    if amplitude > max_amplitude + 1e-12:
+        errors.append("amplitude exceeds max_amplitude")
+    if constraints.get("conditioning_must_be_in_scan_window", False):
+        lower, upper = min(begin, end), max(begin, end)
+        if conditioning < lower - 1e-12 or conditioning > upper + 1e-12:
+            errors.append("conditioning_potential must be within scan window")
+    conditioning_definition = cfg["parameters"].get("conditioning_potential", {})
+    if (
+        str(conditioning_definition.get("mode", "")).lower() == "tied"
+        and abs(conditioning - begin) > 1e-9
+    ):
+        errors.append("conditioning_potential is tied to begin_potential")
+    return errors
+
+
+def _simulation_objective_value(value: float, config: dict) -> float:
+    raw = str(
+        (_simulation_normalized_bo_config(config).get("acquisition") or {}).get(
+            "optimization_direction",
+            "maximize",
+        )
+    ).strip().lower()
+    return -float(value) if raw in {"minimize", "min", "more_negative", "negative"} else float(value)
+
+
+def _simulation_acquisition_score(
+    mean: float,
+    std: float,
+    best_score: float,
+    exploration: float,
+) -> float:
+    exploration = _simulation_clip01(exploration)
+    std = max(float(std), 1e-12)
+    improvement = float(mean) - float(best_score) - 0.01
+    z_score = improvement / std
+    expected_improvement = (
+        improvement * ndtr(z_score)
+        + std * np.exp(-0.5 * z_score ** 2) / np.sqrt(2.0 * np.pi)
+    )
+    return (
+        (1.0 - exploration) * (float(mean) + 0.25 * expected_improvement)
+        + exploration * std
+    )
+
+
+def _simulation_distance_surrogate_choice(
+    available: pd.DataFrame,
+    observations: list[dict],
+    config: dict,
+) -> tuple[int, float, float, float, float]:
+    available_params = available["params"].tolist()
+    encoded_available = _simulation_encode_bo_candidates(available_params, config)
+    observed_params = [observation["params"] for observation in observations]
+    encoded_observed = _simulation_encode_bo_candidates(observed_params, config)
+    observed_values = [
+        _simulation_objective_value(float(observation["Q_run"]), config)
+        for observation in observations
+    ]
+    best_objective = max(observed_values)
+    exploration = _simulation_clip01(
+        (_simulation_normalized_bo_config(config).get("acquisition") or {}).get(
+            "exploration",
+            0.35,
+        )
+    )
+    best_position = 0
+    best_score = -np.inf
+    best_predicted = best_std = best_ei = np.nan
+    for position, encoded in enumerate(encoded_available):
+        distances = np.sqrt(np.sum((encoded_observed - encoded[None, :]) ** 2, axis=1))
+        nearest = float(np.min(distances)) if len(distances) else 1.0
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for distance, q_value in zip(distances, observed_values):
+            weight = 1.0 / (float(distance) + 0.05)
+            weighted_sum += weight * q_value
+            weight_total += weight
+        predicted = weighted_sum / max(weight_total, 1e-12)
+        improvement = max(0.0, predicted - best_objective)
+        exploit_score = predicted + 0.05 * improvement
+        score = (1.0 - exploration) * exploit_score + exploration * nearest
+        if score > best_score:
+            best_position = position
+            best_score = float(score)
+            best_predicted = float(predicted)
+            best_std = float(nearest)
+            best_ei = float(improvement)
+    return best_position, best_predicted, best_std, best_ei, best_score
+
+
+def _simulation_sample_continuous_value(
+    definition: dict,
+    rng: random.Random,
+    center: float | None = None,
+) -> float:
+    lower = float(definition.get("min", definition.get("value", 0.0)))
+    upper = float(definition.get("max", definition.get("value", lower)))
+    if upper < lower:
+        lower, upper = upper, lower
+    if _simulation_is_log_parameter(definition):
+        lower_t = math.log10(max(lower, 1e-12))
+        upper_t = math.log10(max(upper, 1e-12))
+        if center is None:
+            value_t = rng.uniform(lower_t, upper_t)
+        else:
+            center_t = math.log10(max(float(center), 1e-12))
+            sigma = max(1e-6, float(definition.get("proposal_sigma", 0.25))) * max(
+                upper_t - lower_t,
+                1e-9,
+            )
+            value_t = max(lower_t, min(upper_t, rng.gauss(center_t, sigma)))
+        value = 10 ** value_t
+    else:
+        if center is None:
+            value = rng.uniform(lower, upper)
+        else:
+            sigma = max(1e-6, float(definition.get("proposal_sigma", 0.15))) * max(
+                upper - lower,
+                1e-9,
+            )
+            value = max(lower, min(upper, rng.gauss(float(center), sigma)))
+    step = definition.get("step")
+    if step not in (None, "", 0, "0"):
+        step_value = float(step)
+        if step_value > 0:
+            value = max(
+                lower,
+                min(
+                    upper,
+                    float(f"{lower + round((value - lower) / step_value) * step_value:.12g}"),
+                ),
+            )
+    return float(value)
+
+
+def _simulation_local_continuous_candidates(
+    observations: list[dict],
+    tried: set[tuple[float, ...]],
+    config: dict,
+) -> list[dict]:
+    cfg = _simulation_normalized_bo_config(config)
+    active_continuous = [
+        name for name in PARAMETERS
+        if str(cfg["parameters"][name].get("mode", "")).lower() == "active"
+        and str(cfg["parameters"][name].get("space", "discrete")).lower() == "continuous"
+    ]
+    target = max(
+        0,
+        int((cfg.get("acquisition") or {}).get("local_candidate_pool_size", 120)),
+    )
+    if not active_continuous or target <= 0 or not observations:
+        return []
+    best = max(
+        observations,
+        key=lambda observation: _simulation_objective_value(
+            float(observation.get("Q_run", 0.0)),
+            cfg,
+        ),
+    )
+    center = dict(best["params"])
+    rng = random.Random(
+        int(cfg.get("random_seed", 42)) + 1009 * (len(observations) + 1)
+    )
+    candidates = []
+    seen = set(tried)
+    max_attempts = max(target * 25, target + 1000)
+    for _attempt in range(max_attempts):
+        if len(candidates) >= target:
+            break
+        candidate = dict(center)
+        for name in PARAMETERS:
+            definition = cfg["parameters"][name]
+            mode = str(definition.get("mode", "locked")).lower()
+            if mode == "tied":
+                continue
+            if (
+                mode == "active"
+                and str(definition.get("space", "discrete")).lower() == "continuous"
+            ):
+                local_definition = dict(definition)
+                if name == "frequency" and candidate.get("step_potential") is not None:
+                    max_scan_rate = float(
+                        cfg.get("constraints", {}).get(
+                            "max_effective_scan_rate",
+                            5.0,
+                        )
+                    )
+                    max_frequency = max_scan_rate / max(
+                        float(candidate["step_potential"]),
+                        1e-12,
+                    )
+                    local_definition["max"] = min(
+                        float(local_definition.get("max", max_frequency)),
+                        max_frequency,
+                    )
+                candidate[name] = _simulation_sample_continuous_value(
+                    local_definition,
+                    rng,
+                    center.get(name),
+                )
+            elif mode == "active":
+                candidate[name] = rng.choice(
+                    _simulation_parameter_discrete_values(definition, name)
+                )
+            elif mode == "locked":
+                candidate[name] = float(definition.get("value", center.get(name)))
+        candidate = _simulation_resolve_candidate(candidate, cfg)
+        if _simulation_validate_candidate(candidate, cfg):
+            continue
+        key = _simulation_candidate_key(candidate)
+        if key in seen:
+            continue
+        candidates.append(candidate)
+        seen.add(key)
+    return candidates
+
+
+def _simulation_nearest_truth_value(
+    params: dict,
+    candidate_rows: pd.DataFrame,
+    config: dict,
+    value_name: str,
+) -> float:
+    if candidate_rows.empty:
+        return float("nan")
+    if "params" not in candidate_rows.columns:
+        coordinate_names = [
+            name for name in params
+            if name in candidate_rows.columns
+            and pd.api.types.is_numeric_dtype(candidate_rows[name])
+        ]
+        coordinate_names = [
+            name for name in ("step_potential", "amplitude", "frequency")
+            if name in coordinate_names
+        ] or coordinate_names[:3]
+        if coordinate_names:
+            coords = candidate_rows[coordinate_names].apply(
+                pd.to_numeric,
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            target = np.asarray(
+                [float(params[name]) for name in coordinate_names],
+                dtype=float,
+            )
+            spans = np.nanmax(coords, axis=0) - np.nanmin(coords, axis=0)
+            spans = np.where(np.isfinite(spans) & (spans > 0), spans, 1.0)
+            distances = np.sqrt(np.nansum(((coords - target[None, :]) / spans) ** 2, axis=1))
+            nearest_position = int(np.nanargmin(distances))
+            return float(candidate_rows.iloc[nearest_position][value_name])
+    encoded_rows = _simulation_encode_bo_candidates(
+        candidate_rows["params"].tolist(),
+        config,
+    )
+    encoded_target = _simulation_encode_bo_candidates([params], config)[0]
+    distances = np.sqrt(np.sum((encoded_rows - encoded_target[None, :]) ** 2, axis=1))
+    nearest_position = int(np.argmin(distances))
+    return float(candidate_rows.iloc[nearest_position][value_name])
+
+
+def _simulation_interpolated_truth_value(
+    params: dict,
+    tensor_rows: pd.DataFrame,
+    config: dict,
+    axes: tuple[str, str, str],
+    value_name: str,
+) -> float:
+    """Evaluate a candidate against the simulated tensor with continuous interpolation."""
+    if tensor_rows.empty:
+        return float("nan")
+    x_name, y_name, z_name = axes
+    if value_name not in tensor_rows.columns:
+        return _simulation_nearest_truth_value(params, tensor_rows, config, value_name)
+    try:
+        work = tensor_rows[[x_name, y_name, z_name, value_name]].copy()
+        work[[x_name, y_name, z_name, value_name]] = work[
+            [x_name, y_name, z_name, value_name]
+        ].apply(pd.to_numeric, errors="coerce")
+        work = work.dropna(subset=[x_name, y_name, z_name, value_name])
+        if work.empty:
+            raise ValueError("No finite tensor rows")
+        axes_values = [
+            np.asarray(sorted(work[name].unique()), dtype=float)
+            for name in (x_name, y_name, z_name)
+        ]
+        if any(len(values) < 2 for values in axes_values):
+            raise ValueError("Tensor axis has fewer than two values")
+        expected_size = int(np.prod([len(values) for values in axes_values]))
+        grouped = (
+            work.groupby([x_name, y_name, z_name], as_index=False)[value_name]
+            .mean()
+            .sort_values([x_name, y_name, z_name])
+        )
+        if len(grouped) != expected_size:
+            raise ValueError("Tensor grid is incomplete")
+        value_grid = (
+            grouped[value_name]
+            .to_numpy(dtype=float)
+            .reshape(tuple(len(values) for values in axes_values))
+        )
+        interpolator = RegularGridInterpolator(
+            tuple(axes_values),
+            value_grid,
+            method="linear",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        point = np.asarray([
+            float(params[x_name]),
+            float(params[y_name]),
+            float(params[z_name]),
+        ], dtype=float)
+        interpolated = float(interpolator(point))
+        if np.isfinite(interpolated):
+            return interpolated
+    except Exception:
+        pass
+    return _simulation_nearest_truth_value(params, tensor_rows, config, value_name)
+
+
+def _run_landscape_bo_simulation(
+    ground_truth: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    z_name: str,
+    value_name: str,
+    *,
+    config: dict | None = None,
+    iterations: int = 50,
+    initial_random_points: int = 5,
+    exploration: float = 0.2,
+    candidate_pool_size: int = 1000,
+    local_candidate_pool_size: int | None = None,
+    seed: int = 1,
+    falloff_fractions: dict[str, float] | None = None,
+    noise: float = 1e-4,
+    force_initial_point: bool = True,
+    measurement_callback: Callable[[dict[str, float], int, float], tuple[float, dict]] | None = None,
+    progress_callback: Callable[[int, int, dict], None] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run a BO backtest against a discrete 3D ground-truth tensor."""
+    cfg = _simulation_normalized_bo_config(config)
+    acquisition = cfg.get("acquisition") or {}
+    acquisition["exploration"] = _simulation_clip01(exploration)
+    acquisition["candidate_pool_size"] = max(1, int(candidate_pool_size))
+    if local_candidate_pool_size is not None:
+        acquisition["local_candidate_pool_size"] = max(
+            0,
+            int(local_candidate_pool_size),
+        )
+    cfg["n_initial_points"] = max(0, int(initial_random_points))
+    parameters = [x_name, y_name, z_name]
+    columns = [*parameters, value_name]
+    candidates = ground_truth[columns].copy()
+    candidates[columns] = candidates[columns].apply(pd.to_numeric, errors="coerce")
+    candidates = candidates.dropna(subset=columns).drop_duplicates(
+        subset=parameters,
+        keep="first",
+    ).reset_index(drop=True)
+    if candidates.empty:
+        return pd.DataFrame(), candidates
+    candidate_records = []
+    seen_keys = set()
+    for index, row in candidates.iterrows():
+        params = _simulation_resolve_candidate(
+            {
+                **cfg.get("initial_parameters", {}),
+                **{
+                    name: float(row[name])
+                    for name in parameters
+                    if name in PARAMETERS
+                },
+            },
+            cfg,
+        )
+        if _simulation_validate_candidate(params, cfg):
+            continue
+        key = _simulation_candidate_key(params)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidate_records.append({
+            "source_index": int(index),
+            "params": params,
+            **{name: float(row[name]) for name in parameters},
+            value_name: float(row[value_name]),
+        })
+    candidates = pd.DataFrame(candidate_records)
+    if candidates.empty:
+        return pd.DataFrame(), candidates
+    rng = random.Random(int(seed))
+    initial_rng = random.Random(int(seed) + 1_000_003)
+    pool_size = max(1, min(int(candidate_pool_size), len(candidates)))
+    initial_params = _simulation_resolve_candidate(cfg.get("initial_parameters", {}), cfg)
+    initial_key = _simulation_candidate_key(initial_params)
+    exact_initial_rows = [
+        int(index)
+        for index, row in candidates.iterrows()
+        if _simulation_candidate_key(row["params"]) == initial_key
+    ]
+    if len(candidates) > pool_size:
+        mandatory = exact_initial_rows[:1] if force_initial_point else []
+        remaining_indices = [
+            int(index) for index in candidates.index
+            if int(index) not in set(mandatory)
+        ]
+        sampled = rng.sample(
+            remaining_indices,
+            k=max(0, pool_size - len(mandatory)),
+        )
+        pool_indices = sorted([*mandatory, *sampled])
+        candidates = candidates.loc[pool_indices].reset_index(drop=True)
+    else:
+        candidates = candidates.reset_index(drop=True)
+    total_iterations = max(1, min(int(iterations), len(candidates)))
+    initial_count = max(0, min(int(initial_random_points), total_iterations))
+    merged_falloffs = dict(acquisition.get("gp_falloff_fractions") or {})
+    merged_falloffs.update(falloff_fractions or {})
+    acquisition["gp_falloff_fractions"] = dict(merged_falloffs)
+    acquisition["gp_length_scales"] = dict(merged_falloffs)
+    fixed_length_scales = all(
+        name in merged_falloffs and float(merged_falloffs[name]) > 0
+        for name in PARAMETERS
+    )
+    length_scales = np.asarray(
+        [
+            max(1e-9, float(merged_falloffs.get(name, 1.0)))
+            for name in PARAMETERS
+        ],
+        dtype=float,
+    )
+    observations: list[dict] = []
+    history_rows = []
+    for iteration in range(1, total_iterations + 1):
+        tried = {
+            _simulation_candidate_key(observation["params"])
+            for observation in observations
+        }
+        base_available = candidates[
+            ~candidates["params"].apply(
+                lambda params: _simulation_candidate_key(params) in tried
+            )
+        ].copy()
+        base_available["candidate_index"] = base_available.index.astype(int)
+        if (
+            force_initial_point
+            and
+            not _simulation_validate_candidate(initial_params, cfg)
+            and initial_key not in tried
+            and not any(
+                _simulation_candidate_key(params) == initial_key
+                for params in base_available["params"]
+            )
+        ):
+            base_available = pd.concat(
+                [
+                    pd.DataFrame([{
+                        "source_index": None,
+                        "params": dict(initial_params),
+                        **{name: float(initial_params[name]) for name in parameters},
+                        value_name: _simulation_interpolated_truth_value(
+                            initial_params,
+                            ground_truth,
+                            cfg,
+                            (x_name, y_name, z_name),
+                            value_name,
+                        ),
+                        "candidate_index": -1000000,
+                    }]),
+                    base_available,
+                ],
+                ignore_index=True,
+            )
+        local_records = []
+        for local_index, local_params in enumerate(
+            _simulation_local_continuous_candidates(observations, tried, cfg),
+            1,
+        ):
+            local_records.append({
+                "source_index": None,
+                "params": local_params,
+                **{name: float(local_params[name]) for name in parameters},
+                value_name: _simulation_interpolated_truth_value(
+                    local_params,
+                    ground_truth,
+                    cfg,
+                    (x_name, y_name, z_name),
+                    value_name,
+                ),
+                "candidate_index": -local_index,
+            })
+        available = pd.concat(
+            [base_available, pd.DataFrame(local_records)],
+            ignore_index=True,
+        ) if local_records else base_available.reset_index(drop=True)
+        if available.empty:
+            break
+        available_keys = {
+            _simulation_candidate_key(params): int(index)
+            for index, params in zip(available["candidate_index"], available["params"])
+        }
+        if force_initial_point and initial_key not in tried and initial_key in available_keys:
+            chosen_index = int(available_keys[initial_key])
+            chosen_row = available[
+                available["candidate_index"] == chosen_index
+            ].iloc[0].to_dict()
+            mean = std = acquisition_value = expected_improvement = np.nan
+            selection_mode = "initial"
+        elif (not observations and not force_initial_point) or len(observations) < initial_count:
+            anchors = (
+                ([initial_params] if force_initial_point else [])
+                + [observation["params"] for observation in observations]
+            )
+            if not anchors:
+                position = initial_rng.randrange(len(available))
+                chosen_row = available.iloc[position].to_dict()
+                mean = std = acquisition_value = expected_improvement = np.nan
+                selection_mode = "seed random initial"
+                row = chosen_row
+                params = dict(row["params"])
+                tensor_value = float(row[value_name])
+                measurement_metadata = {}
+                value = tensor_value
+                if measurement_callback is not None:
+                    try:
+                        measured_value, measurement_metadata = measurement_callback(
+                            params,
+                            iteration,
+                            tensor_value,
+                        )
+                        if np.isfinite(float(measured_value)):
+                            value = float(measured_value)
+                    except Exception as exc:
+                        measurement_metadata = {
+                            "measurement_error": str(exc),
+                            "simulation_fidelity": "trace-realistic",
+                        }
+                best_so_far = max(
+                    [float(existing["observed_value"]) for existing in history_rows]
+                    + [value]
+                )
+                observations.append({
+                    "params": params,
+                    "Q_run": value,
+                    "iteration": iteration,
+                })
+                history_rows.append({
+                    "iteration": iteration,
+                    "selection_mode": selection_mode,
+                    x_name: float(row[x_name]),
+                    y_name: float(row[y_name]),
+                    z_name: float(row[z_name]),
+                    "observed_value": value,
+                    "tensor_value": tensor_value,
+                    "best_so_far": best_so_far,
+                    "predicted_mean": mean,
+                    "predicted_std": std,
+                    "expected_improvement": expected_improvement,
+                    "acquisition_value": acquisition_value,
+                    "measurement_metadata": measurement_metadata,
+                })
+                if progress_callback is not None:
+                    progress_callback(iteration, total_iterations, history_rows[-1])
+                continue
+            encoded_available = _simulation_encode_bo_candidates(
+                available["params"].tolist(),
+                cfg,
+            )
+            encoded_anchors = _simulation_encode_bo_candidates(anchors, cfg)
+            distances = np.sqrt(
+                np.sum(
+                    (
+                        encoded_available[:, None, :]
+                        - encoded_anchors[None, :, :]
+                    ) ** 2,
+                    axis=2,
+                )
+            )
+            position = int(np.argmax(np.min(distances, axis=1)))
+            chosen_row = available.iloc[position].to_dict()
+            mean = std = acquisition_value = expected_improvement = np.nan
+            selection_mode = "maximin"
+        else:
+            used_gp = False
+            if bool(acquisition.get("use_gp", True)) and len(observations) >= 2:
+                try:
+                    x_train = _simulation_encode_bo_candidates(
+                        [observation["params"] for observation in observations],
+                        cfg,
+                    )
+                    y_train = np.asarray(
+                        [float(observation["Q_run"]) for observation in observations],
+                        dtype=float,
+                    )
+                    x_available = _simulation_encode_bo_candidates(
+                        available["params"].tolist(),
+                        cfg,
+                    )
+                    means, stds = _simulation_gp_predict(
+                        x_train,
+                        y_train,
+                        x_available,
+                        length_scales,
+                        noise,
+                        config=cfg,
+                        fixed_length_scales=fixed_length_scales,
+                    )
+                    best_objective = max(
+                        _simulation_objective_value(float(observation["Q_run"]), cfg)
+                        for observation in observations
+                    )
+                    scores = np.asarray([
+                        _simulation_acquisition_score(
+                            _simulation_objective_value(float(mu), cfg),
+                            float(sigma),
+                            best_objective,
+                            exploration,
+                        )
+                        for mu, sigma in zip(means, stds)
+                    ])
+                    position = int(np.nanargmax(scores))
+                    chosen_row = available.iloc[position].to_dict()
+                    mean = float(means[position])
+                    std = float(stds[position])
+                    improvement = (
+                        _simulation_objective_value(mean, cfg)
+                        - best_objective
+                        - 0.01
+                    )
+                    z_score = improvement / max(std, 1e-12)
+                    expected_improvement = float(
+                        improvement * ndtr(z_score)
+                        + std * np.exp(-0.5 * z_score ** 2) / np.sqrt(2.0 * np.pi)
+                    )
+                    acquisition_value = float(scores[position])
+                    selection_mode = "GP acquisition"
+                    used_gp = True
+                except Exception:
+                    used_gp = False
+            if not used_gp:
+                (
+                    position,
+                    mean,
+                    std,
+                    expected_improvement,
+                    acquisition_value,
+                ) = _simulation_distance_surrogate_choice(
+                    available,
+                    observations,
+                    cfg,
+                )
+                chosen_row = available.iloc[position].to_dict()
+                selection_mode = "distance surrogate"
+        row = chosen_row
+        params = dict(row["params"])
+        tensor_value = float(row[value_name])
+        measurement_metadata = {}
+        value = tensor_value
+        if measurement_callback is not None:
+            try:
+                measured_value, measurement_metadata = measurement_callback(
+                    params,
+                    iteration,
+                    tensor_value,
+                )
+                if np.isfinite(float(measured_value)):
+                    value = float(measured_value)
+            except Exception as exc:
+                measurement_metadata = {
+                    "measurement_error": str(exc),
+                    "simulation_fidelity": "trace-realistic",
+                }
+        best_so_far = max(
+            [float(existing["observed_value"]) for existing in history_rows]
+            + [value]
+        )
+        observations.append({
+            "params": params,
+            "Q_run": value,
+            "iteration": iteration,
+        })
+        history_rows.append({
+            "iteration": iteration,
+            "selection_mode": selection_mode,
+            x_name: float(row[x_name]),
+            y_name: float(row[y_name]),
+            z_name: float(row[z_name]),
+            "observed_value": value,
+            "tensor_value": tensor_value,
+            "best_so_far": best_so_far,
+            "predicted_mean": mean,
+            "predicted_std": std,
+            "expected_improvement": expected_improvement,
+            "acquisition_value": acquisition_value,
+            "measurement_metadata": measurement_metadata,
+        })
+        if progress_callback is not None:
+            progress_callback(iteration, total_iterations, history_rows[-1])
+    return pd.DataFrame(history_rows), candidates
+
+
+def _plot_simulation_history(
+    history: pd.DataFrame,
+    value_label: str,
+    optimum_reference: dict[str, float] | None = None,
+) -> go.Figure:
+    fig = go.Figure()
+    if history.empty:
+        fig.add_annotation(
+            text="No simulation results.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=340)
+        return _apply_plotly_colorbar_height(fig)
+    fig.add_trace(go.Scatter(
+        x=history["iteration"],
+        y=history["observed_value"],
+        mode="lines+markers",
+        name=f"Observed {value_label}",
+        marker={"size": 7},
+    ))
+    fig.add_trace(go.Scatter(
+        x=history["iteration"],
+        y=history["best_so_far"],
+        mode="lines+markers",
+        name="Best so far",
+        line={"width": 3, "color": "#111111"},
+        marker={"size": 7},
+    ))
+    if optimum_reference:
+        _add_horizontal_reference_line(
+            fig,
+            optimum_reference.get("Q_run"),
+            "Best possible Q",
+        )
+    fig.update_layout(
+        title=f"Simulated BO backtest | {value_label}",
+        xaxis_title="Simulation iteration",
+        yaxis_title=value_label,
+        height=420,
+        margin={"l": 65, "r": 30, "t": 55, "b": 55},
+    )
+    return fig
+
+
+def _plot_simulation_comparison(
+    runs: list[dict],
+    value_label: str,
+    y_column: str = "best_so_far",
+    color_by: str | None = None,
+    optimum_reference: dict[str, float] | None = None,
+) -> go.Figure:
+    fig = go.Figure()
+    if not runs:
+        fig.add_annotation(
+            text="No simulation runs to compare.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=420)
+        return fig
+    color_columns = {
+        "exploration": ("exploration", "Explore weight"),
+        "initial_random_points": ("initial_random_points", "Initial maximin points"),
+        "gp_falloff_value": ("gp_falloff_value", "GP falloff"),
+    }
+    color_key, color_label = color_columns.get(color_by, (None, None))
+    categorical_key = "ground_truth_channel" if color_by == "Ground-truth channel" else None
+    categorical_values = []
+    if categorical_key:
+        categorical_values = sorted({
+            str(run.get(categorical_key))
+            for run in runs
+            if run.get(categorical_key) is not None
+        }, key=_channel_sort_key)
+    categorical_colors = {
+        value: GROUP_CATEGORICAL_COLORS[index % len(GROUP_CATEGORICAL_COLORS)]
+        for index, value in enumerate(categorical_values)
+    }
+    color_values = [
+        float(run.get(color_key))
+        for run in runs
+        if color_key
+        and run.get(color_key) is not None
+        and np.isfinite(float(run.get(color_key)))
+    ]
+    color_min = min(color_values) if color_values else 0.0
+    color_max = max(color_values) if color_values else 1.0
+    if np.isclose(color_min, color_max):
+        color_max = color_min + 1.0
+
+    def scale_color(value: float) -> str:
+        cmap = plt.get_cmap("viridis")
+        fraction = (float(value) - color_min) / (
+            color_max - color_min + 1e-12
+        )
+        red, green, blue, _alpha = cmap(min(1.0, max(0.0, fraction)))
+        return f"rgb({red * 255:.0f},{green * 255:.0f},{blue * 255:.0f})"
+
+    for run in runs:
+        history = run.get("history")
+        if history is None or history.empty or y_column not in history.columns:
+            continue
+        label = str(run.get("label") or "Simulation")
+        color_value = run.get(color_key) if color_key else None
+        numeric_color_value = _finite_float(color_value)
+        trace_color = (
+            categorical_colors.get(str(run.get(categorical_key)))
+            if categorical_key and run.get(categorical_key) is not None
+            else
+            scale_color(numeric_color_value)
+            if color_key and color_values and numeric_color_value is not None
+            else None
+        )
+        marker = {"size": 7}
+        if color_key and color_values and numeric_color_value is not None:
+            marker.update({
+                "color": [numeric_color_value] * len(history),
+                "coloraxis": "coloraxis",
+            })
+        elif trace_color:
+            marker["color"] = trace_color
+        fig.add_trace(go.Scatter(
+            x=history["iteration"],
+            y=history[y_column],
+            mode="lines+markers",
+            name=label,
+            line=({"color": trace_color} if trace_color else None),
+            marker=marker,
+            customdata=history[["observed_value", "selection_mode"]],
+            hovertemplate=(
+                f"{label}<br>Iteration %{{x}}<br>"
+                f"{'Best so far' if y_column == 'best_so_far' else 'Observed'}: "
+                "%{y:.4g}<br>Observed: %{customdata[0]:.4g}<br>"
+                "Mode: %{customdata[1]}<extra></extra>"
+            ),
+        ))
+    if color_key and color_label and color_values:
+        _apply_metadata_coloraxis(
+            fig,
+            {index: value for index, value in enumerate(color_values)},
+            color_label,
+        )
+    if optimum_reference:
+        _add_horizontal_reference_line(
+            fig,
+            optimum_reference.get("Q_run"),
+            "Best possible Q",
+        )
+    fig.update_layout(
+        title=(
+            f"Simulation hyperparameter comparison | {value_label} "
+            f"{'best-so-far' if y_column == 'best_so_far' else 'observed'}"
+        ),
+        xaxis_title="Simulation iteration",
+        yaxis_title=(
+            f"Best {value_label} so far"
+            if y_column == "best_so_far" else value_label
+        ),
+        height=460,
+        margin={"l": 65, "r": 30, "t": 55, "b": 95},
+        legend={
+            "orientation": "h",
+            "x": 0,
+            "xanchor": "left",
+            "y": -0.18,
+            "yanchor": "top",
+        },
+    )
+    return fig
+
+
+def _simulation_history_display_frame(history: pd.DataFrame) -> pd.DataFrame:
+    if history is None or history.empty:
+        return pd.DataFrame()
+    display = history.copy()
+    if "measurement_metadata" in display.columns:
+        display["measurement_mode"] = [
+            (
+                metadata.get("simulation_fidelity")
+                if isinstance(metadata, dict)
+                else None
+            )
+            for metadata in display["measurement_metadata"]
+        ]
+        display["trace_warnings"] = [
+            (
+                len(metadata.get("trace_errors") or [])
+                if isinstance(metadata, dict)
+                else 0
+            )
+            for metadata in display["measurement_metadata"]
+        ]
+        display = display.drop(columns=["measurement_metadata"])
+    return display
+
+
+def _plot_simulation_3d_path(
+    ground_truth: pd.DataFrame,
+    history: pd.DataFrame,
+    value_label: str,
+    x_name: str,
+    y_name: str,
+    z_name: str,
+    *,
+    tensor_height: int = 620,
+    dot_size: int = 6,
+    dot_opacity: float = 0.35,
+) -> go.Figure:
+    fig = _plot_interpolated_3d_landscape(
+        history.rename(columns={"observed_value": "value"})[
+            ["iteration", x_name, y_name, z_name, "value"]
+        ] if not history.empty else pd.DataFrame(columns=[
+            "iteration",
+            x_name,
+            y_name,
+            z_name,
+            "value",
+        ]),
+        ground_truth.rename(columns={"ground_truth_value": "interpolated_value"}),
+        value_label,
+        x_name,
+        y_name,
+        z_name,
+        tensor_height=tensor_height,
+        dot_size=dot_size,
+        dot_opacity=dot_opacity,
+    )
+    if not history.empty:
+        ordered = history.sort_values("iteration")
+        _add_plotly_iteration_path(
+            fig,
+            ordered[x_name],
+            ordered[y_name],
+            ordered["iteration"],
+            z=ordered[z_name],
+            show_colorbar=True,
+        )
+    fig.update_layout(title=f"Simulated BO path on {value_label} tensor")
+    return fig
+
+
+def _plot_interpolated_simulated_trace(
+    session: dict,
+    observations: list[dict],
+    target_params: dict[str, float],
+    selected_channels: list[str],
+    *,
+    corrected: bool,
+    analysis: dict,
+    correction_label: str,
+    normalize_to_peak: bool = False,
+    corrected_trace_key: str = "smoothed_corrected_current",
+    nearest_count: int = 4,
+) -> tuple[plt.Figure, list[str]]:
+    """Interpolate real SWV waveforms near a simulated parameter point."""
+    rows = []
+    parameters = [
+        name for name in PARAMETERS
+        if name in target_params
+        and any((observation.get("params") or {}).get(name) is not None for observation in observations)
+    ]
+    if not parameters:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(.5, .5, "No parameter coordinates are available.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, []
+    source_frame = pd.DataFrame([
+        {
+            "observation": observation,
+            **{
+                name: (observation.get("params") or {}).get(name)
+                for name in parameters
+            },
+        }
+        for observation in observations
+    ])
+    numeric_source = source_frame[parameters].apply(pd.to_numeric, errors="coerce")
+    valid_mask = numeric_source.notna().all(axis=1)
+    source_frame = source_frame.loc[valid_mask].reset_index(drop=True)
+    numeric_source = numeric_source.loc[valid_mask].reset_index(drop=True)
+    if source_frame.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(.5, .5, "No trace observations have complete coordinates.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, []
+    bounds = _simulation_parameter_bounds(
+        pd.concat(
+            [
+                numeric_source,
+                pd.DataFrame([{name: target_params[name] for name in parameters}]),
+            ],
+            ignore_index=True,
+        ),
+        parameters,
+        session.get("config") or {},
+    )
+    encoded_source = _simulation_encode_parameters(
+        numeric_source,
+        parameters,
+        bounds,
+    )
+    encoded_target = _simulation_encode_parameters(
+        pd.DataFrame([{name: target_params[name] for name in parameters}]),
+        parameters,
+        bounds,
+    )[0]
+    distances = np.sqrt(np.sum((encoded_source - encoded_target[None, :]) ** 2, axis=1))
+    nearest_positions = np.argsort(distances)[:max(1, int(nearest_count))]
+    selected_channel_set = set(map(str, selected_channels))
+    trace_rows = []
+    errors = []
+    for position in nearest_positions:
+        observation = source_frame.loc[int(position), "observation"]
+        distance = float(distances[int(position)])
+        weight = 1.0 / max(distance, 1e-6)
+        for item in _trace_paths(session, observation):
+            channel = _trace_channel_key(item)
+            if selected_channel_set and channel not in selected_channel_set:
+                continue
+            try:
+                voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                    item["path"],
+                    corrected,
+                    analysis,
+                    corrected_trace_key,
+                )
+                if normalize_to_peak:
+                    y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+                trace_rows.append({
+                    "phase": str(item.get("phase") or "measurement"),
+                    "channel": channel,
+                    "voltage": np.asarray(voltage, dtype=float),
+                    "current": np.asarray(y, dtype=float),
+                    "weight": weight,
+                    "iteration": int(observation.get("iteration", 0)),
+                })
+            except Exception as exc:
+                errors.append(f"{item['path'].name}: {exc}")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    if not trace_rows:
+        ax.text(.5, .5, "No nearby real SWV traces matched the selected channels.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, errors
+    colors = plt.get_cmap("tab10")(np.linspace(0, 1, max(2, len(trace_rows))))
+    for trace_index, ((phase, channel), group) in enumerate(
+        itertools.groupby(
+            sorted(trace_rows, key=lambda row: (row["phase"], _channel_sort_key(row["channel"]))),
+            key=lambda row: (row["phase"], row["channel"]),
+        )
+    ):
+        group_rows = list(group)
+        reference_voltage = group_rows[0]["voltage"]
+        weighted_current = np.zeros_like(reference_voltage, dtype=float)
+        total_weight = 0.0
+        source_iterations = []
+        for row in group_rows:
+            current = row["current"]
+            voltage = row["voltage"]
+            if len(current) != len(reference_voltage) or not np.allclose(
+                voltage,
+                reference_voltage,
+                equal_nan=True,
+            ):
+                current = np.interp(reference_voltage, voltage, current)
+            weighted_current += current * float(row["weight"])
+            total_weight += float(row["weight"])
+            source_iterations.append(row["iteration"])
+        if total_weight <= 0:
+            continue
+        weighted_current /= total_weight
+        ax.plot(
+            reference_voltage,
+            weighted_current,
+            color=colors[trace_index % len(colors)],
+            linewidth=1.5,
+            label=(
+                f"{phase} {_trace_channel_label(channel)} "
+                f"(from iters {', '.join(map(str, sorted(set(source_iterations))))})"
+            ),
+        )
+    ax.set_title(f"Interpolated simulated SWV trace ({correction_label})")
+    ax.set_xlabel("Voltage (V)")
+    ax.set_ylabel("Current")
+    ax.grid(True, alpha=.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig, errors
+
+
+def _trace_realistic_channel_measurements(
+    session: dict,
+    observations: list[dict],
+    target_params: dict[str, float],
+    selected_channels: list[str],
+    *,
+    analysis: dict,
+    nearest_count: int = 4,
+) -> tuple[dict[str, dict], list[str]]:
+    """Create trace-derived channel measurements near a simulated point."""
+    parameters = [
+        name for name in PARAMETERS
+        if name in target_params
+        and any((observation.get("params") or {}).get(name) is not None for observation in observations)
+    ]
+    if not parameters:
+        return {}, ["No parameter coordinates are available for trace interpolation."]
+    source_frame = pd.DataFrame([
+        {
+            "observation": observation,
+            **{
+                name: (observation.get("params") or {}).get(name)
+                for name in parameters
+            },
+        }
+        for observation in observations
+    ])
+    numeric_source = source_frame[parameters].apply(pd.to_numeric, errors="coerce")
+    valid_mask = numeric_source.notna().all(axis=1)
+    source_frame = source_frame.loc[valid_mask].reset_index(drop=True)
+    numeric_source = numeric_source.loc[valid_mask].reset_index(drop=True)
+    if source_frame.empty:
+        return {}, ["No real trace observations have complete coordinates."]
+    bounds = _simulation_parameter_bounds(
+        pd.concat(
+            [
+                numeric_source,
+                pd.DataFrame([{name: target_params[name] for name in parameters}]),
+            ],
+            ignore_index=True,
+        ),
+        parameters,
+        session.get("config") or {},
+    )
+    encoded_source = _simulation_encode_parameters(numeric_source, parameters, bounds)
+    encoded_target = _simulation_encode_parameters(
+        pd.DataFrame([{name: target_params[name] for name in parameters}]),
+        parameters,
+        bounds,
+    )[0]
+    distances = np.sqrt(np.sum((encoded_source - encoded_target[None, :]) ** 2, axis=1))
+    nearest_positions = np.argsort(distances)[:max(1, int(nearest_count))]
+    selected_channel_set = set(map(str, selected_channels))
+    trace_rows: list[dict] = []
+    errors: list[str] = []
+    for position in nearest_positions:
+        observation = source_frame.loc[int(position), "observation"]
+        distance = float(distances[int(position)])
+        weight = 1.0 / max(distance, 1e-6)
+        for item in _trace_paths(session, observation):
+            channel = _trace_channel_key(item)
+            if selected_channel_set and channel not in selected_channel_set:
+                continue
+            try:
+                voltage, current = _cached_swv_arrays(
+                    str(item["path"]),
+                    int(Path(item["path"]).stat().st_mtime_ns),
+                )
+                trace_rows.append({
+                    "channel": channel,
+                    "voltage": np.asarray(voltage, dtype=float),
+                    "current": np.asarray(current, dtype=float),
+                    "weight": weight,
+                    "source_iteration": int(observation.get("iteration", 0)),
+                })
+            except Exception as exc:
+                errors.append(f"{item['path'].name}: {exc}")
+    channel_measurements: dict[str, dict] = {}
+    for channel, group in itertools.groupby(
+        sorted(trace_rows, key=lambda row: _channel_sort_key(row["channel"])),
+        key=lambda row: row["channel"],
+    ):
+        group_rows = list(group)
+        if not group_rows:
+            continue
+        reference_voltage = group_rows[0]["voltage"]
+        weighted_current = np.zeros_like(reference_voltage, dtype=float)
+        total_weight = 0.0
+        source_iterations = []
+        for row in group_rows:
+            current = row["current"]
+            voltage = row["voltage"]
+            if len(current) != len(reference_voltage) or not np.allclose(
+                voltage,
+                reference_voltage,
+                equal_nan=True,
+            ):
+                current = np.interp(reference_voltage, voltage, current)
+            weighted_current += current * float(row["weight"])
+            total_weight += float(row["weight"])
+            source_iterations.append(row["source_iteration"])
+        if total_weight <= 0:
+            continue
+        weighted_current /= total_weight
+        try:
+            analyzed = analyze_swv_arrays(
+                v_raw=reference_voltage,
+                i_raw=weighted_current,
+                crop_range=(
+                    float(analysis.get("crop_min_v", -0.6)),
+                    float(analysis.get("crop_max_v", -0.2)),
+                ),
+                smooth_window=int(analysis.get("smooth_window", 9)),
+                smooth_polyorder=int(analysis.get("smooth_polyorder", 2)),
+                minima_search_window_V=float(
+                    analysis.get("minima_search_window_v", 0.30)
+                ),
+                use_prominent_minima=bool(
+                    analysis.get("use_prominent_minima", False)
+                ),
+                use_double_correction=bool(
+                    analysis.get("use_double_correction", False)
+                ),
+                min_peak_height_uA=analysis.get("min_peak_height_uA"),
+                compute_skew=True,
+                compute_wavelet_energy=True,
+                compute_wavelet_denoised_trace=bool(
+                    analysis.get("compute_wavelet_denoised_trace", False)
+                ),
+                use_wavelet_for_correction=bool(
+                    analysis.get("use_wavelet_for_correction", False)
+                ),
+            )
+            noise = float(analyzed.get("background_current_rms", np.nan))
+            peak = float(analyzed.get("peak_current", np.nan))
+            snr = peak / max(noise, 1e-12) if np.isfinite(peak) else np.nan
+            classic_q = max(0.0, float(snr)) if np.isfinite(snr) else 0.0
+            channel_measurements[str(channel)] = {
+                "voltage": reference_voltage,
+                "current": weighted_current,
+                "analysis": analyzed,
+                "classic_Q": classic_q,
+                "Q_channel": classic_q,
+                "snr": float(snr) if np.isfinite(snr) else np.nan,
+                "snr_unadjusted": float(snr) if np.isfinite(snr) else np.nan,
+                "mean_peak_current_uA": peak,
+                "background_current_rms": noise,
+                "peak_shape_score": max(0.0, 1.0 - abs(float(analyzed.get("peak_offset_norm", 0.0) or 0.0))),
+                "baseline_stability_score": 1.0 / (1.0 + max(0.0, noise)),
+                "replicate_consistency_score": 1.0,
+                "success_score": 1.0 if classic_q > 0 else 0.0,
+                "source_iterations": sorted(set(source_iterations)),
+            }
+        except Exception as exc:
+            errors.append(f"Ch {channel}: {exc}")
+    return channel_measurements, errors
+
+
+def _trace_realistic_measurement_value(
+    session: dict,
+    observations: list[dict],
+    params: dict[str, float],
+    selected_channels: list[str],
+    *,
+    analysis: dict,
+    nearest_count: int,
+) -> tuple[float, dict]:
+    channel_measurements, errors = _trace_realistic_channel_measurements(
+        session,
+        observations,
+        params,
+        selected_channels,
+        analysis=analysis,
+        nearest_count=nearest_count,
+    )
+    values = [
+        float(item.get("Q_channel", np.nan))
+        for item in channel_measurements.values()
+        if np.isfinite(float(item.get("Q_channel", np.nan)))
+    ]
+    q_run = float(np.mean(values)) if values else float("nan")
+    return q_run, {
+        "channel_measurements": channel_measurements,
+        "trace_errors": errors,
+        "simulation_fidelity": "trace-realistic",
+    }
+
+
+def _synthetic_swv_arrays(q_value: float, params: dict, iteration: int) -> tuple[np.ndarray, np.ndarray]:
+    begin = float(params.get("begin_potential", -0.7))
+    end = float(params.get("end_potential", -0.1))
+    if end <= begin:
+        begin, end = min(begin, end), max(begin, end)
+        if np.isclose(begin, end):
+            begin, end = -0.7, -0.1
+    voltage = np.linspace(begin, end, 181)
+    center = begin + 0.58 * (end - begin)
+    amplitude = max(0.02, float(params.get("amplitude", 0.04)))
+    frequency = max(1.0, float(params.get("frequency", 100.0)))
+    width = max(0.012, min(0.08, 0.018 + amplitude * 0.22))
+    baseline = 0.03 * np.sin(
+        np.linspace(0, 2.0 * np.pi, len(voltage))
+        * (1.0 + min(frequency, 1000.0) / 1000.0)
+    )
+    peak_height = max(0.05, float(q_value)) * 0.12
+    peak = peak_height * np.exp(-0.5 * ((voltage - center) / width) ** 2)
+    deterministic_noise = 0.012 * np.sin(
+        np.arange(len(voltage)) * 0.37 + int(iteration) * 0.91
+    )
+    current = baseline + peak + deterministic_noise
+    return voltage, current
+
+
+def _write_simulated_trace_record(
+    session_root: Path,
+    observation: dict,
+    *,
+    channel: int,
+) -> str:
+    iteration = int(observation.get("iteration", 0))
+    group_id = int(observation.get("group_id", 1))
+    q_value = float(observation.get("Q_run", 0.0))
+    params = dict(observation.get("params") or {})
+    raw_dir = session_root / "raw_swv" / f"group_{group_id:02d}" / f"iter_{iteration:03d}"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"ch{int(channel):03d}_measurement_simulated_swv.csv"
+    trace_measurements = (
+        (observation.get("simulation_trace_measurements") or {})
+        if isinstance(observation.get("simulation_trace_measurements"), dict)
+        else {}
+    )
+    trace_measurement = trace_measurements.get(str(channel)) or {}
+    if not trace_measurement and trace_measurements:
+        trace_measurement = next(iter(trace_measurements.values())) or {}
+    if trace_measurement:
+        voltage = np.asarray(trace_measurement.get("voltage"), dtype=float)
+        current = np.asarray(trace_measurement.get("current"), dtype=float)
+    else:
+        voltage, current = _synthetic_swv_arrays(q_value, params, iteration)
+    pd.DataFrame({
+        "Potential (V)": voltage,
+        "Current (uA)": current,
+    }).to_csv(raw_path, index=False)
+
+    analysis_dir = session_root / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    results_csv = analysis_dir / (
+        f"group_{group_id:02d}_iter_{iteration:03d}_results.csv"
+    )
+    trace_classic_q = float(trace_measurement.get("classic_Q", q_value))
+    trace_snr = float(trace_measurement.get("snr", max(0.0, q_value)))
+    pd.DataFrame([{
+        "file_path": str(raw_path),
+        "file_name": raw_path.name,
+        "channel": int(channel),
+        "phase": "measurement",
+        "classic_Q": trace_classic_q,
+        "Q_channel": trace_classic_q,
+        "snr": trace_snr,
+        "snr_unadjusted": float(
+            trace_measurement.get("snr_unadjusted", trace_snr)
+        ),
+        "mean_peak_current_uA": float(
+            trace_measurement.get(
+                "mean_peak_current_uA",
+                float(np.nanmax(current) - np.nanmin(current)),
+            )
+        ),
+        "background_current_rms": trace_measurement.get(
+            "background_current_rms"
+        ),
+        "peak_shape_score": trace_measurement.get("peak_shape_score"),
+        "baseline_stability_score": trace_measurement.get(
+            "baseline_stability_score"
+        ),
+        "replicate_consistency_score": trace_measurement.get(
+            "replicate_consistency_score"
+        ),
+        "success_score": trace_measurement.get("success_score", q_value),
+    }]).to_csv(results_csv, index=False)
+    record_path = analysis_dir / (
+        f"group_{group_id:02d}_iter_{iteration:03d}_analysis_record.json"
+    )
+    payload = {
+        "schema_version": 1,
+        "source": "simulated_bo_session_export",
+        "results_csv": str(results_csv),
+        "folders": [str(raw_dir)],
+    }
+    with record_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(record_path)
+
+
+def _simulation_surrogate_artifact_frame(
+    ground_truth: pd.DataFrame,
+    history: pd.DataFrame,
+    axes: tuple[str, str, str],
+    value_column: str = "ground_truth_value",
+) -> pd.DataFrame:
+    x_name, y_name, z_name = axes
+    frame = ground_truth.copy()
+    if value_column not in frame.columns and "interpolated_value" in frame.columns:
+        value_column = "interpolated_value"
+    if value_column not in frame.columns:
+        value_candidates = [
+            column for column in frame.columns
+            if column not in {x_name, y_name, z_name, "source_index", "candidate_index"}
+            and pd.api.types.is_numeric_dtype(frame[column])
+        ]
+        value_column = value_candidates[0] if value_candidates else frame.columns[-1]
+    for name in PARAMETERS:
+        if name not in frame.columns:
+            if "params" in frame.columns:
+                frame[name] = [
+                    (params or {}).get(name, DEFAULT_INITIAL_METHOD[name])
+                    if isinstance(params, dict) else DEFAULT_INITIAL_METHOD[name]
+                    for params in frame["params"]
+                ]
+            else:
+                frame[name] = DEFAULT_INITIAL_METHOD[name]
+    frame["predicted_mean_Q"] = pd.to_numeric(frame[value_column], errors="coerce")
+    observed = history.dropna(subset=[x_name, y_name, z_name])
+    if observed.empty:
+        frame["predicted_std_Q"] = 1.0
+        frame["already_tested"] = False
+    else:
+        candidate_coords = frame[[x_name, y_name, z_name]].apply(
+            pd.to_numeric,
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        observed_coords = observed[[x_name, y_name, z_name]].apply(
+            pd.to_numeric,
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        spans = np.nanmax(candidate_coords, axis=0) - np.nanmin(candidate_coords, axis=0)
+        spans = np.where(np.isfinite(spans) & (spans > 0), spans, 1.0)
+        distances = np.sqrt(
+            np.sum(
+                (
+                    (candidate_coords[:, None, :] - observed_coords[None, :, :])
+                    / spans[None, None, :]
+                ) ** 2,
+                axis=2,
+            )
+        )
+        nearest = np.nanmin(distances, axis=1)
+        frame["predicted_std_Q"] = np.maximum(nearest, 0.02)
+        observed_keys = {
+            tuple(round(float(row[name]), 9) for name in (x_name, y_name, z_name))
+            for _idx, row in observed.iterrows()
+        }
+        frame["already_tested"] = [
+            tuple(round(float(row[name]), 9) for name in (x_name, y_name, z_name))
+            in observed_keys
+            for _idx, row in frame.iterrows()
+        ]
+    best = float(pd.to_numeric(history.get("observed_value"), errors="coerce").max())
+    if not np.isfinite(best):
+        best = float(frame["predicted_mean_Q"].max())
+    improvement = frame["predicted_mean_Q"] - best - 0.01
+    std = np.maximum(frame["predicted_std_Q"].to_numpy(dtype=float), 1e-12)
+    z_score = improvement.to_numpy(dtype=float) / std
+    expected = improvement.to_numpy(dtype=float) * ndtr(z_score) + (
+        std * np.exp(-0.5 * z_score ** 2) / np.sqrt(2.0 * np.pi)
+    )
+    frame["acquisition_value"] = frame["predicted_mean_Q"] + 0.25 * expected
+    return frame[[*PARAMETERS, "predicted_mean_Q", "predicted_std_Q", "acquisition_value", "already_tested"]]
+
+
+def _simulation_history_row_params(
+    row: pd.Series,
+    config: dict,
+    axes: tuple[str, str, str],
+) -> dict:
+    params = {
+        name: float(
+            (config.get("initial_parameters") or {}).get(
+                name,
+                DEFAULT_INITIAL_METHOD[name],
+            )
+        )
+        for name in PARAMETERS
+    }
+    for name in axes:
+        if name in PARAMETERS and name in row and pd.notna(row[name]):
+            params[name] = float(row[name])
+    conditioning_cfg = (
+        (config.get("parameters") or {}).get("conditioning_potential")
+        or {}
+    )
+    if str(conditioning_cfg.get("mode", "")).lower() == "tied":
+        params["conditioning_potential"] = float(params["begin_potential"])
+    return params
+
+
+def _simulation_first_history_params(
+    history: pd.DataFrame,
+    config: dict,
+    axes: tuple[str, str, str],
+) -> dict:
+    if history is None or history.empty:
+        return {
+            name: float(
+                (config.get("initial_parameters") or {}).get(
+                    name,
+                    DEFAULT_INITIAL_METHOD[name],
+                )
+            )
+            for name in PARAMETERS
+        }
+    sorted_history = history.sort_values("iteration")
+    return _simulation_history_row_params(sorted_history.iloc[0], config, axes)
+
+
+def _simulation_channel_group_metadata(
+    *,
+    group_id: int,
+    name: str,
+    channels: list[int],
+    first_params: dict,
+    settings: dict | None = None,
+    exploration: float | None = None,
+    replicate: int | None = None,
+    seed: int | None = None,
+) -> dict:
+    settings = dict(settings or {})
+    falloffs = dict(settings.get("falloff_fractions") or {})
+    resolved_exploration = (
+        float(exploration)
+        if exploration is not None and np.isfinite(float(exploration))
+        else settings.get("exploration")
+    )
+    return {
+        "id": int(group_id),
+        "name": str(name),
+        "channels": [int(channel) for channel in channels],
+        "initial_parameters": {
+            name: float(value)
+            for name, value in first_params.items()
+            if name in PARAMETERS and value is not None
+        },
+        "configured_initial_parameters": dict(
+            settings.get("configured_initial_parameters") or {}
+        ),
+        "exploration": resolved_exploration,
+        "n_initial_points": settings.get("initial_random_points"),
+        "candidate_pool_size": settings.get("candidate_pool_size"),
+        "local_candidate_pool_size": settings.get("local_candidate_pool_size"),
+        "initial_point_mode": settings.get("initial_point_mode", "simulation"),
+        "use_gp": settings.get("use_gp", True),
+        "gp_optimizer_restarts": settings.get("gp_optimizer_restarts"),
+        "gp_noise_level": settings.get("noise"),
+        "gp_falloff_fractions": falloffs,
+        "gp_length_scales": falloffs,
+        "simulation_replicate": replicate,
+        "simulation_seed": seed,
+        "simulated_session": True,
+    }
+
+
+def _simulation_serializable_trace_metadata(metadata: dict) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    compact = {
+        key: value for key, value in metadata.items()
+        if key not in {"channel_measurements"}
+    }
+    channel_measurements = metadata.get("channel_measurements") or {}
+    if isinstance(channel_measurements, dict):
+        compact["channel_measurements"] = {
+            str(channel): {
+                key: value for key, value in measurement.items()
+                if key not in {"voltage", "current", "analysis"}
+            }
+            for channel, measurement in channel_measurements.items()
+            if isinstance(measurement, dict)
+        }
+    return compact
+
+
+def _write_simulated_surrogate_artifacts(
+    session_root: Path,
+    ground_truth: pd.DataFrame,
+    history: pd.DataFrame,
+    *,
+    axes: tuple[str, str, str],
+    group_id: int,
+    candidate_pool: pd.DataFrame | None = None,
+) -> None:
+    surrogate_dir = session_root / "surrogate"
+    surrogate_dir.mkdir(parents=True, exist_ok=True)
+    artifact_source = (
+        candidate_pool
+        if candidate_pool is not None and not candidate_pool.empty
+        else ground_truth
+    )
+    for iteration in sorted(pd.to_numeric(history["iteration"], errors="coerce").dropna().astype(int).unique()):
+        partial_history = history[
+            pd.to_numeric(history["iteration"], errors="coerce") <= iteration
+        ]
+        artifact = _simulation_surrogate_artifact_frame(
+            artifact_source,
+            partial_history,
+            axes,
+        )
+        artifact.to_csv(
+            surrogate_dir / f"group_{int(group_id):02d}_iter_{int(iteration):03d}_candidate_predictions.csv",
+            index=False,
+        )
+
+
+def _write_simulated_bo_session(
+    output_parent: Path,
+    source_session: dict,
+    history: pd.DataFrame,
+    ground_truth: pd.DataFrame,
+    *,
+    run_label: str,
+    value_label: str,
+    axes: tuple[str, str, str],
+    source_points: pd.DataFrame | None = None,
+    candidate_pool: pd.DataFrame | None = None,
+    simulation_settings: dict | None = None,
+    exploration: float | None = None,
+    replicate: int | None = None,
+    seed: int | None = None,
+) -> Path:
+    if history.empty:
+        raise ValueError("Cannot write an empty simulation history.")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", str(run_label)).strip("_")
+    safe_label = safe_label or "simulation"
+    output_parent.mkdir(parents=True, exist_ok=True)
+    session_root = output_parent / f"bo_session_simulated_{timestamp}_{safe_label}"
+    suffix = 2
+    while session_root.exists():
+        session_root = output_parent / (
+            f"bo_session_simulated_{timestamp}_{safe_label}_{suffix}"
+        )
+        suffix += 1
+    session_root.mkdir(parents=True, exist_ok=False)
+
+    config = json.loads(json.dumps(source_session.get("config") or {}))
+    config.setdefault("name", "Simulated BO session")
+    config.setdefault("records", {})["simulated_session"] = True
+    config.setdefault("acquisition", {})
+    simulation_settings = dict(simulation_settings or {})
+    if exploration is not None and np.isfinite(float(exploration)):
+        config["acquisition"]["exploration"] = float(exploration)
+    if simulation_settings.get("initial_random_points") is not None:
+        config["n_initial_points"] = int(simulation_settings["initial_random_points"])
+    for setting_key, config_key in (
+        ("candidate_pool_size", "candidate_pool_size"),
+        ("local_candidate_pool_size", "local_candidate_pool_size"),
+        ("noise", "gp_noise_level"),
+        ("use_gp", "use_gp"),
+        ("gp_optimizer_restarts", "gp_optimizer_restarts"),
+    ):
+        if simulation_settings.get(setting_key) is not None:
+            config["acquisition"][config_key] = simulation_settings[setting_key]
+    if simulation_settings.get("falloff_fractions"):
+        config["acquisition"]["gp_falloff_fractions"] = dict(
+            simulation_settings["falloff_fractions"]
+        )
+        config["acquisition"]["gp_length_scales"] = dict(
+            simulation_settings["falloff_fractions"]
+        )
+    if seed is not None:
+        config["random_seed"] = int(seed)
+    ground_truth_channel = (
+        simulation_settings.get("ground_truth_channel")
+        if simulation_settings.get("ground_truth_channel") is not None
+        else (
+            str(history["ground_truth_channel"].dropna().iloc[0])
+            if "ground_truth_channel" in history.columns
+            and not history["ground_truth_channel"].dropna().empty
+            else None
+        )
+    )
+    group_name = str(run_label)
+    first_params = _simulation_first_history_params(history, config, axes)
+    config["initial_parameters"] = dict(first_params)
+    group_metadata = _simulation_channel_group_metadata(
+        group_id=1,
+        name=group_name,
+        channels=[1],
+        first_params=first_params,
+        settings=simulation_settings,
+        exploration=exploration,
+        replicate=replicate,
+        seed=seed,
+    )
+    config["channel_groups"] = [group_metadata]
+    config["channels"] = [1]
+
+    observations = []
+    history_rows = []
+    x_name, y_name, z_name = axes
+    for _index, row in history.sort_values("iteration").iterrows():
+        params = _simulation_history_row_params(row, config, axes)
+        iteration = int(row["iteration"])
+        q_run = float(row["observed_value"])
+        measurement_metadata = (
+            row.get("measurement_metadata")
+            if isinstance(row.get("measurement_metadata"), dict)
+            else {}
+        )
+        observation = {
+            "iteration": iteration,
+            "method_id": f"simulated_iter_{iteration:03d}",
+            "params": params,
+            "created_at": timestamp,
+            "completed_at": timestamp,
+            "status": "completed",
+            "group_id": 1,
+            "group_name": group_name,
+            "channels": [1],
+            "objective": "simulation",
+            "Q_run": q_run,
+            "quality": {
+                "Q_run": q_run,
+                "channel_components": {
+                    "1": {
+                        "Q_channel": q_run,
+                        "classic_Q": q_run,
+                        "snr_score": q_run,
+                        "normalized_SNR": q_run,
+                    }
+                },
+                "simulation_metric": value_label,
+                "simulation_run_label": run_label,
+                "simulation_exploration": (
+                    float(exploration)
+                    if exploration is not None and np.isfinite(float(exploration))
+                    else None
+                ),
+                "simulation_replicate": replicate,
+                "simulation_seed": seed,
+                "ground_truth_channel": ground_truth_channel,
+                "selection_mode": row.get("selection_mode"),
+                "predicted_mean_Q": (
+                    float(row["predicted_mean"])
+                    if "predicted_mean" in row and pd.notna(row["predicted_mean"])
+                    else None
+                ),
+                "predicted_std_Q": (
+                    float(row["predicted_std"])
+                    if "predicted_std" in row and pd.notna(row["predicted_std"])
+                    else None
+                ),
+                "acquisition_value": (
+                    float(row["acquisition_value"])
+                    if "acquisition_value" in row and pd.notna(row["acquisition_value"])
+                    else None
+                ),
+            },
+            "channel_metrics": {
+                "1": {
+                    "Q_channel": q_run,
+                    "classic_Q": q_run,
+                    "snr": max(0.0, q_run),
+                    "snr_unadjusted": max(0.0, q_run),
+                    "success_score": q_run,
+                    "mean_peak_current_uA": q_run,
+                    "peak_shape_score": q_run,
+                    "baseline_stability_score": q_run,
+                    "replicate_consistency_score": q_run,
+                }
+            },
+            "simulation_truth": {
+                "ground_truth_metric": value_label,
+                "ground_truth_value": q_run,
+                "tensor_value": (
+                    float(row["tensor_value"])
+                    if "tensor_value" in row and pd.notna(row["tensor_value"])
+                    else q_run
+                ),
+                "run_label": run_label,
+                "exploration": exploration,
+                "replicate": replicate,
+                "seed": seed,
+                "ground_truth_channel": ground_truth_channel,
+                **_simulation_serializable_trace_metadata(measurement_metadata),
+            },
+        }
+        transient_trace_measurements = measurement_metadata.get(
+            "channel_measurements",
+            {},
+        )
+        if transient_trace_measurements:
+            observation["simulation_trace_measurements"] = transient_trace_measurements
+        observation["analysis_record"] = _write_simulated_trace_record(
+            session_root,
+            observation,
+            channel=1,
+        )
+        observation.pop("simulation_trace_measurements", None)
+        observations.append(observation)
+        history_row = {
+            "iteration": iteration,
+            "group_id": 1,
+            "group_name": group_name,
+            "channels": "1",
+            "Q_run": q_run,
+            "objective": "simulation",
+            "completed_at": timestamp,
+            "selection_mode": row.get("selection_mode"),
+            "exploration": exploration,
+            "replicate": replicate,
+            "seed": seed,
+            "initial_random_points": simulation_settings.get("initial_random_points"),
+            "gp_falloff_parameter": row.get("gp_falloff_parameter"),
+            "gp_falloff_value": row.get("gp_falloff_value"),
+            "run_label": run_label,
+            "ground_truth_channel": ground_truth_channel,
+            "best_so_far": float(row.get("best_so_far", q_run)),
+            "predicted_mean_Q": row.get("predicted_mean"),
+            "predicted_std_Q": row.get("predicted_std"),
+            "acquisition_value": row.get("acquisition_value"),
+        }
+        history_row.update(params)
+        if "tensor_value" in row and pd.notna(row["tensor_value"]):
+            history_row["tensor_value"] = float(row["tensor_value"])
+        history_rows.append(history_row)
+
+    best_observation = max(
+        observations,
+        key=lambda observation: float(observation.get("Q_run", 0.0)),
+    )
+    ground_truth_optimum = _simulation_optimum_reference_from_frame(ground_truth)
+    state = {
+        "session_id": f"simulated_{timestamp}_{safe_label}",
+        "record_dir": str(session_root),
+        "analysis_output_dir": str(session_root / "analysis"),
+        "candidate_count": int(
+            len(candidate_pool)
+            if candidate_pool is not None and not candidate_pool.empty
+            else len(ground_truth)
+        ),
+        "active_parameters": list(axes),
+        "channel_groups": [group_metadata],
+        "pending": None,
+        "pending_batch": [],
+        "suggestions": [],
+        "observations": observations,
+        "best_observation": best_observation,
+        "simulation_metadata": {
+            "source_session": str(source_session.get("root")),
+            "run_label": run_label,
+            "value_label": value_label,
+            "axes": list(axes),
+            "ground_truth_optimum": ground_truth_optimum,
+            "exploration": exploration,
+            "replicate": replicate,
+            "seed": seed,
+            "ground_truth_channel": ground_truth_channel,
+            "settings": simulation_settings,
+            "ground_truth_rows": int(len(ground_truth)),
+            "candidate_pool_rows": int(
+                len(candidate_pool)
+                if candidate_pool is not None and not candidate_pool.empty
+                else len(ground_truth)
+            ),
+        },
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with (session_root / "bo_state.json").open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+    with (session_root / "bo_config_snapshot.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+    pd.DataFrame(history_rows).to_csv(session_root / "history.csv", index=False)
+    ground_truth.to_csv(session_root / "simulation_ground_truth_tensor.csv", index=False)
+    if source_points is not None and not source_points.empty:
+        source_points.to_csv(session_root / "simulation_source_observations.csv", index=False)
+    _write_simulated_surrogate_artifacts(
+        session_root,
+        ground_truth,
+        history,
+        axes=axes,
+        group_id=1,
+        candidate_pool=candidate_pool,
+    )
+    return session_root
+
+
+def _write_simulated_bo_session_bundle(
+    output_parent: Path,
+    source_session: dict,
+    runs: list[dict],
+    ground_truth: pd.DataFrame,
+    *,
+    value_label: str,
+    axes: tuple[str, str, str],
+    source_points: pd.DataFrame | None = None,
+    candidate_pool: pd.DataFrame | None = None,
+    simulation_settings: dict | None = None,
+) -> Path:
+    nonempty_runs = [
+        run for run in runs
+        if run.get("history") is not None and not run["history"].empty
+    ]
+    if not nonempty_runs:
+        raise ValueError("Cannot write an empty simulation sweep.")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_parent.mkdir(parents=True, exist_ok=True)
+    session_root = output_parent / f"bo_session_simulated_{timestamp}_sweep"
+    suffix = 2
+    while session_root.exists():
+        session_root = output_parent / f"bo_session_simulated_{timestamp}_sweep_{suffix}"
+        suffix += 1
+    session_root.mkdir(parents=True, exist_ok=False)
+
+    config = json.loads(json.dumps(source_session.get("config") or {}))
+    config.setdefault("name", "Simulated BO sweep session")
+    config.setdefault("records", {})["simulated_session"] = True
+    config.setdefault("acquisition", {})
+    simulation_settings = dict(simulation_settings or {})
+    if simulation_settings.get("initial_random_points") is not None:
+        config["n_initial_points"] = int(simulation_settings["initial_random_points"])
+    for setting_key, config_key in (
+        ("candidate_pool_size", "candidate_pool_size"),
+        ("local_candidate_pool_size", "local_candidate_pool_size"),
+        ("noise", "gp_noise_level"),
+        ("use_gp", "use_gp"),
+        ("gp_optimizer_restarts", "gp_optimizer_restarts"),
+    ):
+        if simulation_settings.get(setting_key) is not None:
+            config["acquisition"][config_key] = simulation_settings[setting_key]
+    if simulation_settings.get("falloff_fractions"):
+        config["acquisition"]["gp_falloff_fractions"] = dict(
+            simulation_settings["falloff_fractions"]
+        )
+        config["acquisition"]["gp_length_scales"] = dict(
+            simulation_settings["falloff_fractions"]
+        )
+    channel_groups = []
+    observations = []
+    history_rows = []
+    x_name, y_name, z_name = axes
+    for run_index, run in enumerate(nonempty_runs, start=1):
+        group_id = run_index
+        channel = run_index
+        run_label = str(run.get("label") or f"Simulation {run_index}")
+        exploration = run.get("exploration")
+        replicate = run.get("replicate")
+        seed = run.get("seed")
+        run_settings = dict(simulation_settings)
+        if run.get("initial_random_points") is not None:
+            run_settings["initial_random_points"] = int(
+                run["initial_random_points"]
+            )
+        if run.get("falloff_fractions"):
+            run_settings["falloff_fractions"] = dict(run["falloff_fractions"])
+        ground_truth_channel = run.get("ground_truth_channel")
+        if ground_truth_channel is not None:
+            run_settings["ground_truth_channel"] = str(ground_truth_channel)
+        first_params = _simulation_first_history_params(
+            run["history"],
+            config,
+            axes,
+        )
+        group_metadata = _simulation_channel_group_metadata(
+            group_id=group_id,
+            name=run_label,
+            channels=[channel],
+            first_params=first_params,
+            settings=run_settings,
+            exploration=exploration,
+            replicate=replicate,
+            seed=seed,
+        )
+        channel_groups.append(group_metadata)
+        for _row_index, row in run["history"].sort_values("iteration").iterrows():
+            params = _simulation_history_row_params(row, config, axes)
+            iteration = int(row["iteration"])
+            q_run = float(row["observed_value"])
+            measurement_metadata = (
+                row.get("measurement_metadata")
+                if isinstance(row.get("measurement_metadata"), dict)
+                else {}
+            )
+            quality = {
+                "Q_run": q_run,
+                "simulation_metric": value_label,
+                "simulation_run_label": run_label,
+                "simulation_exploration": (
+                    float(exploration)
+                    if exploration is not None and np.isfinite(float(exploration))
+                    else None
+                ),
+                "simulation_replicate": replicate,
+                "simulation_seed": seed,
+                "ground_truth_channel": (
+                    str(ground_truth_channel)
+                    if ground_truth_channel is not None
+                    else None
+                ),
+                "selection_mode": row.get("selection_mode"),
+                "channel_components": {
+                    str(channel): {
+                        "Q_channel": q_run,
+                        "classic_Q": q_run,
+                        "snr_score": q_run,
+                        "normalized_SNR": q_run,
+                    }
+                },
+            }
+            for source_column, target_key in (
+                ("predicted_mean", "predicted_mean_Q"),
+                ("predicted_std", "predicted_std_Q"),
+                ("acquisition_value", "acquisition_value"),
+            ):
+                if source_column in row and pd.notna(row[source_column]):
+                    quality[target_key] = float(row[source_column])
+            observation = {
+                "iteration": iteration,
+                "method_id": (
+                    f"simulated_group_{group_id:02d}_iter_{iteration:03d}"
+                ),
+                "params": params,
+                "created_at": timestamp,
+                "completed_at": timestamp,
+                "status": "completed",
+                "group_id": group_id,
+                "group_name": run_label,
+                "channels": [channel],
+                "objective": "simulation",
+                "Q_run": q_run,
+                "quality": quality,
+                "channel_metrics": {
+                    str(channel): {
+                        "Q_channel": q_run,
+                        "classic_Q": q_run,
+                        "snr": max(0.0, q_run),
+                        "snr_unadjusted": max(0.0, q_run),
+                        "success_score": q_run,
+                        "mean_peak_current_uA": q_run,
+                        "peak_shape_score": q_run,
+                        "baseline_stability_score": q_run,
+                        "replicate_consistency_score": q_run,
+                    }
+                },
+                "simulation_truth": {
+                    "ground_truth_metric": value_label,
+                    "ground_truth_value": q_run,
+                    "tensor_value": (
+                        float(row["tensor_value"])
+                        if "tensor_value" in row and pd.notna(row["tensor_value"])
+                        else q_run
+                    ),
+                    "run_label": run_label,
+                    "ground_truth_channel": (
+                        str(ground_truth_channel)
+                        if ground_truth_channel is not None
+                        else None
+                    ),
+                    "exploration": exploration,
+                    "replicate": replicate,
+                    "seed": seed,
+                    **_simulation_serializable_trace_metadata(measurement_metadata),
+                },
+            }
+            transient_trace_measurements = measurement_metadata.get(
+                "channel_measurements",
+                {},
+            )
+            if transient_trace_measurements:
+                observation["simulation_trace_measurements"] = transient_trace_measurements
+            observation["analysis_record"] = _write_simulated_trace_record(
+                session_root,
+                observation,
+                channel=channel,
+            )
+            observation.pop("simulation_trace_measurements", None)
+            observations.append(observation)
+            history_row = {
+                "iteration": iteration,
+                "group_id": group_id,
+                "group_name": run_label,
+                "channels": str(channel),
+                "Q_run": q_run,
+                "objective": "simulation",
+                "completed_at": timestamp,
+                "selection_mode": row.get("selection_mode"),
+                "exploration": exploration,
+                "replicate": replicate,
+                "seed": seed,
+                "initial_random_points": run_settings.get("initial_random_points"),
+                "gp_falloff_parameter": run.get("gp_falloff_parameter"),
+                "gp_falloff_value": run.get("gp_falloff_value"),
+                "run_label": run_label,
+                "ground_truth_channel": (
+                    str(ground_truth_channel)
+                    if ground_truth_channel is not None
+                    else None
+                ),
+                "best_so_far": float(row.get("best_so_far", q_run)),
+                "Q_ch1": q_run,
+            }
+            for source_column, target_column in (
+                ("predicted_mean", "predicted_mean_Q"),
+                ("predicted_std", "predicted_std_Q"),
+                ("acquisition_value", "acquisition_value"),
+            ):
+                history_row[target_column] = row.get(source_column)
+            if "tensor_value" in row and pd.notna(row["tensor_value"]):
+                history_row["tensor_value"] = float(row["tensor_value"])
+            history_row.update(params)
+            history_rows.append(history_row)
+
+    config["channel_groups"] = channel_groups
+    config["channels"] = [group["channels"][0] for group in channel_groups]
+    if channel_groups:
+        config["initial_parameters"] = dict(channel_groups[0]["initial_parameters"])
+    best_observation = max(
+        observations,
+        key=lambda observation: float(observation.get("Q_run", 0.0)),
+    )
+    ground_truth_optimum = _simulation_optimum_reference_from_frame(ground_truth)
+    state = {
+        "session_id": f"simulated_{timestamp}_sweep",
+        "record_dir": str(session_root),
+        "analysis_output_dir": str(session_root / "analysis"),
+        "candidate_count": int(
+            len(candidate_pool)
+            if candidate_pool is not None and not candidate_pool.empty
+            else len(ground_truth)
+        ),
+        "active_parameters": list(axes),
+        "channel_groups": channel_groups,
+        "pending": None,
+        "pending_batch": [],
+        "suggestions": [],
+        "observations": observations,
+        "best_observation": best_observation,
+        "simulation_metadata": {
+            "source_session": str(source_session.get("root")),
+            "value_label": value_label,
+            "axes": list(axes),
+            "ground_truth_optimum": ground_truth_optimum,
+            "run_count": len(nonempty_runs),
+            "settings": simulation_settings,
+            "ground_truth_rows": int(len(ground_truth)),
+            "candidate_pool_rows": int(
+                len(candidate_pool)
+                if candidate_pool is not None and not candidate_pool.empty
+                else len(ground_truth)
+            ),
+        },
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with (session_root / "bo_state.json").open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+    with (session_root / "bo_config_snapshot.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+    pd.DataFrame(history_rows).to_csv(session_root / "history.csv", index=False)
+    ground_truth.to_csv(session_root / "simulation_ground_truth_tensor.csv", index=False)
+    if source_points is not None and not source_points.empty:
+        source_points.to_csv(session_root / "simulation_source_observations.csv", index=False)
+    for group_id, run in enumerate(nonempty_runs, start=1):
+        run_ground_truth = run.get("ground_truth")
+        if run_ground_truth is None or run_ground_truth.empty:
+            run_ground_truth = ground_truth
+        run_channel = run.get("ground_truth_channel")
+        run_candidate_pool = candidate_pool
+        if (
+            run_channel is not None
+            and run_candidate_pool is not None
+            and not run_candidate_pool.empty
+            and "ground_truth_channel" in run_candidate_pool.columns
+        ):
+            run_candidate_pool = run_candidate_pool[
+                run_candidate_pool["ground_truth_channel"].astype(str)
+                == str(run_channel)
+            ].copy()
+        _write_simulated_surrogate_artifacts(
+            session_root,
+            run_ground_truth,
+            run["history"],
+            axes=axes,
+            group_id=group_id,
+            candidate_pool=run_candidate_pool,
+        )
+    return session_root
+
+
+def _simulation_run_summary_frame(runs: list[dict]) -> pd.DataFrame:
+    rows = []
+    for run in runs:
+        history = run.get("history")
+        if history is None or history.empty:
+            continue
+        best_row = history.loc[history["observed_value"].idxmax()]
+        final_best = float(history["best_so_far"].iloc[-1])
+        threshold = 0.95 * final_best
+        reached = history[history["best_so_far"] >= threshold]
+        rows.append({
+            "run_label": str(run.get("label") or "Simulation"),
+            "ground_truth_channel": run.get("ground_truth_channel"),
+            "exploration": run.get("exploration"),
+            "initial_random_points": run.get("initial_random_points"),
+            "gp_falloff_parameter": run.get("gp_falloff_parameter"),
+            "gp_falloff_value": run.get("gp_falloff_value"),
+            "repeat_index": run.get("repeat_index"),
+            "repeat_count": run.get("repeat_count"),
+            "replicate": run.get("replicate"),
+            "seed": run.get("seed"),
+            "best_fitness": float(best_row["observed_value"]),
+            "best_iteration": int(best_row["iteration"]),
+            "final_best": final_best,
+            "iteration_to_95_percent_final": (
+                int(reached["iteration"].iloc[0])
+                if not reached.empty else np.nan
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def _write_compact_simulated_sweep_session(
+    output_parent: Path,
+    source_session: dict,
+    runs: list[dict],
+    *,
+    value_label: str,
+    axes: tuple[str, str, str],
+    simulation_settings: dict | None = None,
+) -> Path:
+    nonempty_runs = [
+        run for run in runs
+        if run.get("history") is not None and not run["history"].empty
+    ]
+    if not nonempty_runs:
+        raise ValueError("Cannot write an empty simulation sweep.")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_parent.mkdir(parents=True, exist_ok=True)
+    session_root = output_parent / f"bo_session_simulated_{timestamp}_compact_sweep"
+    suffix = 2
+    while session_root.exists():
+        session_root = output_parent / (
+            f"bo_session_simulated_{timestamp}_compact_sweep_{suffix}"
+        )
+        suffix += 1
+    session_root.mkdir(parents=True, exist_ok=False)
+
+    config = json.loads(json.dumps(source_session.get("config") or {}))
+    config.setdefault("name", "Compact simulated BO sweep")
+    config.setdefault("records", {})["simulated_session"] = True
+    config.setdefault("records", {})["compact_simulation_export"] = True
+    config.setdefault("acquisition", {})
+    simulation_settings = dict(simulation_settings or {})
+    for setting_key, config_key in (
+        ("candidate_pool_size", "candidate_pool_size"),
+        ("local_candidate_pool_size", "local_candidate_pool_size"),
+        ("noise", "gp_noise_level"),
+        ("use_gp", "use_gp"),
+        ("gp_optimizer_restarts", "gp_optimizer_restarts"),
+    ):
+        if simulation_settings.get(setting_key) is not None:
+            config["acquisition"][config_key] = simulation_settings[setting_key]
+
+    history_rows = []
+    channel_groups = []
+    x_name, y_name, z_name = axes
+    for run_index, run in enumerate(nonempty_runs, start=1):
+        group_id = run_index
+        channel = run_index
+        run_label = str(run.get("label") or f"Simulation {run_index}")
+        exploration = run.get("exploration")
+        run_settings = dict(simulation_settings)
+        if run.get("initial_random_points") is not None:
+            run_settings["initial_random_points"] = int(run["initial_random_points"])
+        if run.get("falloff_fractions"):
+            run_settings["falloff_fractions"] = dict(run["falloff_fractions"])
+        first_params = _simulation_first_history_params(
+            run["history"],
+            config,
+            axes,
+        )
+        channel_groups.append(_simulation_channel_group_metadata(
+            group_id=group_id,
+            name=run_label,
+            channels=[channel],
+            first_params=first_params,
+            settings=run_settings,
+            exploration=exploration,
+            replicate=run.get("replicate"),
+            seed=run.get("seed"),
+        ))
+        for _row_index, row in run["history"].sort_values("iteration").iterrows():
+            params = _simulation_history_row_params(row, config, axes)
+            q_run = float(row["observed_value"])
+            history_row = {
+                "iteration": int(row["iteration"]),
+                "group_id": group_id,
+                "group_name": run_label,
+                "channels": str(channel),
+                "Q_run": q_run,
+                f"Q_ch{channel}": q_run,
+                "objective": "compact_simulation",
+                "completed_at": timestamp,
+                "selection_mode": row.get("selection_mode"),
+                "exploration": exploration,
+                "initial_random_points": run_settings.get("initial_random_points"),
+                "gp_falloff_parameter": run.get("gp_falloff_parameter"),
+                "gp_falloff_value": run.get("gp_falloff_value"),
+                "repeat_index": run.get("repeat_index"),
+                "repeat_count": run.get("repeat_count"),
+                "replicate": run.get("replicate"),
+                "seed": run.get("seed"),
+                "run_label": run_label,
+                "ground_truth_channel": run.get("ground_truth_channel"),
+                "best_so_far": float(row.get("best_so_far", q_run)),
+                "predicted_mean_Q": row.get("predicted_mean"),
+                "predicted_std_Q": row.get("predicted_std"),
+                "acquisition_value": row.get("acquisition_value"),
+                "tensor_value": row.get("tensor_value"),
+            }
+            history_row.update(params)
+            history_rows.append(history_row)
+
+    config["channel_groups"] = channel_groups
+    config["channels"] = [group["channels"][0] for group in channel_groups]
+    if channel_groups:
+        config["initial_parameters"] = dict(channel_groups[0]["initial_parameters"])
+    summary = _simulation_run_summary_frame(nonempty_runs)
+    history_frame = pd.DataFrame(history_rows)
+    state = {
+        "session_id": f"simulated_{timestamp}_compact_sweep",
+        "record_dir": str(session_root),
+        "analysis_output_dir": str(session_root / "analysis"),
+        "candidate_count": None,
+        "active_parameters": list(axes),
+        "channel_groups": channel_groups,
+        "pending": None,
+        "pending_batch": [],
+        "suggestions": [],
+        "observations": [],
+        "best_observation": {},
+        "simulation_metadata": {
+            "source_session": str(source_session.get("root")),
+            "value_label": value_label,
+            "axes": list(axes),
+            "run_count": len(nonempty_runs),
+            "settings": simulation_settings,
+            "compact_export": True,
+            "omitted_files": [
+                "raw_swv",
+                "analysis records",
+                "surrogate artifacts",
+                "ground-truth tensor CSV",
+                "source observation CSV",
+            ],
+        },
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with (session_root / "bo_state.json").open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+    with (session_root / "bo_config_snapshot.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+    history_frame.to_csv(session_root / "history.csv", index=False)
+    summary.to_csv(session_root / "simulation_run_summary.csv", index=False)
+    return session_root
+
+
+def _simulated_bo_sessions_parent(session_root: Path, search_root: Path) -> Path:
+    """Return the experiment-level bo_sessions folder for simulated exports."""
+    session_root = Path(session_root).resolve()
+    search_root = Path(search_root).resolve()
+    if session_root.parent.name == "bo_sessions":
+        return session_root.parent
+    if search_root.name == "bo_sessions":
+        return search_root
+    search_bo_sessions = search_root / "bo_sessions"
+    if search_bo_sessions.exists() or not (search_root / "bo_state.json").is_file():
+        return search_bo_sessions
+    return session_root.parent / "bo_sessions"
 
 
 def _session_parameter_context(observations: list[dict]) -> str:
@@ -3628,17 +8544,30 @@ def _swv_global_y_limits(
     analysis: dict,
     normalize_to_peak: bool,
     corrected_trace_key: str,
+    selected_phases: tuple[str, ...] | None = None,
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
 ) -> tuple[float, float] | None:
     if normalize_to_peak:
         return (-0.2, 1.2)
     values = []
     selected_channel_set = set(selected_channels)
+    selected_phase_set = (
+        {str(phase).lower() for phase in selected_phases}
+        if selected_phases is not None
+        else None
+    )
     for observation in trace_observations:
         for item in _trace_paths(session, observation):
             if item["channel"] not in selected_channel_set:
                 continue
+            if (
+                selected_phase_set is not None
+                and str(item.get("phase", "")).lower() not in selected_phase_set
+            ):
+                continue
             try:
-                _voltage, y, _peak_idx, _left_idx, _right_idx = _swv_trace_arrays(
+                voltage, y, _peak_idx, _left_idx, _right_idx = _swv_trace_arrays(
                     item["path"],
                     corrected,
                     analysis,
@@ -3646,7 +8575,15 @@ def _swv_global_y_limits(
                 )
             except Exception:
                 continue
+            voltage = np.asarray(voltage, dtype=float)
             y = np.asarray(y, dtype=float)
+            if voltage_min is not None or voltage_max is not None:
+                voltage_mask = np.isfinite(voltage)
+                if voltage_min is not None:
+                    voltage_mask &= voltage >= float(voltage_min)
+                if voltage_max is not None:
+                    voltage_mask &= voltage <= float(voltage_max)
+                y = y[voltage_mask]
             finite = y[np.isfinite(y)]
             if len(finite):
                 values.append(finite)
@@ -3691,6 +8628,8 @@ def _plot_traces(
     trace_items: list[dict] | None = None,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
 ):
     traces = [
         item for item in (
@@ -3722,6 +8661,20 @@ def _plot_traces(
             )
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+            voltage = np.asarray(voltage, dtype=float)
+            y = np.asarray(y, dtype=float)
+            if voltage_min is not None or voltage_max is not None:
+                voltage_mask = np.isfinite(voltage) & np.isfinite(y)
+                if voltage_min is not None:
+                    voltage_mask &= voltage >= float(voltage_min)
+                if voltage_max is not None:
+                    voltage_mask &= voltage <= float(voltage_max)
+                if not voltage_mask.any():
+                    raise ValueError(
+                        "Trace has no points inside the selected voltage crop."
+                    )
+                voltage = voltage[voltage_mask]
+                y = y[voltage_mask]
             channel_label = _trace_channel_label(_trace_channel_key(item))
             trace_label = f"{phase} {channel_label}: {path.stem}"
             ax.plot(
@@ -3797,6 +8750,8 @@ def _plot_iteration_trace_overlay(
     selection_label: str,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
 ):
     """Overlay traces from many observations with channel-aware colors."""
     entries = [
@@ -3860,6 +8815,20 @@ def _plot_iteration_trace_overlay(
             )
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+            voltage = np.asarray(voltage, dtype=float)
+            y = np.asarray(y, dtype=float)
+            if voltage_min is not None or voltage_max is not None:
+                voltage_mask = np.isfinite(voltage) & np.isfinite(y)
+                if voltage_min is not None:
+                    voltage_mask &= voltage >= float(voltage_min)
+                if voltage_max is not None:
+                    voltage_mask &= voltage <= float(voltage_max)
+                if not voltage_mask.any():
+                    raise ValueError(
+                        "Trace has no points inside the selected voltage crop."
+                    )
+                voltage = voltage[voltage_mask]
+                y = y[voltage_mask]
             ax.plot(
                 voltage,
                 y,
@@ -3961,37 +8930,79 @@ def _plot_iteration_trace_overlay(
     return fig, errors
 
 
-def _plot_chronological_swv_stack(
+def _chronological_swv_stack_entries(
     trace_entries: list[tuple[dict, dict]],
     corrected: bool,
     selected_channels: list[str],
     analysis: dict,
-    correction_label: str,
-    selection_label: str,
+    config: dict,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
-    x_offset_per_iteration: float | None = None,
-    y_offset_per_iteration: float | None = None,
     trace_height_scale: float = 1.0,
-):
-    """Render SWVs as a diagonal chronological stack."""
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
+    current_min: float | None = None,
+    current_max: float | None = None,
+    selected_phases: tuple[str, ...] | None = None,
+) -> tuple[list[dict], list[str], list[tuple[dict, dict]]]:
+    batch_size = max(1, int((config or {}).get("paired_batch_size", 1) or 1))
+    phase_filter = (
+        {phase.lower() for phase in selected_phases}
+        if selected_phases is not None
+        else None
+    )
+
+    def stack_sort_key(pair: tuple[dict, dict]) -> tuple:
+        observation, item = pair
+        iteration = int(observation.get("iteration", 0) or 0)
+        group_id = int(observation.get("group_id", 1) or 1)
+        channel_key = _channel_sort_key(_trace_channel_key(item))
+        paired = str(observation.get("objective") or "").lower() == "paired_response"
+        if not paired:
+            return (
+                group_id,
+                iteration,
+                channel_key,
+                str(item.get("phase", "")),
+            )
+        cycle = observation.get("paired_cycle")
+        if cycle in (None, ""):
+            cycle = ((iteration - 1) // batch_size) + 1
+        batch = observation.get("paired_batch_index")
+        if batch in (None, ""):
+            batch = ((iteration - 1) % batch_size) + 1
+        phase = str(item.get("phase", "")).lower()
+        phase_order = {"buffer": 0, "target": 1}.get(phase, 2)
+        trace = observation.get(f"{phase}_trace_number")
+        try:
+            trace_value = int(trace)
+        except (TypeError, ValueError):
+            trace_value = int(batch)
+        return (
+            group_id,
+            int(cycle),
+            phase_order,
+            trace_value,
+            int(batch),
+            iteration,
+            channel_key,
+        )
+
     entries = sorted(
         [
             (observation, item)
             for observation, item in trace_entries
             if _trace_channel_key(item) in selected_channels
+            and (
+                phase_filter is None
+                or str(item.get("phase", "")).lower() in phase_filter
+            )
         ],
-        key=lambda pair: (
-            int(pair[0].get("group_id", 1)),
-            int(pair[0].get("iteration", 0)),
-            _channel_sort_key(_trace_channel_key(pair[1])),
-            str(pair[1].get("phase", "")),
-        ),
+        key=stack_sort_key,
     )
-    fig, ax = plt.subplots(figsize=(9, 5.5))
     errors = []
     loaded = []
-    for observation, item in entries:
+    for stack_index, (observation, item) in enumerate(entries):
         phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
         try:
             voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
@@ -4007,25 +9018,74 @@ def _plot_chronological_swv_stack(
             finite = np.isfinite(voltage) & np.isfinite(y)
             if not finite.any():
                 raise ValueError("Trace has no finite voltage/current values.")
+            voltage = voltage[finite]
+            y = y[finite]
+            if voltage_min is not None or voltage_max is not None:
+                voltage_mask = np.ones_like(voltage, dtype=bool)
+                if voltage_min is not None:
+                    voltage_mask &= voltage >= float(voltage_min)
+                if voltage_max is not None:
+                    voltage_mask &= voltage <= float(voltage_max)
+                if not voltage_mask.any():
+                    raise ValueError(
+                        "Trace has no points inside the selected voltage crop."
+                    )
+                voltage = voltage[voltage_mask]
+                y = y[voltage_mask]
+            current = y * float(trace_height_scale)
+            if current_min is not None or current_max is not None:
+                current_mask = np.ones_like(current, dtype=bool)
+                if current_min is not None:
+                    current_mask &= current >= float(current_min)
+                if current_max is not None:
+                    current_mask &= current <= float(current_max)
+                if not current_mask.any():
+                    raise ValueError(
+                        "Trace has no points inside the selected current crop."
+                    )
+                voltage = voltage[current_mask]
+                current = current[current_mask]
             loaded.append({
                 "iteration": int(observation.get("iteration", 0)),
+                "stack_index": stack_index,
                 "phase": str(phase),
                 "channel": channel,
-                "voltage": voltage[finite],
-            "current": y[finite] * float(trace_height_scale),
-        })
+                "voltage": voltage,
+                "current": current,
+            })
         except Exception as exc:
             errors.append(f"{path.name}: {exc}")
+    return loaded, errors, entries
 
+
+def _chronological_swv_stack_display_bounds(
+    loaded: list[dict],
+    x_step: float,
+    y_step: float,
+) -> tuple[float, float, float, float] | None:
     if not loaded:
-        ax.text(.5, .5, "No traces match the selected channels.", ha="center", va="center")
-        ax.set_axis_off()
-        return fig, errors
+        return None
+    plotted_x_values = np.concatenate([
+        row["voltage"] + int(row.get("stack_index", 0)) * x_step
+        for row in loaded
+    ])
+    plotted_y_values = np.concatenate([
+        row["current"] + int(row.get("stack_index", 0)) * y_step
+        for row in loaded
+    ])
+    return (
+        float(np.nanmin(plotted_x_values)),
+        float(np.nanmax(plotted_x_values)),
+        float(np.nanmin(plotted_y_values)),
+        float(np.nanmax(plotted_y_values)),
+    )
 
-    iteration_values = [row["iteration"] for row in loaded]
-    iteration_minimum = min(iteration_values)
-    iteration_maximum = max(iteration_values)
-    iteration_span = max(1, iteration_maximum - iteration_minimum)
+
+def _chronological_swv_stack_steps(
+    loaded: list[dict],
+    x_offset_per_iteration: float | None = None,
+    y_offset_per_iteration: float | None = None,
+) -> tuple[float, float]:
     voltage_values = np.concatenate([row["voltage"] for row in loaded])
     current_values = np.concatenate([row["current"] for row in loaded])
     voltage_range = float(np.nanmax(voltage_values) - np.nanmin(voltage_values))
@@ -4040,12 +9100,73 @@ def _plot_chronological_swv_stack(
         if y_offset_per_iteration is not None
         else current_range * 0.10 if current_range > 0 else 0.08
     )
+    return x_step, y_step
+
+
+def _plot_chronological_swv_stack(
+    trace_entries: list[tuple[dict, dict]],
+    corrected: bool,
+    selected_channels: list[str],
+    analysis: dict,
+    config: dict,
+    correction_label: str,
+    selection_label: str,
+    normalize_to_peak: bool = False,
+    corrected_trace_key: str = "smoothed_corrected_current",
+    x_offset_per_iteration: float | None = None,
+    y_offset_per_iteration: float | None = None,
+    trace_height_scale: float = 1.0,
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    selected_phases: tuple[str, ...] | None = None,
+):
+    """Render SWVs as a diagonal chronological stack."""
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    loaded, errors, entries = _chronological_swv_stack_entries(
+        trace_entries,
+        corrected,
+        selected_channels,
+        analysis,
+        config,
+        normalize_to_peak,
+        corrected_trace_key,
+        trace_height_scale,
+        voltage_min,
+        voltage_max,
+        y_min,
+        y_max,
+        selected_phases,
+    )
+
+    if not loaded:
+        ax.text(.5, .5, "No traces match the selected channels.", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, errors
+
+    iteration_values = [row["iteration"] for row in loaded]
+    stack_indices = [int(row.get("stack_index", 0)) for row in loaded]
+    stack_min = min(stack_indices)
+    stack_span = max(1, max(stack_indices) - stack_min)
+    x_step, y_step = _chronological_swv_stack_steps(
+        loaded,
+        x_offset_per_iteration,
+        y_offset_per_iteration,
+    )
     phase_styles = {
-        "buffer": "--",
+        "buffer": "-",
         "target": "-",
         "measurement": "-",
         "unknown": ":",
     }
+    phase_colors = {
+        "buffer": "#1f77b4",
+        "target": "#ff7f0e",
+    }
+    use_phase_colors = any(
+        str(row["phase"]).lower() in phase_colors for row in loaded
+    )
     channel_values = sorted(
         {_trace_channel_key(row) for _obs, row in entries},
         key=_channel_sort_key,
@@ -4058,42 +9179,40 @@ def _plot_chronological_swv_stack(
         )
     }
     for row in loaded:
-        age = (row["iteration"] - iteration_minimum) / iteration_span
-        offset_index = row["iteration"] - iteration_minimum
-        alpha = 0.18 + 0.82 * age
+        offset_index = int(row.get("stack_index", 0))
+        age = (offset_index - stack_min) / stack_span
+        age = min(1.0, max(0.0, float(age)))
+        alpha = min(1.0, max(0.0, 0.18 + 0.82 * age))
         ax.plot(
             row["voltage"] + offset_index * x_step,
             row["current"] + offset_index * y_step,
-            color=channel_colors.get(row["channel"], "#155e63"),
+            color=(
+                phase_colors.get(str(row["phase"]).lower())
+                if use_phase_colors
+                else None
+            ) or channel_colors.get(row["channel"], "#155e63"),
             linestyle=phase_styles.get(row["phase"].lower(), phase_styles["unknown"]),
             linewidth=1.05 + 0.45 * age,
             alpha=alpha,
         )
 
-    plotted_x_values = np.concatenate([
-        row["voltage"] + (row["iteration"] - iteration_minimum) * x_step
-        for row in loaded
-    ])
-    plotted_y_values = np.concatenate([
-        row["current"] + (row["iteration"] - iteration_minimum) * y_step
-        for row in loaded
-    ])
-    plotted_x_min = float(np.nanmin(plotted_x_values))
-    plotted_x_max = float(np.nanmax(plotted_x_values))
-    plotted_y_min = float(np.nanmin(plotted_y_values))
-    plotted_y_max = float(np.nanmax(plotted_y_values))
+    display_bounds = _chronological_swv_stack_display_bounds(
+        loaded,
+        x_step,
+        y_step,
+    )
+    plotted_x_min, plotted_x_max, plotted_y_min, plotted_y_max = display_bounds
     plotted_x_span = max(plotted_x_max - plotted_x_min, abs(x_step), 1e-9)
     plotted_y_span = max(plotted_y_max - plotted_y_min, abs(y_step), 1e-9)
     oldest_iteration = min(iteration_values)
     newest_iteration = max(iteration_values)
 
-    def iteration_left_edge(iteration: int) -> tuple[float, float]:
-        rows = [row for row in loaded if row["iteration"] == iteration]
-        offset_index = iteration - iteration_minimum
+    def stack_left_edge(stack_index: int) -> tuple[float, float]:
+        rows = [row for row in loaded if int(row.get("stack_index", 0)) == stack_index]
         edge_points = []
         for row in rows:
-            shifted_x = row["voltage"] + offset_index * x_step
-            shifted_y = row["current"] + offset_index * y_step
+            shifted_x = row["voltage"] + stack_index * x_step
+            shifted_y = row["current"] + stack_index * y_step
             left_index = int(np.nanargmin(shifted_x))
             edge_points.append((float(shifted_x[left_index]), float(shifted_y[left_index])))
         return (
@@ -4101,8 +9220,10 @@ def _plot_chronological_swv_stack(
             float(np.nanmean([point[1] for point in edge_points])),
         )
 
-    oldest_edge = iteration_left_edge(oldest_iteration)
-    newest_edge = iteration_left_edge(newest_iteration)
+    oldest_stack_index = min(stack_indices)
+    newest_stack_index = max(stack_indices)
+    oldest_edge = stack_left_edge(oldest_stack_index)
+    newest_edge = stack_left_edge(newest_stack_index)
     axis_dx = newest_edge[0] - oldest_edge[0]
     axis_dy = newest_edge[1] - oldest_edge[1]
     if np.isclose(axis_dx, 0.0) and np.isclose(axis_dy, 0.0):
@@ -4139,7 +9260,7 @@ def _plot_chronological_swv_stack(
     ax.text(
         axis_end[0],
         axis_end[1],
-        " increasing iteration",
+        " chronological order",
         fontsize=8,
         color="#222222",
         ha="left" if axis_dx >= 0 else "right",
@@ -4147,8 +9268,8 @@ def _plot_chronological_swv_stack(
         zorder=8,
     )
 
-    newest = max(loaded, key=lambda row: row["iteration"])
-    oldest = min(loaded, key=lambda row: row["iteration"])
+    newest = max(loaded, key=lambda row: int(row.get("stack_index", 0)))
+    oldest = min(loaded, key=lambda row: int(row.get("stack_index", 0)))
     ax.annotate(
         f"Oldest: iter {oldest['iteration']}",
         xy=(
@@ -4163,8 +9284,8 @@ def _plot_chronological_swv_stack(
     ax.annotate(
         f"Newest: iter {newest['iteration']}",
         xy=(
-            float(np.nanmax(newest["voltage"])) + (newest["iteration"] - iteration_minimum) * x_step,
-            float(np.nanmax(newest["current"])) + (newest["iteration"] - iteration_minimum) * y_step,
+            float(np.nanmax(newest["voltage"])) + int(newest.get("stack_index", 0)) * x_step,
+            float(np.nanmax(newest["current"])) + int(newest.get("stack_index", 0)) * y_step,
         ),
         xytext=(-88, 8),
         textcoords="offset points",
@@ -4181,10 +9302,27 @@ def _plot_chronological_swv_stack(
         )
         for channel in channel_values
     ]
-    if channel_handles:
+    phase_values = [
+        phase for phase in ("buffer", "target", "measurement", "unknown")
+        if any(str(row["phase"]).lower() == phase for row in loaded)
+    ]
+    phase_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=phase_colors.get(phase, "#333333"),
+            linestyle=phase_styles.get(phase, phase_styles["unknown"]),
+            linewidth=1.8,
+            label=phase.title(),
+        )
+        for phase in phase_values
+        if phase in ("buffer", "target")
+    ]
+    legend_handles = ([] if use_phase_colors else channel_handles) + phase_handles
+    if legend_handles:
         ax.legend(
-            handles=channel_handles,
-            title="Channel",
+            handles=legend_handles,
+            title="Channel / phase",
             loc="upper left",
             fontsize=7,
             title_fontsize=8,
@@ -4843,7 +9981,7 @@ def _plot_observed_path(
     marker_colors = (
         {"c": measured, "cmap": "viridis", "norm": value_norm}
         if value_norm is not None
-        else {"color": "#35589a"}
+        else {"color": "#111111"}
     )
     ax.scatter(
         x, y, **marker_colors, s=marker_size, label=label, zorder=3
@@ -4886,13 +10024,24 @@ def _parameter_grid_values(
     frame: pd.DataFrame,
     name: str,
     grid_size: int,
+    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
 ) -> np.ndarray | None:
     definition = ((session.get("config") or {}).get("parameters") or {}).get(name) or {}
     values = pd.to_numeric(frame.get(name), errors="coerce").dropna()
-    try:
-        lower = float(definition.get("min"))
-        upper = float(definition.get("max"))
-    except (TypeError, ValueError):
+    bounds = (axis_ranges or {}).get(name)
+    if bounds is not None:
+        lower = float(bounds[0])
+        upper = float(bounds[1])
+    else:
+        try:
+            lower = float(definition.get("min"))
+            upper = float(definition.get("max"))
+        except (TypeError, ValueError):
+            if values.empty:
+                return None
+            lower = float(values.min())
+            upper = float(values.max())
+    if bounds is None and (not np.isfinite(lower) or not np.isfinite(upper)):
         if values.empty:
             return None
         lower = float(values.min())
@@ -4948,17 +10097,38 @@ def _surrogate_regular_2d_grid(
     y_name: str,
     base_params: dict,
     grid_size: int = 75,
+    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     if x_name == y_name or value not in SURROGATE_VALUES:
         return None
     size = max(20, min(160, int(grid_size)))
-    x_values = _parameter_grid_values(session, frame, x_name, size)
-    y_values = _parameter_grid_values(session, frame, y_name, size)
+    x_values = _parameter_grid_values(
+        session,
+        frame,
+        x_name,
+        size,
+        axis_ranges=axis_ranges,
+    )
+    y_values = _parameter_grid_values(
+        session,
+        frame,
+        y_name,
+        size,
+        axis_ranges=axis_ranges,
+    )
     if x_values is None or y_values is None:
         return None
     mesh_x, mesh_y = np.meshgrid(x_values, y_values)
+
+    def grid_base_value(name: str) -> float:
+        if name not in {x_name, y_name} and name in frame.columns:
+            values = pd.to_numeric(frame[name], errors="coerce").dropna()
+            if not values.empty and values.nunique(dropna=True) == 1:
+                return float(values.iloc[0])
+        return _base_parameter_value(session, frame, base_params, name)
+
     grid_frame = pd.DataFrame({
-        name: np.full(mesh_x.size, _base_parameter_value(session, frame, base_params, name))
+        name: np.full(mesh_x.size, grid_base_value(name))
         for name in PARAMETERS
     })
     grid_frame[x_name] = mesh_x.ravel()
@@ -4995,6 +10165,10 @@ def _plot_surrogate_2d_control_style(
     dot_size: int = 6,
     log_frequency: bool = False,
     show_iteration_path: bool = True,
+    show_observed_points: bool = True,
+    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
+    observed_slice_axis: str | None = None,
+    observed_slice_value: float | None = None,
 ):
     """Render 2D surrogate maps with the control-software slice style."""
     base_params = _surrogate_slice_base_params(session, iteration)
@@ -5006,6 +10180,7 @@ def _plot_surrogate_2d_control_style(
         x_name,
         y_name,
         base_params,
+        axis_ranges=axis_ranges,
     )
     if grid is not None:
         x_values, y_values, z_values = grid
@@ -5033,27 +10208,80 @@ def _plot_surrogate_2d_control_style(
             s=max(10, dot_size ** 2),
             alpha=.8,
         )
-    observed = _observed_points(session, iteration, [x_name, y_name])
-    if observed:
+    observed_axes = [x_name, y_name]
+    if (
+        observed_slice_axis is not None
+        and observed_slice_value is not None
+        and observed_slice_axis not in observed_axes
+    ):
+        observed_axes.append(observed_slice_axis)
+    observed = _observed_points(session, iteration, observed_axes)
+    if (
+        observed
+        and observed_slice_axis is not None
+        and observed_slice_value is not None
+    ):
+        filtered_observed = []
+        for obs in observed:
+            try:
+                observed_value = float(
+                    (obs.get("params") or {}).get(observed_slice_axis)
+                )
+            except (TypeError, ValueError):
+                continue
+            if np.isclose(
+                observed_value,
+                float(observed_slice_value),
+                rtol=1e-9,
+                atol=1e-12,
+            ):
+                filtered_observed.append(obs)
+        observed = filtered_observed
+    if observed and (show_iteration_path or show_observed_points):
         observed_x = [float(obs["params"][x_name]) for obs in observed]
         observed_y = [float(obs["params"][y_name]) for obs in observed]
-        if show_iteration_path and len(observed) > 1:
-            ax.plot(
+        observed_iterations = _observed_iterations(observed)
+        iteration_norm = _iteration_norm(observed_iterations)
+        if show_iteration_path:
+            if len(observed) > 1:
+                points = np.column_stack((observed_x, observed_y))
+                segments = np.stack((points[:-1], points[1:]), axis=1)
+                lines = LineCollection(
+                    segments,
+                    cmap=OBSERVED_PATH_CMAP,
+                    norm=iteration_norm,
+                    linewidth=1.6,
+                    zorder=4,
+                )
+                lines.set_array(observed_iterations[1:])
+                ax.add_collection(lines)
+            if show_observed_points:
+                ax.scatter(
+                    observed_x,
+                    observed_y,
+                    color="#111111",
+                    edgecolors="white",
+                    linewidths=0.4,
+                    s=max(18, dot_size ** 2),
+                    label="observed runs",
+                    zorder=5,
+                )
+            iteration_map = plt.cm.ScalarMappable(
+                norm=iteration_norm,
+                cmap=OBSERVED_PATH_CMAP,
+            )
+            ax.figure.colorbar(iteration_map, ax=ax, label="Iteration")
+        elif show_observed_points:
+            ax.scatter(
                 observed_x,
                 observed_y,
-                color="#d67b32",
-                linewidth=1.4,
-                alpha=.95,
-                label="observed path",
-                zorder=4,
+                color="#111111",
+                edgecolors="#111111",
+                linewidths=0.4,
+                s=max(18, dot_size ** 2),
+                label="observed runs",
+                zorder=5,
             )
-        ax.scatter(
-            observed_x,
-            observed_y,
-            color="#d67b32",
-            s=max(18, dot_size ** 2),
-            zorder=5,
-        )
     if (
         not selected_next_frame.empty
         and x_name in selected_next_frame.columns
@@ -5069,7 +10297,7 @@ def _plot_surrogate_2d_control_style(
                 linewidths=1.0,
                 s=(dot_size + 8) ** 2,
                 zorder=6,
-                label=f"selected iteration {iteration + 1}",
+                label=f"selected next iteration {iteration + 1}",
             )
     ax.set_xlabel(x_name, fontsize=9, labelpad=4)
     ax.set_ylabel(y_name, fontsize=9, labelpad=4)
@@ -5094,6 +10322,10 @@ def _plot_chronological_surrogate_2d_stack(
     y_offset_fraction: float = 0.05,
     map_alpha: float = 0.55,
     log_frequency: bool = False,
+    crop_ranges: Mapping[str, tuple[float, float]] | None = None,
+    slice_column: str | None = None,
+    slice_value: float | None = None,
+    progress_callback=None,
 ):
     """Render saved 2D surrogate maps as a diagonal chronological stack."""
     frame_iterations = [
@@ -5110,7 +10342,10 @@ def _plot_chronological_surrogate_2d_stack(
             return np.log10(np.clip(output, 1e-12, None))
         return output
 
-    for frame_iteration in frame_iterations:
+    total_frames = len(frame_iterations)
+    for frame_index, frame_iteration in enumerate(frame_iterations, start=1):
+        if progress_callback is not None:
+            progress_callback(frame_index, total_frames, frame_iteration)
         try:
             predictions = pd.read_csv(group_files[frame_iteration])
             predictions = _recompute_group_surrogate(
@@ -5118,6 +10353,18 @@ def _plot_chronological_surrogate_2d_stack(
                 predictions,
                 frame_iteration,
             )
+            predictions = _apply_numeric_slice(
+                predictions,
+                slice_column,
+                slice_value,
+            )
+            if crop_ranges:
+                predictions = _apply_parameter_crop(
+                    predictions,
+                    crop_ranges,
+                ).reset_index(drop=True)
+                if predictions.empty:
+                    continue
             if not all(
                 name in predictions.columns
                 for name in (x_name, y_name, value)
@@ -5133,6 +10380,7 @@ def _plot_chronological_surrogate_2d_stack(
                 x_name,
                 y_name,
                 base_params,
+                axis_ranges=crop_ranges,
             )
             if grid is None:
                 valid = display_frame[[x_name, y_name, value]].apply(
@@ -5347,6 +10595,213 @@ def _surrogate_display_frame(frame: pd.DataFrame, value: str) -> pd.DataFrame:
     return frame.loc[eligible].copy()
 
 
+def _surrogate_valid_plot_frame(
+    frame: pd.DataFrame,
+    value: str,
+    view: str,
+    x_name: str,
+    y_name: str | None,
+    z_name: str | None,
+) -> pd.DataFrame:
+    display_frame = _surrogate_display_frame(frame, value)
+    if view == "3D tensor":
+        plot_columns = [x_name, y_name, z_name, value]
+    elif view == "2D map":
+        plot_columns = [x_name, y_name, value]
+    else:
+        plot_columns = [x_name, value]
+    plot_columns = [column for column in plot_columns if column is not None]
+    valid = display_frame[plot_columns].copy()
+    for column in plot_columns:
+        valid[column] = pd.to_numeric(valid[column], errors="coerce")
+    return valid.dropna(subset=plot_columns)
+
+
+def _surrogate_candidate_accounting_text(
+    session: dict,
+    group: dict | None,
+    predictions: pd.DataFrame,
+    value: str,
+    view: str,
+    x_name: str,
+    y_name: str | None,
+    z_name: str | None,
+    show_local_pool: bool = True,
+) -> str:
+    config = session.get("config") or {}
+    acquisition = config.get("acquisition") or {}
+    requested_pool_size = acquisition.get(
+        "candidate_pool_size",
+        config.get("candidate_pool_size"),
+    )
+    requested_local_pool_size = acquisition.get(
+        "local_candidate_pool_size",
+        config.get("local_candidate_pool_size"),
+    )
+    group_id = None if group is None else int(group["id"])
+    for raw_group in (
+        (config.get("channel_groups") or [])
+        + ((session.get("state") or {}).get("channel_groups") or [])
+    ):
+        try:
+            if group_id is not None and int(raw_group.get("id")) == group_id:
+                requested_pool_size = raw_group.get(
+                    "candidate_pool_size",
+                    requested_pool_size,
+                )
+                requested_local_pool_size = raw_group.get(
+                    "local_candidate_pool_size",
+                    requested_local_pool_size,
+                )
+        except (TypeError, ValueError):
+            continue
+    state_candidate_count = (session.get("state") or {}).get("candidate_count")
+    valid = _surrogate_valid_plot_frame(
+        predictions,
+        value,
+        view,
+        x_name,
+        y_name,
+        z_name,
+    )
+    source_column = _surrogate_pool_source_column(predictions)
+    prediction_local_mask = _surrogate_local_pool_mask(predictions)
+    local_count = int(prediction_local_mask.sum())
+    local_mask = prediction_local_mask.reindex(valid.index, fill_value=False)
+    selected_mask = (
+        predictions["selected_next"].fillna(False).astype(bool)
+        if "selected_next" in predictions.columns
+        else pd.Series(False, index=predictions.index)
+    ).reindex(valid.index, fill_value=False)
+    if not show_local_pool and local_count:
+        valid = valid.loc[~local_mask | selected_mask].copy()
+    displayed_local_count = int(
+        local_mask.reindex(valid.index, fill_value=False).sum()
+    )
+    displayed_columns = [
+        column for column in (x_name, y_name, z_name)
+        if column is not None and column in valid.columns
+    ]
+    unique_displayed = (
+        len(valid.drop_duplicates(displayed_columns))
+        if displayed_columns
+        else len(valid)
+    )
+    parts = [
+        "requested pool target: "
+        f"{requested_pool_size if requested_pool_size is not None else 'unknown'}",
+        (
+            "requested local pool target: "
+            f"{requested_local_pool_size if requested_local_pool_size is not None else 'unknown'}"
+        ),
+        "valid saved candidate count: "
+        f"{state_candidate_count if state_candidate_count is not None else 'unknown'}",
+        f"saved prediction rows: {len(predictions):,}",
+        f"plotted rows: {len(valid):,}",
+    ]
+    try:
+        requested_pool_number = int(requested_pool_size)
+        saved_pool_number = int(state_candidate_count)
+    except (TypeError, ValueError):
+        requested_pool_number = None
+        saved_pool_number = None
+    if (
+        requested_pool_number is not None
+        and saved_pool_number is not None
+        and saved_pool_number < requested_pool_number
+    ):
+        parts.append(
+            "saved pool is smaller than requested because invalid or duplicate "
+            "candidate draws were filtered during generation"
+        )
+    if view != "1D slice":
+        parts.append(
+            "unique displayed coordinates: "
+            f"{unique_displayed:,}"
+        )
+    if source_column is None:
+        parts.append("pool source metadata: absent")
+    else:
+        parts.append(
+            f"pool source metadata: {source_column}; local rows: {local_count:,}; "
+            f"plotted local rows: {displayed_local_count:,}; "
+            f"local rows {'shown' if show_local_pool else 'hidden'}"
+        )
+    if {"step_potential", "frequency"}.issubset(predictions.columns):
+        step_values = pd.to_numeric(
+            predictions["step_potential"],
+            errors="coerce",
+        )
+        frequency_values = pd.to_numeric(
+            predictions["frequency"],
+            errors="coerce",
+        )
+        effective_scan_rate = step_values * frequency_values
+        finite_scan_rate = effective_scan_rate[np.isfinite(effective_scan_rate)]
+        constraints = config.get("constraints") or {}
+        max_effective_scan_rate = constraints.get("max_effective_scan_rate")
+        if not finite_scan_rate.empty:
+            scan_rate_text = (
+                "effective scan-rate range: "
+                f"{float(finite_scan_rate.min()):.4g}-"
+                f"{float(finite_scan_rate.max()):.4g} V/s"
+            )
+            try:
+                max_scan_rate = float(max_effective_scan_rate)
+            except (TypeError, ValueError):
+                max_scan_rate = None
+            if max_scan_rate is not None:
+                over_limit = int((finite_scan_rate > max_scan_rate).sum())
+                scan_rate_text += (
+                    f"; configured max: {max_scan_rate:.4g} V/s; "
+                    f"rows over max: {over_limit:,}"
+                )
+            parts.append(scan_rate_text)
+    if value == "acquisition_value" and "already_tested" in predictions.columns:
+        tested = int(predictions["already_tested"].fillna(False).astype(bool).sum())
+        parts.append(f"already-tested rows hidden from acquisition: {tested:,}")
+    return "Candidate accounting: " + "; ".join(parts) + "."
+
+
+def _surrogate_pool_source_column(frame: pd.DataFrame) -> str | None:
+    for column in (
+        "is_local_candidate",
+        "is_local_pool",
+        "local_candidate",
+        "local_pool",
+        "pool_source",
+        "candidate_source",
+        "candidate_pool",
+        "pool",
+        "source",
+        "origin",
+    ):
+        if column in frame.columns:
+            return column
+    return None
+
+
+def _surrogate_local_pool_mask(frame: pd.DataFrame) -> pd.Series:
+    source_column = _surrogate_pool_source_column(frame)
+    if source_column is None:
+        return pd.Series(False, index=frame.index)
+    values = frame[source_column]
+    if pd.api.types.is_bool_dtype(values):
+        return values.fillna(False).astype(bool)
+    normalized = values.fillna("").astype(str).str.lower()
+    if source_column in {
+        "is_local_candidate",
+        "is_local_pool",
+        "local_candidate",
+        "local_pool",
+    }:
+        return normalized.isin({"1", "true", "yes", "y", "local"})
+    return normalized.str.contains(
+        "local",
+        regex=False,
+    )
+
+
 def _surrogate_parameter_context(
     session: dict,
     iteration: int,
@@ -5380,14 +10835,39 @@ def _surrogate_parameter_context(
 def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: str, view: str,
                     x_name: str, y_name: str | None, z_name: str | None,
                     tensor_height: int = 620, dot_size: int = 6,
+                    dot_opacity: float = 0.45,
                     log_frequency: bool = False,
-                    show_iteration_path: bool = True):
+                    show_iteration_path: bool = True,
+                    show_observed_points: bool = True,
+                    show_local_pool: bool = False,
+                    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
+                    slice_axis: str | None = None,
+                    slice_value: float | None = None,
+                    observed_slice_axis: str | None = None,
+                    observed_slice_value: float | None = None,
+                    slice_sweep_values: Sequence[float] | None = None,
+                    title_note: str | None = None):
     parameter_context = _surrogate_parameter_context(session, iteration)
     title = (
         f"{view} | {value} | artifact iteration {iteration}<br>"
         f"{parameter_context}"
     )
+    if title_note:
+        title = f"{title}<br>{title_note}"
     display_frame = _surrogate_display_frame(frame, value)
+    pool_source_column = _surrogate_pool_source_column(display_frame)
+    if (
+        pool_source_column is not None
+        and not show_local_pool
+        and view != "3D tensor"
+    ):
+        local_mask = _surrogate_local_pool_mask(display_frame)
+        selected_mask = (
+            display_frame["selected_next"].fillna(False).astype(bool)
+            if "selected_next" in display_frame.columns
+            else pd.Series(False, index=display_frame.index)
+        )
+        display_frame = display_frame.loc[~local_mask | selected_mask].copy()
     selected_next_frame = (
         display_frame.loc[
             display_frame["selected_next"].fillna(False).astype(bool)
@@ -5396,39 +10876,232 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         else pd.DataFrame()
     )
     if view == "3D tensor":
-        valid = display_frame[[x_name, y_name, z_name, value]].apply(pd.to_numeric, errors="coerce").dropna()
+        plot_columns = [x_name, y_name, z_name, value]
+        if pool_source_column is not None:
+            plot_columns.append(pool_source_column)
+        if "selected_next" in display_frame.columns:
+            plot_columns.append("selected_next")
+        valid = display_frame[plot_columns].copy()
+        for column in (x_name, y_name, z_name, value):
+            valid[column] = pd.to_numeric(valid[column], errors="coerce")
+        valid = valid.dropna(subset=[x_name, y_name, z_name, value])
+        if valid.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text=(
+                    "No candidate rows to plot. Enable Show local-pool "
+                    "candidates if this artifact only contains local-pool rows."
+                ),
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+            )
+            fig.update_layout(height=tensor_height)
+            return fig
         prediction_min = float(valid[value].min())
         prediction_max = float(valid[value].max())
         if prediction_min == prediction_max:
             prediction_max = prediction_min + 1.0
-        fig = go.Figure(go.Scatter3d(
-            x=valid[x_name],
-            y=valid[y_name],
-            z=valid[z_name],
-            mode="markers",
-            name="Candidate predictions",
-            marker={
+        fig = go.Figure()
+
+        def add_prediction_trace(
+            rows: pd.DataFrame,
+            name: str,
+            hover_extra: str,
+            *,
+            outline: bool = False,
+            opacity: float = dot_opacity,
+            line_width: int = 2,
+        ) -> None:
+            trace_x = rows[x_name] if not rows.empty else [None]
+            trace_y = rows[y_name] if not rows.empty else [None]
+            trace_z = rows[z_name] if not rows.empty else [None]
+            trace_color = rows[value] if not rows.empty else [prediction_min]
+            trace_customdata = rows[value] if not rows.empty else [np.nan]
+            marker = {
                 "size": dot_size,
-                "color": valid[value],
+                "color": trace_color,
                 "colorscale": "Viridis",
                 "cmin": prediction_min,
                 "cmax": prediction_max,
-                "opacity": 0.55,
-                "showscale": True,
+                "opacity": opacity,
+                "symbol": "circle",
+                "showscale": len(fig.data) == 0,
                 "colorbar": {
                     "title": SURROGATE_VALUE_LABELS.get(value, value),
                     "x": 0.84,
                     "y": 0.48,
                     "len": 0.68,
                 },
-            },
-            customdata=valid[value],
-            hovertemplate=(
-                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
-                f"{z_name}: %{{z:.4g}}<br>{value}: %{{customdata:.4g}}"
-                "<extra></extra>"
-            ),
-        ))
+            }
+            if outline:
+                marker["line"] = {"color": "#111111", "width": line_width}
+            fig.add_trace(go.Scatter3d(
+                x=trace_x,
+                y=trace_y,
+                z=trace_z,
+                mode="markers",
+                name=name,
+                marker=marker,
+                customdata=trace_customdata,
+                hovertemplate=(
+                    f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                    f"{z_name}: %{{z:.4g}}<br>{value}: %{{customdata:.4g}}"
+                    f"<extra>{hover_extra}</extra>"
+                ),
+            ))
+
+        if pool_source_column is not None:
+            valid_local_mask = _surrogate_local_pool_mask(valid)
+            selected_mask = (
+                valid["selected_next"].fillna(False).astype(bool)
+                if "selected_next" in valid.columns
+                else pd.Series(False, index=valid.index)
+            )
+            local_rows = valid.loc[valid_local_mask].copy()
+            nonlocal_rows = valid.loc[~valid_local_mask | selected_mask].copy()
+            add_prediction_trace(
+                nonlocal_rows,
+                "Candidate predictions",
+                "Candidate",
+            )
+            add_prediction_trace(
+                local_rows,
+                "Local-pool candidates",
+                "Local pool",
+                outline=True,
+                opacity=min(1.0, dot_opacity + 0.33) if show_local_pool else 0.0,
+                line_width=2 if show_local_pool else 0,
+            )
+        else:
+            add_prediction_trace(
+                valid,
+                "Candidate predictions",
+                "Candidate",
+            )
+        valid_slice_values = []
+        if slice_sweep_values:
+            for raw_slice_value in slice_sweep_values:
+                numeric_slice_value = _finite_float(raw_slice_value)
+                if numeric_slice_value is not None:
+                    valid_slice_values.append(float(numeric_slice_value))
+        elif slice_value is not None and np.isfinite(float(slice_value)):
+            valid_slice_values = [float(slice_value)]
+        if slice_axis in {x_name, y_name, z_name} and valid_slice_values:
+            axis_bounds = {}
+            for axis_name in (x_name, y_name, z_name):
+                bounds = (axis_ranges or {}).get(axis_name)
+                if bounds is not None:
+                    axis_bounds[axis_name] = (
+                        float(bounds[0]),
+                        float(bounds[1]),
+                    )
+                else:
+                    axis_values = pd.to_numeric(
+                        valid[axis_name],
+                        errors="coerce",
+                    ).dropna()
+                    if axis_values.empty:
+                        axis_bounds[axis_name] = (0.0, 1.0)
+                    else:
+                        axis_bounds[axis_name] = (
+                            float(axis_values.min()),
+                            float(axis_values.max()),
+                        )
+                if np.isclose(axis_bounds[axis_name][0], axis_bounds[axis_name][1]):
+                    center = axis_bounds[axis_name][0]
+                    padding = max(abs(center) * 0.05, 1e-9)
+                    axis_bounds[axis_name] = (center - padding, center + padding)
+            base_plane_x = np.array([
+                [axis_bounds[x_name][0], axis_bounds[x_name][1]],
+                [axis_bounds[x_name][0], axis_bounds[x_name][1]],
+            ], dtype=float)
+            base_plane_y = np.array([
+                [axis_bounds[y_name][0], axis_bounds[y_name][0]],
+                [axis_bounds[y_name][1], axis_bounds[y_name][1]],
+            ], dtype=float)
+            base_plane_z = np.array([
+                [axis_bounds[z_name][0], axis_bounds[z_name][0]],
+                [axis_bounds[z_name][1], axis_bounds[z_name][1]],
+            ], dtype=float)
+            x0, x1 = axis_bounds[x_name]
+            y0, y1 = axis_bounds[y_name]
+            z0, z1 = axis_bounds[z_name]
+            for slice_index, current_slice_value in enumerate(valid_slice_values):
+                plane_x = base_plane_x.copy()
+                plane_y = base_plane_y.copy()
+                plane_z = base_plane_z.copy()
+                if slice_axis == x_name:
+                    plane_x = np.full_like(plane_x, float(current_slice_value))
+                    outline_x = [
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                    ]
+                    outline_y = [y0, y1, y1, y0, y0]
+                    outline_z = [z0, z0, z1, z1, z0]
+                elif slice_axis == y_name:
+                    plane_y = np.full_like(plane_y, float(current_slice_value))
+                    outline_x = [x0, x1, x1, x0, x0]
+                    outline_y = [
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                    ]
+                    outline_z = [z0, z0, z1, z1, z0]
+                else:
+                    plane_z = np.full_like(plane_z, float(current_slice_value))
+                    outline_x = [x0, x1, x1, x0, x0]
+                    outline_y = [y0, y0, y1, y1, y0]
+                    outline_z = [
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                        current_slice_value,
+                    ]
+                _mpl_color, color = _slice_highlight_color(
+                    slice_index,
+                    len(valid_slice_values),
+                )
+                if len(valid_slice_values) > 1:
+                    trace_name = f"Slice {slice_index + 1}: {slice_axis}={current_slice_value:g}"
+                else:
+                    trace_name = "Highlighted slice"
+                fig.add_trace(go.Surface(
+                    x=plane_x,
+                    y=plane_y,
+                    z=plane_z,
+                    surfacecolor=np.zeros_like(plane_x),
+                    colorscale=[[0, color], [1, color]],
+                    opacity=0.34 if len(valid_slice_values) > 1 else 0.28,
+                    showscale=False,
+                    showlegend=False,
+                    name=trace_name,
+                    hovertemplate=(
+                        f"{slice_axis}: {float(current_slice_value):.4g}"
+                        "<extra>Highlighted slice</extra>"
+                    ),
+                ))
+                fig.add_trace(go.Scatter3d(
+                    x=outline_x,
+                    y=outline_y,
+                    z=outline_z,
+                    mode="lines",
+                    line={"color": color, "width": 7},
+                    name=f"{trace_name} outline",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"{slice_axis}: {float(current_slice_value):.4g}"
+                        "<extra>Highlighted slice outline</extra>"
+                    ),
+                ))
         if not selected_next_frame.empty:
             selected_row = selected_next_frame.iloc[0]
             fig.add_trace(go.Scatter3d(
@@ -5505,6 +11178,7 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
                     "cmin": prediction_min,
                     "cmax": prediction_max,
                     "size": dot_size,
+                    "opacity": dot_opacity,
                     "showscale": False,
                 },
                 customdata=np.column_stack((observed_iterations, observed_values)),
@@ -5537,6 +11211,12 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
                     "type": "log" if log_frequency and z_name == "frequency" else "linear",
                 },
                 "domain": {"x": [0, 0.76], "y": [0.14, 0.82]},
+                "uirevision": (
+                    "surrogate-3d:"
+                    f"{session.get('selected_group_id', 'all')}:"
+                    f"{iteration}:{value}:{x_name}:{y_name}:{z_name}:"
+                    f"{int(bool(log_frequency))}"
+                ),
             },
             legend={
                 "orientation": "h",
@@ -5547,7 +11227,30 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             },
             height=tensor_height,
             margin={"l": 10, "r": 10, "t": 105, "b": 75},
+            uirevision=(
+                "surrogate-3d:"
+                f"{session.get('selected_group_id', 'all')}:"
+                f"{iteration}:{value}:{x_name}:{y_name}:{z_name}:"
+                f"{int(bool(log_frequency))}"
+            ),
         )
+        if axis_ranges:
+            def plotly_axis_range(name: str) -> list[float] | None:
+                bounds = axis_ranges.get(name)
+                if bounds is None:
+                    return None
+                if log_frequency and name == "frequency":
+                    return [
+                        float(np.log10(max(bounds[0], 1e-12))),
+                        float(np.log10(max(bounds[1], 1e-12))),
+                    ]
+                return [float(bounds[0]), float(bounds[1])]
+
+            fig.update_scenes(
+                xaxis_range=plotly_axis_range(x_name),
+                yaxis_range=plotly_axis_range(y_name),
+                zaxis_range=plotly_axis_range(z_name),
+            )
         return fig
     elif view == "2D map":
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
@@ -5563,6 +11266,10 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             dot_size=dot_size,
             log_frequency=log_frequency,
             show_iteration_path=show_iteration_path,
+            show_observed_points=show_observed_points,
+            axis_ranges=axis_ranges,
+            observed_slice_axis=observed_slice_axis,
+            observed_slice_value=observed_slice_value,
         )
         if mesh is not None:
             colorbar = fig.colorbar(
@@ -5578,6 +11285,11 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(loc="best", fontsize=8)
+        if axis_ranges:
+            if x_name in axis_ranges:
+                ax.set_xlim(*map(float, axis_ranges[x_name]))
+            if y_name in axis_ranges:
+                ax.set_ylim(*map(float, axis_ranges[y_name]))
     else:
         fig, ax = plt.subplots(figsize=(6.4, 3.5))
         valid = display_frame[[x_name, value]].apply(pd.to_numeric, errors="coerce").dropna()
@@ -5586,7 +11298,7 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             valid[value],
             color="#155e63",
             s=dot_size ** 2,
-            alpha=.35,
+            alpha=dot_opacity,
             label="candidate predictions",
         )
         observed = _observed_points(session, iteration, [x_name])
@@ -5619,11 +11331,16 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         ax.set(xlabel=x_name, ylabel=value)
         if log_frequency and x_name == "frequency":
             ax.set_xscale("log")
+        if axis_ranges and x_name in axis_ranges:
+            ax.set_xlim(*map(float, axis_ranges[x_name]))
         ax.legend()
-    ax.set_title(
-        f"{view} | {value} | artifact iteration {iteration}\n"
-        f"{parameter_context}"
-    )
+    title_lines = [
+        f"{view} | {value} | artifact iteration {iteration}",
+        parameter_context,
+    ]
+    if title_note:
+        title_lines.append(title_note)
+    ax.set_title("\n".join(title_lines))
     ax.grid(alpha=.2)
     fig.tight_layout()
     return fig
@@ -5643,6 +11360,168 @@ def _sized_plot_container(container, width_percent: int):
 def _safe_download_stem(label: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("_")
     return stem or "plot"
+
+
+def _plotly_colorbar_height_fraction() -> float:
+    try:
+        percent = float(st.session_state.get("bo_colorbar_height_percent", 100))
+    except (TypeError, ValueError):
+        percent = 100.0
+    return min(1.0, max(0.2, percent / 100.0))
+
+
+def _apply_plotly_colorbar_height(fig: go.Figure) -> go.Figure:
+    uses_layout_coloraxis = False
+    height_fraction = _plotly_colorbar_height_fraction()
+    for trace in fig.data:
+        if getattr(trace, "coloraxis", None):
+            uses_layout_coloraxis = True
+        colorbar = getattr(trace, "colorbar", None)
+        if colorbar is not None:
+            colorbar.len = height_fraction
+            colorbar.y = 0.5
+        marker = getattr(trace, "marker", None)
+        if getattr(marker, "coloraxis", None):
+            uses_layout_coloraxis = True
+        marker_colorbar = getattr(marker, "colorbar", None)
+        if marker_colorbar is not None:
+            marker_colorbar.len = height_fraction
+            marker_colorbar.y = 0.5
+    if not uses_layout_coloraxis:
+        fig.update_layout(coloraxis=None)
+    return fig
+
+
+def _plotly_chart_with_colorbars(container, fig: go.Figure, **kwargs):
+    return container.plotly_chart(
+        _apply_plotly_colorbar_height(fig),
+        **kwargs,
+    )
+
+
+def _parameter_crop_ranges(
+    frame: pd.DataFrame,
+    axes: Sequence[str | None],
+    *,
+    key_prefix: str,
+    label: str = "Crop heatmap/tensor by parameter",
+    help_text: str = "Crop limits are applied before plotting.",
+    expanded: bool = False,
+) -> dict[str, tuple[float, float]]:
+    available_axes = []
+    seen_axes = set()
+    for axis in axes:
+        if axis is None or axis in seen_axes or axis not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[axis], errors="coerce").dropna()
+        if values.empty:
+            continue
+        available_axes.append((axis, values))
+        seen_axes.add(axis)
+    if not available_axes:
+        return {}
+    crop_ranges: dict[str, tuple[float, float]] = {}
+    with st.expander(label, expanded=expanded):
+        crop_enabled = st.checkbox(
+            "Enable parameter crop",
+            key=f"{key_prefix}_enabled",
+        )
+        if crop_enabled:
+            st.caption(help_text)
+            crop_columns = st.columns(len(available_axes))
+            for axis_index, (axis_name, axis_values) in enumerate(available_axes):
+                axis_min = float(axis_values.min())
+                axis_max = float(axis_values.max())
+                axis_step = max(abs(axis_max - axis_min) / 100.0, 1e-9)
+                with crop_columns[axis_index]:
+                    st.markdown(f"**{_metric_label(axis_name)}**")
+                    crop_min = float(st.number_input(
+                        "Min",
+                        value=axis_min,
+                        step=axis_step,
+                        format="%.8g",
+                        key=f"{key_prefix}_{axis_name}_min",
+                    ))
+                    crop_max = float(st.number_input(
+                        "Max",
+                        value=axis_max,
+                        step=axis_step,
+                        format="%.8g",
+                        key=f"{key_prefix}_{axis_name}_max",
+                    ))
+                if crop_min > crop_max:
+                    crop_min, crop_max = crop_max, crop_min
+                crop_ranges[axis_name] = (crop_min, crop_max)
+    return crop_ranges
+
+
+def _apply_parameter_crop(
+    frame: pd.DataFrame,
+    crop_ranges: Mapping[str, tuple[float, float]],
+) -> pd.DataFrame:
+    cropped = frame
+    for axis_name, (crop_min, crop_max) in crop_ranges.items():
+        if axis_name not in cropped.columns:
+            continue
+        axis_values = pd.to_numeric(cropped[axis_name], errors="coerce")
+        cropped = cropped.loc[
+            axis_values.between(
+                float(crop_min),
+                float(crop_max),
+                inclusive="both",
+            )
+        ]
+    return cropped
+
+
+def _numeric_slice_values(frame: pd.DataFrame, column: str) -> list[float]:
+    if frame is None or frame.empty or column not in frame.columns:
+        return []
+    values = pd.to_numeric(frame[column], errors="coerce")
+    return sorted(float(value) for value in values[np.isfinite(values)].unique())
+
+
+def _apply_numeric_slice(
+    frame: pd.DataFrame,
+    column: str | None,
+    value: float | None,
+) -> pd.DataFrame:
+    if (
+        frame is None
+        or frame.empty
+        or column is None
+        or value is None
+        or column not in frame.columns
+    ):
+        return frame
+    values = pd.to_numeric(frame[column], errors="coerce")
+    return frame.loc[
+        np.isclose(values, float(value), rtol=1e-9, atol=1e-12)
+    ].copy()
+
+
+def _numeric_slice_token(column: str | None, value: float | None) -> str:
+    if column is None or value is None:
+        return "all_unplotted"
+    return f"{column}={float(value):g}"
+
+
+def _numeric_slice_values_token(
+    column: str | None,
+    values: Sequence[float] | None,
+) -> str:
+    if column is None or not values:
+        return "no_sweep"
+    return (
+        f"{column}="
+        + ",".join(f"{float(value):g}" for value in values)
+    )
+
+
+def _numeric_slice_title_note(column: str | None, value: float | None) -> str | None:
+    if column is None or value is None:
+        return None
+    return f"Fixed {_metric_label(column)} = {float(value):g}"
 
 
 def _matplotlib_png_bytes(fig, *, dpi: int = 150) -> bytes:
@@ -5699,6 +11578,98 @@ def _plotly_png_bytes(
         ) from exc
 
 
+def _plotly_camera_state_key(camera_storage_key: str) -> str:
+    digest = hashlib.sha1(camera_storage_key.encode("utf-8")).hexdigest()[:16]
+    return f"bo_plotly_camera_state_{digest}"
+
+
+def _valid_plotly_camera(camera: Any) -> dict | None:
+    if not isinstance(camera, dict) or not isinstance(camera.get("eye"), dict):
+        return None
+    cleaned = {}
+    for part in ("eye", "center", "up"):
+        values = camera.get(part)
+        if not isinstance(values, dict):
+            continue
+        cleaned_part = {}
+        for axis in ("x", "y", "z"):
+            numeric = _finite_float(values.get(axis))
+            if numeric is not None:
+                cleaned_part[axis] = float(numeric)
+        if cleaned_part:
+            cleaned[part] = cleaned_part
+    return cleaned if "eye" in cleaned else None
+
+
+def _store_plotly_camera(storage_key: str, camera: Any) -> dict | None:
+    valid_camera = _valid_plotly_camera(camera)
+    if valid_camera is None:
+        return None
+    st.session_state[_plotly_camera_state_key(storage_key)] = valid_camera
+    return valid_camera
+
+
+def _stored_plotly_camera(camera_storage_key: str | None) -> dict | None:
+    if not camera_storage_key:
+        return _valid_plotly_camera(
+            st.session_state.get(_plotly_camera_state_key(_SHARED_3D_CAMERA_STORAGE_KEY))
+        )
+    storage_key = f"bo_viewer_camera:{camera_storage_key}"
+    camera = _valid_plotly_camera(
+        st.session_state.get(_plotly_camera_state_key(storage_key))
+    )
+    if camera is not None:
+        return camera
+    return _valid_plotly_camera(
+        st.session_state.get(_plotly_camera_state_key(_SHARED_3D_CAMERA_STORAGE_KEY))
+    )
+
+
+def _apply_plotly_camera(fig: go.Figure, camera: dict | None) -> go.Figure:
+    valid_camera = _valid_plotly_camera(camera)
+    if valid_camera is not None:
+        fig.update_layout(scene_camera=valid_camera)
+    return fig
+
+
+def _render_camera_persistent_plotly(
+    container,
+    fig: go.Figure,
+    *,
+    key: str,
+    camera_storage_key: str,
+    height: int,
+    file_stem: str,
+    export_width: int = 1200,
+    export_height: int | None = None,
+) -> dict | None:
+    _apply_plotly_colorbar_height(fig)
+    storage_key = f"bo_viewer_camera:{camera_storage_key}"
+    camera_state_key = _plotly_camera_state_key(storage_key)
+    current_camera = _valid_plotly_camera(st.session_state.get(camera_state_key))
+    apply_nonce = int(st.session_state.get("bo_3d_perspective_snap_nonce", 0))
+    component_figure = json.loads(
+        json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
+    )
+    component_key = f"{key}_camera_component"
+    returned_camera = _plotly_camera_capture(
+        figure=component_figure,
+        storage_key=storage_key,
+        shared_storage_key=_SHARED_3D_CAMERA_STORAGE_KEY,
+        camera_storage_key=camera_storage_key,
+        camera=current_camera,
+        height=int(height),
+        apply_sync_nonce=apply_nonce,
+        default=None,
+        key=component_key,
+    )
+    stored_camera = _store_plotly_camera(storage_key, returned_camera)
+    if stored_camera is not None:
+        _store_plotly_camera(_SHARED_3D_CAMERA_STORAGE_KEY, stored_camera)
+        current_camera = stored_camera
+    return current_camera
+
+
 def _render_downloadable_plotly(
     container,
     fig: go.Figure,
@@ -5710,30 +11681,48 @@ def _render_downloadable_plotly(
     export_height: int | None = None,
     on_select: str = "ignore",
     selection_mode: str | tuple[str, ...] = "points",
+    camera_storage_key: str | None = None,
+    eager_png: bool = True,
 ) -> Any:
     plot_column = _sized_plot_container(container, width_percent)
-    event = plot_column.plotly_chart(
-        fig,
-        use_container_width=True,
-        on_select=on_select,
-        selection_mode=selection_mode,
-        key=key,
-    )
-    try:
-        png_bytes = _plotly_png_bytes(
+    _apply_plotly_colorbar_height(fig)
+    if camera_storage_key:
+        _render_camera_persistent_plotly(
+            plot_column,
             fig,
-            width=export_width,
+            key=key,
+            camera_storage_key=camera_storage_key,
             height=export_height or int(fig.layout.height or 800),
+            file_stem=file_stem,
+            export_width=export_width,
+            export_height=export_height,
         )
-        plot_column.download_button(
-            "Download plot",
-            data=png_bytes,
-            file_name=f"{_safe_download_stem(file_stem)}.png",
-            mime="image/png",
-            key=f"{key}_download",
+        event = None
+        eager_png = True
+    else:
+        event = plot_column.plotly_chart(
+            fig,
+            use_container_width=True,
+            on_select=on_select,
+            selection_mode=selection_mode,
+            key=key,
         )
-    except RuntimeError as exc:
-        plot_column.caption(str(exc))
+    if eager_png:
+        try:
+            png_bytes = _plotly_png_bytes(
+                fig,
+                width=export_width,
+                height=export_height or int(fig.layout.height or 800),
+            )
+            plot_column.download_button(
+                "Download plot",
+                data=png_bytes,
+                file_name=f"{_safe_download_stem(file_stem)}.png",
+                mime="image/png",
+                key=f"{key}_download",
+            )
+        except RuntimeError as exc:
+            plot_column.caption(str(exc))
     return event
 
 
@@ -5742,14 +11731,158 @@ def _preserve_valid_widget_value(
     options: list,
     default=None,
 ) -> None:
-    """Keep a widget selection across reruns unless it is no longer valid."""
-    if not options:
+    """Keep a widget selection across reruns without losing invalid preferences."""
+    _prepare_preferred_widget_value(
+        key,
+        f"{key}__preferred",
+        options,
+        default,
+    )
+
+
+def _seed_session_state_value(target_key: str, source_key: str) -> None:
+    """Initialize a shared widget key from an older scoped key when present."""
+    if target_key not in st.session_state and source_key in st.session_state:
+        st.session_state[target_key] = st.session_state[source_key]
+
+
+def _initialize_preference(
+    preference_key: str,
+    *source_keys: str | None,
+    default=None,
+) -> None:
+    """Seed a durable preference from current or legacy widget state."""
+    if preference_key in st.session_state:
         return
-    current = st.session_state.get(key)
-    if current not in options:
-        st.session_state[key] = (
-            default if default in options else options[0]
-        )
+    for source_key in source_keys:
+        if source_key and source_key in st.session_state:
+            st.session_state[preference_key] = st.session_state[source_key]
+            return
+    st.session_state[preference_key] = default
+
+
+def _prepare_preferred_widget_value(
+    widget_key: str,
+    preference_key: str,
+    options: list,
+    default=None,
+) -> tuple[bool, Any]:
+    """Set a widget to the preferred value when valid without losing preference."""
+    if not options:
+        return False, None
+    fallback_key = f"{preference_key}__fallback_display"
+    current_widget_value = st.session_state.get(widget_key)
+    fallback_display = st.session_state.get(fallback_key)
+    if (
+        current_widget_value in options
+        and current_widget_value != fallback_display
+        and current_widget_value != st.session_state.get(preference_key)
+    ):
+        st.session_state[preference_key] = current_widget_value
+    preferred = st.session_state.get(preference_key, default)
+    preference_valid = preferred in options
+    display_value = (
+        preferred
+        if preference_valid
+        else default if default in options else options[0]
+    )
+    if preference_valid:
+        st.session_state.pop(fallback_key, None)
+    else:
+        st.session_state[fallback_key] = display_value
+    st.session_state[widget_key] = display_value
+    return preference_valid, display_value
+
+
+def _sync_preferred_widget_value(
+    widget_key: str,
+    preference_key: str,
+    preference_valid: bool,
+    display_value: Any,
+) -> None:
+    """Persist user changes while ignoring automatic session-switch fallbacks."""
+    current_value = st.session_state.get(widget_key)
+    if preference_valid or current_value != display_value:
+        st.session_state[preference_key] = current_value
+        st.session_state.pop(f"{preference_key}__fallback_display", None)
+
+
+def _prepare_preferred_multiselect_value(
+    widget_key: str,
+    preference_key: str,
+    options: list,
+    default: list,
+) -> tuple[bool, list]:
+    fallback_key = f"{preference_key}__fallback_display"
+    current_widget_value = st.session_state.get(widget_key)
+    fallback_display = st.session_state.get(fallback_key)
+    if isinstance(current_widget_value, (list, tuple, set)):
+        current_list = list(current_widget_value)
+        current_valid_values = [
+            value for value in current_list if value in options
+        ]
+        if (
+            current_list != fallback_display
+            and current_valid_values == current_list
+            and current_list != st.session_state.get(preference_key)
+        ):
+            st.session_state[preference_key] = current_list
+    preferred = st.session_state.get(preference_key, default)
+    if not isinstance(preferred, (list, tuple, set)):
+        preferred = [preferred]
+    valid_values = [value for value in preferred if value in options]
+    preference_valid = bool(valid_values) or list(preferred) == []
+    display_values = valid_values if valid_values else default
+    if preference_valid:
+        st.session_state.pop(fallback_key, None)
+    else:
+        st.session_state[fallback_key] = display_values
+    st.session_state[widget_key] = display_values
+    return preference_valid, display_values
+
+
+def _capture_widget_preference(widget_key: str, preference_key: str) -> None:
+    if widget_key in st.session_state:
+        st.session_state[preference_key] = st.session_state[widget_key]
+
+
+def _prepare_numeric_widget_preference(
+    widget_key: str,
+    preference_key: str,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+    cast=float,
+) -> None:
+    _initialize_preference(
+        preference_key,
+        widget_key,
+        default=default,
+    )
+    _capture_widget_preference(widget_key, preference_key)
+    try:
+        value = cast(st.session_state.get(preference_key, default))
+    except (TypeError, ValueError):
+        value = cast(default)
+    st.session_state[widget_key] = cast(min(maximum, max(minimum, value)))
+
+
+def _progress_fraction(
+    current: int,
+    total: int,
+    *,
+    start: float = 0.0,
+    end: float = 1.0,
+) -> float:
+    """Map a completed/total count onto a bounded Streamlit progress fraction."""
+    total = max(1, int(total or 0))
+    current = max(0, min(int(current or 0), total))
+    start = float(start)
+    end = float(end)
+    if end < start:
+        start, end = end, start
+    return min(end, max(start, start + (end - start) * current / total))
 
 
 def _stabilize_gif_figure_layout(figure) -> None:
@@ -5803,6 +11936,7 @@ def _figures_to_gif(
     *,
     plotly_width: int = 1000,
     plotly_height: int = 700,
+    plotly_camera: dict | None = None,
     total_frames: int | None = None,
     progress_callback=None,
 ) -> bytes:
@@ -5814,6 +11948,7 @@ def _figures_to_gif(
         _stabilize_gif_figure_layout(figure)
         buffer = BytesIO()
         if isinstance(figure, go.Figure):
+            _apply_plotly_camera(figure, plotly_camera)
             try:
                 png = figure.to_image(
                     format="png",
@@ -5905,17 +12040,107 @@ def render_bo_session_app() -> None:
             except Exception as exc:
                 st.error(f"Folder picker failed: {exc}")
         folder = st.text_input(
-            "Session folder",
+            "Experiment or session folder",
             key="bo_session_folder",
-            placeholder=".../bo_session_<name>",
-            help="Choose a folder containing bo_state.json.",
+            placeholder=".../experiment_folder or .../bo_session_<name>",
+            help=(
+                "Choose a BO session folder containing bo_state.json, or an "
+                "experiment folder containing one or more BO session folders."
+            ),
         )
 
     if not folder:
-        st.info("Enter a BO session folder in the sidebar to load its results.")
+        st.info("Enter a BO experiment or session folder in the sidebar to load its results.")
         return
     try:
-        session = load_bo_session(folder)
+        session_folders = discover_bo_session_folders(folder)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+    if not session_folders:
+        st.error(
+            "No BO sessions found. Choose a folder containing bo_state.json or "
+            "an experiment folder with BO session subfolders."
+        )
+        return
+
+    search_root = Path(folder).expanduser().resolve()
+    selected_session_folder = session_folders[0]
+    with st.sidebar:
+        if len(session_folders) > 1:
+            st.markdown("**BO sessions**")
+            st.markdown(
+                """
+                <style>
+                section[data-testid="stSidebar"] div.stButton > button {
+                    min-height: 34px;
+                    height: 34px;
+                    overflow: hidden;
+                    justify-content: flex-start;
+                    padding: 0.35rem 0.55rem;
+                }
+                section[data-testid="stSidebar"] div.stButton > button p {
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    display: block;
+                    max-width: 100%;
+                }
+                section[data-testid="stSidebar"] .bo-session-active-row {
+                    background: #e8f0fe;
+                    border-left: 4px solid #1a73e8;
+                    border-radius: 4px;
+                    padding: 7px 8px;
+                    margin: 4px 0;
+                    font-weight: 600;
+                    color: #1f2937;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    line-height: 20px;
+                    height: 34px;
+                    box-sizing: border-box;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            selected_session_key = f"bo_selected_session_folder_{search_root}"
+            session_options = [str(path) for path in session_folders]
+            if st.session_state.get(selected_session_key) not in session_options:
+                st.session_state[selected_session_key] = session_options[0]
+            for index, session_path_text in enumerate(session_options):
+                session_path = Path(session_path_text)
+                session_label = _bo_session_choice_label(
+                    session_path,
+                    search_root,
+                )
+                if session_path_text == st.session_state[selected_session_key]:
+                    st.markdown(
+                        (
+                            "<div class='bo-session-active-row' title='"
+                            f"{html.escape(session_label)}"
+                            "'>"
+                            f"{html.escape(session_label)}"
+                            "</div>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                elif st.button(
+                    session_label,
+                    key=f"{selected_session_key}_{index}",
+                    use_container_width=True,
+                ):
+                    st.session_state[selected_session_key] = session_path_text
+                    st.rerun()
+            selected_session_folder = Path(st.session_state[selected_session_key])
+        else:
+            st.caption(
+                f"Loaded BO session: "
+                f"{_bo_session_choice_label(selected_session_folder, search_root)}"
+            )
+    try:
+        session = load_bo_session(selected_session_folder)
     except Exception as exc:
         st.error(str(exc))
         return
@@ -5926,6 +12151,11 @@ def render_bo_session_app() -> None:
         st.divider()
         if len(groups) > 1:
             group_ids = [group["id"] for group in groups]
+            _preserve_valid_widget_value(
+                "bo_channel_group_scope",
+                ["all", *group_ids],
+                "all",
+            )
             selected_group_scope = st.selectbox(
                 "Channel groups",
                 ["all", *group_ids],
@@ -5961,6 +12191,14 @@ def render_bo_session_app() -> None:
                 "Using the analysis parameters recorded in bo_config_snapshot.json."
             )
         st.divider()
+        _prepare_numeric_widget_preference(
+            "bo_plot_width_percent",
+            "bo_plot_width_percent__preferred",
+            default=80,
+            minimum=40,
+            maximum=100,
+            cast=int,
+        )
         plot_width_percent = st.slider(
             "Plot width",
             min_value=40,
@@ -5970,6 +12208,15 @@ def render_bo_session_app() -> None:
             format="%d%%",
             help="Width of plots relative to the space available in the current tab or column.",
             key="bo_plot_width_percent",
+        )
+        st.session_state["bo_plot_width_percent__preferred"] = plot_width_percent
+        _prepare_numeric_widget_preference(
+            "bo_plot_3d_height",
+            "bo_plot_3d_height__preferred",
+            default=620,
+            minimum=400,
+            maximum=1500,
+            cast=int,
         )
         plot_3d_height = st.slider(
             "3D plot height",
@@ -5981,6 +12228,29 @@ def render_bo_session_app() -> None:
             help="Canvas height used for 3D tensor plots.",
             key="bo_plot_3d_height",
         )
+        st.session_state["bo_plot_3d_height__preferred"] = plot_3d_height
+        st.session_state.setdefault("bo_3d_perspective_snap_nonce", 0)
+        st.session_state.pop("bo_sync_3d_perspective", None)
+        if st.button(
+            "Sync 3D perspectives now",
+            help=(
+                "Applies the most recently adjusted 3D Plotly camera to 3D "
+                "plots once. Later rotations remain local to the plot you edit."
+            ),
+            key="bo_snap_3d_perspective",
+        ):
+            st.session_state["bo_3d_perspective_snap_nonce"] = (
+                int(st.session_state.get("bo_3d_perspective_snap_nonce", 0)) + 1
+            )
+            st.rerun()
+        _prepare_numeric_widget_preference(
+            "bo_plot_dot_size",
+            "bo_plot_dot_size__preferred",
+            default=6,
+            minimum=2,
+            maximum=20,
+            cast=int,
+        )
         plot_dot_size = st.slider(
             "1D/3D dot size",
             min_value=2,
@@ -5989,6 +12259,47 @@ def render_bo_session_app() -> None:
             step=1,
             help="Marker diameter for 1D slice and 3D tensor plots.",
             key="bo_plot_dot_size",
+        )
+        st.session_state["bo_plot_dot_size__preferred"] = plot_dot_size
+        _prepare_numeric_widget_preference(
+            "bo_plot_dot_opacity",
+            "bo_plot_dot_opacity__preferred",
+            default=0.45,
+            minimum=0.05,
+            maximum=1.0,
+            cast=float,
+        )
+        plot_dot_opacity = st.slider(
+            "1D/3D dot opacity",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.45,
+            step=0.05,
+            format="%.2f",
+            help="Marker opacity for 1D slice and 3D tensor plots.",
+            key="bo_plot_dot_opacity",
+        )
+        st.session_state["bo_plot_dot_opacity__preferred"] = plot_dot_opacity
+        _prepare_numeric_widget_preference(
+            "bo_colorbar_height_percent",
+            "bo_colorbar_height_percent__preferred",
+            default=100,
+            minimum=20,
+            maximum=100,
+            cast=int,
+        )
+        colorbar_height_percent = st.slider(
+            "Colorbar height",
+            min_value=20,
+            max_value=100,
+            value=100,
+            step=5,
+            format="%d%%",
+            help="Height of Plotly colorbars relative to each plot.",
+            key="bo_colorbar_height_percent",
+        )
+        st.session_state["bo_colorbar_height_percent__preferred"] = (
+            colorbar_height_percent
         )
 
     observations = session["observations"]
@@ -6023,6 +12334,20 @@ def render_bo_session_app() -> None:
     )
     c3.metric("Best observation", best_label)
     c4.metric("Candidates", session["state"].get("candidate_count", "—"))
+    simulation_channel_optima = _simulation_channel_optima_frame(full_session)
+    if not simulation_channel_optima.empty:
+        st.markdown("#### Simulation ground-truth optima")
+        st.dataframe(
+            simulation_channel_optima,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Maximum possible Q": st.column_config.NumberColumn(format="%.4g"),
+                "Best frequency": st.column_config.NumberColumn(format="%.6g Hz"),
+                "Best amplitude": st.column_config.NumberColumn(format="%.6g V"),
+                "Best step size": st.column_config.NumberColumn(format="%.6g V"),
+            },
+        )
 
     all_groups_scope = len(groups) > 1 and selected_group_id is None
     observation_group_ids = sorted({
@@ -6030,9 +12355,15 @@ def render_bo_session_app() -> None:
     })
     observation_selector_columns = st.columns(2)
     with observation_selector_columns[0]:
+        observation_group_options = ["all", *observation_group_ids]
+        _preserve_valid_widget_value(
+            "bo_observation_group_scope",
+            observation_group_options,
+            "all",
+        )
         selected_observation_group_scope = st.selectbox(
             "Observation group",
-            [*observation_group_ids, "all"],
+            observation_group_options,
             format_func=lambda group_id: next(
                 (
                     f"{group['name']} (channels "
@@ -6055,14 +12386,22 @@ def render_bo_session_app() -> None:
         int(obs["iteration"]) for obs in group_scoped_observations
     })
     with observation_selector_columns[1]:
+        observation_iteration_options = [*scoped_iterations, "all"]
+        observation_iteration_key = (
+            f"bo_observation_iteration_{selected_observation_group_scope}"
+        )
+        _preserve_valid_widget_value(
+            observation_iteration_key,
+            observation_iteration_options,
+            scoped_iterations[-1] if scoped_iterations else "all",
+        )
         selected_iteration_scope = st.selectbox(
             "Observation iteration",
-            [*scoped_iterations, "all"],
-            index=max(0, len(scoped_iterations) - 1),
+            observation_iteration_options,
             format_func=lambda iteration: (
                 "All iterations" if iteration == "all" else f"Iteration {iteration}"
             ),
-            key=f"bo_observation_iteration_{selected_observation_group_scope}",
+            key=observation_iteration_key,
         )
     selected_observations = [
         obs for obs in group_scoped_observations
@@ -6077,13 +12416,14 @@ def render_bo_session_app() -> None:
     observation_is_single = len(selected_observations) == 1
     iteration_options = scoped_iterations
     iteration_state_key = "bo_requested_observation_iteration"
-    overview, metadata_tab, traces, real_data, surrogate, gifs, pdf_export = st.tabs(
+    overview, metadata_tab, traces, real_data, surrogate, simulation, gifs, pdf_export = st.tabs(
         [
             "History & scores",
             "Optimization metadata",
             "SWV traces",
             "Real data landscapes",
             "Surrogate",
+            "Simulation",
             "GIFs",
             "PDF Export",
         ]
@@ -6107,6 +12447,9 @@ def render_bo_session_app() -> None:
                 "Local candidate pool": item["local_candidate_pool_size"],
                 "Use GP": item["use_gp"],
                 "GP optimizer restarts": item["gp_optimizer_restarts"],
+                "GP noise": item.get("gp_noise_level"),
+                "Simulation seed": item.get("simulation_seed"),
+                "Simulation replicate": item.get("simulation_replicate"),
             }
             for item in optimization_metadata
         ])
@@ -6160,6 +12503,81 @@ def render_bo_session_app() -> None:
             current = first_observations_by_group.get(group_id)
             if current is None or iteration < int(current.get("iteration", 0)):
                 first_observations_by_group[group_id] = recorded_observation
+
+        start_parameter_names = [
+            name for name in PARAMETERS
+            if any(name in item["initial_parameters"] for item in optimization_metadata)
+        ]
+        first_parameter_names = [
+            name for name in PARAMETERS
+            if any(
+                name in (first_observations_by_group.get(int(item["id"])) or {}).get(
+                    "params",
+                    {},
+                )
+                for item in optimization_metadata
+            )
+        ]
+        if start_parameter_names:
+            start_rows = []
+            for item in optimization_metadata:
+                row = {
+                    "Group": item["name"],
+                    "Channels": ", ".join(map(str, item["channels"])),
+                    "Initial-point mode": item["initial_point_mode"],
+                }
+                row.update({
+                    (parameter_config.get(name) or {}).get("label") or name:
+                    item["initial_parameters"].get(name)
+                    for name in start_parameter_names
+                })
+                start_rows.append(row)
+            st.dataframe(
+                pd.DataFrame(start_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Configured starting parameters saved for each channel group."
+            )
+        else:
+            st.info("No configured starting parameters were saved for this session.")
+
+        if first_parameter_names:
+            first_rows = []
+            for item in optimization_metadata:
+                first_observation = first_observations_by_group.get(int(item["id"]))
+                first_iteration_params = (
+                    dict(first_observation.get("params") or {})
+                    if first_observation is not None
+                    else {}
+                )
+                first_rows.append({
+                    "Group": item["name"],
+                    "Channels": ", ".join(map(str, item["channels"])),
+                    "First completed iteration": (
+                        first_observation.get("iteration")
+                        if first_observation is not None
+                        else None
+                    ),
+                    **{
+                        (parameter_config.get(name) or {}).get("label") or name:
+                        first_iteration_params.get(name)
+                        for name in first_parameter_names
+                    },
+                })
+            st.dataframe(
+                pd.DataFrame(first_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "First completed iteration values show the actual parameters "
+                "recorded at the start of each channel-group run."
+            )
+
+        st.markdown("##### Parameter bounds and GP details")
+        parameter_detail_rows = []
         for item in optimization_metadata:
             first_observation = first_observations_by_group.get(int(item["id"]))
             first_iteration_params = (
@@ -6167,53 +12585,42 @@ def render_bo_session_app() -> None:
                 if first_observation is not None
                 else {}
             )
-            first_iteration_label = (
-                f"iteration {first_observation.get('iteration')}"
-                if first_observation is not None
-                else "no completed iteration"
+            parameter_names = [
+                name for name in PARAMETERS
+                if (
+                    name in item["initial_parameters"]
+                    or name in first_iteration_params
+                    or name in item["gp_falloff_fractions"]
+                    or name in item["gp_length_scales"]
+                )
+            ]
+            for name in parameter_names:
+                definition = parameter_config.get(name) or {}
+                parameter_detail_rows.append({
+                    "Group": item["name"],
+                    "Channels": ", ".join(map(str, item["channels"])),
+                    "Parameter": definition.get("label") or name,
+                    "Mode": definition.get("mode"),
+                    "Start": item["initial_parameters"].get(name),
+                    "First iteration": first_iteration_params.get(name),
+                    "Unit": definition.get("unit"),
+                    "Minimum": definition.get("min"),
+                    "Maximum": definition.get("max"),
+                    "GP falloff fraction": item[
+                        "gp_falloff_fractions"
+                    ].get(name),
+                    "GP length scale": item["gp_length_scales"].get(name),
+                })
+        if parameter_detail_rows:
+            st.dataframe(
+                pd.DataFrame(parameter_detail_rows),
+                use_container_width=True,
+                hide_index=True,
             )
-            with st.expander(
-                f"{item['name']} parameter metadata "
-                f"(channels {', '.join(map(str, item['channels']))})"
-            ):
-                parameter_names = [
-                    name for name in PARAMETERS
-                    if (
-                        name in item["initial_parameters"]
-                        or name in first_iteration_params
-                        or name in item["gp_falloff_fractions"]
-                        or name in item["gp_length_scales"]
-                    )
-                ]
-                parameter_rows = []
-                for name in parameter_names:
-                    definition = parameter_config.get(name) or {}
-                    parameter_rows.append({
-                        "Parameter": definition.get("label") or name,
-                        "Mode": definition.get("mode"),
-                        "Start": item["initial_parameters"].get(name),
-                        "First iteration": first_iteration_params.get(name),
-                        "Unit": definition.get("unit"),
-                        "Minimum": definition.get("min"),
-                        "Maximum": definition.get("max"),
-                        "GP falloff fraction": item[
-                            "gp_falloff_fractions"
-                        ].get(name),
-                        "GP length scale": item["gp_length_scales"].get(name),
-                    })
-                if parameter_rows:
-                    st.dataframe(
-                        pd.DataFrame(parameter_rows),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    st.caption(
-                        f"First iteration values are the actual parameters recorded for {first_iteration_label}."
-                    )
-                else:
-                    st.caption(
-                        "No parameter-level starting-point or GP metadata was saved."
-                    )
+        else:
+            st.caption(
+                "No parameter-level starting-point or GP metadata was saved."
+            )
 
         st.divider()
         st.markdown("#### How explore vs exploit affects candidate selection")
@@ -6280,9 +12687,34 @@ def render_bo_session_app() -> None:
             minimum_iteration = int(available_trend_iterations.min())
             maximum_iteration = int(available_trend_iterations.max())
             range_columns = st.columns(2)
-            range_key = (
-                f"{session['state'].get('session_id', 'session')}_"
-                f"{trend_scope_key}"
+            range_key = trend_scope_key
+            trend_start_key = f"bo_trend_iteration_start_{range_key}"
+            trend_end_key = f"bo_trend_iteration_end_{range_key}"
+            trend_start_preference_key = f"{trend_start_key}__preferred"
+            trend_end_preference_key = f"{trend_end_key}__preferred"
+            _capture_widget_preference(
+                trend_start_key,
+                trend_start_preference_key,
+            )
+            _capture_widget_preference(
+                trend_end_key,
+                trend_end_preference_key,
+            )
+            preferred_start = int(st.session_state.get(
+                trend_start_preference_key,
+                minimum_iteration,
+            ))
+            preferred_end = int(st.session_state.get(
+                trend_end_preference_key,
+                maximum_iteration,
+            ))
+            st.session_state[trend_start_key] = min(
+                maximum_iteration,
+                max(minimum_iteration, preferred_start),
+            )
+            st.session_state[trend_end_key] = min(
+                maximum_iteration,
+                max(minimum_iteration, preferred_end),
             )
             iteration_start = int(range_columns[0].number_input(
                 "Plot iteration start",
@@ -6290,7 +12722,7 @@ def render_bo_session_app() -> None:
                 max_value=maximum_iteration,
                 value=minimum_iteration,
                 step=1,
-                key=f"bo_trend_iteration_start_{range_key}",
+                key=trend_start_key,
             ))
             iteration_end = int(range_columns[1].number_input(
                 "Plot iteration end",
@@ -6298,8 +12730,10 @@ def render_bo_session_app() -> None:
                 max_value=maximum_iteration,
                 value=maximum_iteration,
                 step=1,
-                key=f"bo_trend_iteration_end_{range_key}",
+                key=trend_end_key,
             ))
+            st.session_state[trend_start_preference_key] = iteration_start
+            st.session_state[trend_end_preference_key] = iteration_end
             if iteration_start > iteration_end:
                 st.warning(
                     "Iteration start is greater than iteration end; "
@@ -6372,12 +12806,17 @@ def render_bo_session_app() -> None:
                 if "Q_run" in global_metrics
                 else metric_options[0]
             )
+            trend_metric_key = f"bo_trend_metric_{trend_scope_key}"
+            _preserve_valid_widget_value(
+                trend_metric_key,
+                metric_options,
+                default_metric,
+            )
             metric_choice = st.selectbox(
                 "Trend metric",
                 metric_options,
-                index=metric_options.index(default_metric),
                 format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
-                key=f"bo_trend_metric_{trend_scope_key}",
+                key=trend_metric_key,
             )
         else:
             st.info("No trend metrics change within the current group scope.")
@@ -6391,16 +12830,23 @@ def render_bo_session_app() -> None:
             and metric == "Q_run"
             and "Q_channel" in channel_metrics
         ):
+            q_display_options = [
+                "Run-level Q",
+                "Average channel Q",
+                "Overlay channel Q",
+                "Separate channel Q plots",
+            ]
+            q_display_key = f"bo_q_run_display_{trend_scope_key}"
+            _preserve_valid_widget_value(
+                q_display_key,
+                q_display_options,
+                q_display_options[0],
+            )
             q_run_channel_view = st.radio(
                 "Q display",
-                [
-                    "Run-level Q",
-                    "Average channel Q",
-                    "Overlay channel Q",
-                    "Separate channel Q plots",
-                ],
+                q_display_options,
                 horizontal=True,
-                key=f"bo_q_run_display_{trend_scope_key}",
+                key=q_display_key,
             )
             if q_run_channel_view != "Run-level Q":
                 plot_metric_kind = "channel"
@@ -6408,6 +12854,8 @@ def render_bo_session_app() -> None:
         group_layout = "Plot groups overlaid"
         group_color_values = None
         group_color_label = None
+        group_average_values = None
+        group_average_label = None
         has_multiple_trend_groups = (
             metric in trend_history.columns
             and
@@ -6415,23 +12863,80 @@ def render_bo_session_app() -> None:
             and trend_history["group_id"].nunique(dropna=True) > 1
         )
         if has_multiple_trend_groups:
-            group_layout = st.radio(
-                "Group display",
-                [
-                    "Plot groups overlaid",
-                    "Plot groups separately",
-                    "Average groups together",
-                ],
-                horizontal=True,
-                key=f"bo_trend_group_layout_{trend_scope_key}_{metric}",
+            trend_group_metadata = _channel_group_optimization_metadata(
+                full_session,
+                groups,
             )
+            group_layout_options = [
+                "Plot groups overlaid",
+                "Plot groups separately",
+                "Average groups together",
+            ]
+            metadata_group_options: dict[str, tuple[dict[int, float], str]] = {}
+            initial_values = {
+                item["id"]: float(item["n_initial_points"])
+                for item in trend_group_metadata
+                if _finite_float(item.get("n_initial_points")) is not None
+            }
+            if initial_values:
+                metadata_group_options[
+                    "Average groups with same initial maximin points"
+                ] = (initial_values, "Initial maximin")
+            exploration_values = {
+                item["id"]: float(item["exploration"])
+                for item in trend_group_metadata
+                if item["exploration"] is not None
+            }
+            if exploration_values:
+                metadata_group_options[
+                    "Average groups with same exploration weight"
+                ] = (exploration_values, "Exploration")
+            parameter_config = (
+                (full_session.get("config") or {}).get("parameters") or {}
+            )
+            for parameter in PARAMETERS:
+                falloff_values = {
+                    item["id"]: float(item["gp_falloff_fractions"][parameter])
+                    for item in trend_group_metadata
+                    if parameter in item["gp_falloff_fractions"]
+                    and _finite_float(item["gp_falloff_fractions"][parameter])
+                    is not None
+                }
+                if falloff_values:
+                    parameter_label = (
+                        (parameter_config.get(parameter) or {}).get("label")
+                        or parameter
+                    )
+                    metadata_group_options[
+                        f"Average groups with same GP falloff — {parameter_label}"
+                    ] = (falloff_values, f"{parameter_label} GP falloff")
+            group_layout_options.extend(metadata_group_options)
+            group_layout_key = f"bo_trend_group_layout_{trend_scope_key}_{metric}"
+            _preserve_valid_widget_value(
+                group_layout_key,
+                group_layout_options,
+                group_layout_options[0],
+            )
+            group_layout = st.selectbox(
+                "Group display",
+                group_layout_options,
+                key=group_layout_key,
+            )
+            if group_layout in metadata_group_options:
+                group_average_values, group_average_label = metadata_group_options[
+                    group_layout
+                ]
             if group_layout != "Average groups together":
-                trend_group_metadata = _channel_group_optimization_metadata(
-                    full_session,
-                    groups,
-                )
                 color_options: dict[str, tuple[dict[int, float] | None, str | None]] = {
                     "Default categorical colors": (None, None),
+                    "Initial random/maximin points": (
+                        {
+                            item["id"]: float(item["n_initial_points"])
+                            for item in trend_group_metadata
+                            if _finite_float(item.get("n_initial_points")) is not None
+                        },
+                        "Initial points",
+                    ),
                     "Exploration weight": (
                         {
                             item["id"]: float(item["exploration"])
@@ -6449,9 +12954,6 @@ def render_bo_session_app() -> None:
                         "Exploitation",
                     ),
                 }
-                parameter_config = (
-                    (full_session.get("config") or {}).get("parameters") or {}
-                )
                 for parameter in PARAMETERS:
                     values = {
                         item["id"]: float(
@@ -6470,35 +12972,87 @@ def render_bo_session_app() -> None:
                             values,
                             f"{parameter_label} GP falloff",
                         )
+                group_color_key = (
+                    f"bo_trend_group_colormap_{trend_scope_key}_{metric}"
+                )
+                _preserve_valid_widget_value(
+                    group_color_key,
+                    list(color_options),
+                    "Default categorical colors",
+                )
                 group_color_choice = st.selectbox(
                     "Group colormap metadata metric",
                     list(color_options),
-                    key=(
-                        f"bo_trend_group_colormap_{trend_scope_key}_{metric}"
-                    ),
+                    key=group_color_key,
                 )
                 group_color_values, group_color_label = color_options[
                     group_color_choice
                 ]
         chart_key_suffix = metric
+        simulation_optimum_reference = _session_simulation_optimum_reference(full_session)
+        trend_reference_value = None
+        trend_reference_label = None
+        if simulation_optimum_reference and plot_metric_kind == "global":
+            reference_metric = "Q_run" if metric == "Q_run" else metric
+            if reference_metric in {
+                "Q_run",
+                "frequency",
+                "amplitude",
+                "step_potential",
+            }:
+                trend_reference_value = simulation_optimum_reference.get(
+                    reference_metric
+                )
+                if trend_reference_value is not None:
+                    trend_reference_label = (
+                        "Best possible Q"
+                        if reference_metric == "Q_run"
+                        else f"Best-Q {_metric_label(reference_metric)}"
+                    )
         if plot_metric_kind == "channel":
             available_metric_channels = sorted(
                 channel_metrics[plot_metric],
                 key=_channel_sort_key,
             )
+            trend_channels_key = f"bo_trend_channels_{trend_scope_key}_{plot_metric}"
+            trend_channels_valid, trend_channels_display = (
+                _prepare_preferred_multiselect_value(
+                    trend_channels_key,
+                    f"{trend_channels_key}__preferred",
+                    available_metric_channels,
+                    available_metric_channels,
+                )
+            )
             trend_channels = st.multiselect(
                 "Trend channels",
                 available_metric_channels,
-                default=available_metric_channels,
+                default=trend_channels_display,
                 format_func=lambda channel: f"Ch {channel}",
-                key=f"bo_trend_channels_{trend_scope_key}_{plot_metric}",
+                key=trend_channels_key,
+            )
+            _sync_preferred_widget_value(
+                trend_channels_key,
+                f"{trend_channels_key}__preferred",
+                trend_channels_valid,
+                trend_channels_display,
             )
             if q_run_channel_view is None:
+                channel_layout_options = [
+                    "Overlay selected channels",
+                    "Separate plots",
+                    "Average selected channels",
+                ]
+                channel_layout_key = f"bo_trend_layout_{trend_scope_key}_{plot_metric}"
+                _preserve_valid_widget_value(
+                    channel_layout_key,
+                    channel_layout_options,
+                    channel_layout_options[0],
+                )
                 channel_layout = st.radio(
                     "Channel display",
-                    ["Overlay selected channels", "Separate plots", "Average selected channels"],
+                    channel_layout_options,
                     horizontal=True,
-                    key=f"bo_trend_layout_{trend_scope_key}_{plot_metric}",
+                    key=channel_layout_key,
                 )
             else:
                 channel_layout = {
@@ -6516,6 +13070,8 @@ def render_bo_session_app() -> None:
                     group_layout,
                     group_color_values,
                     group_color_label,
+                    group_average_values,
+                    group_average_label,
                 )
             else:
                 trend_figure = go.Figure()
@@ -6527,6 +13083,7 @@ def render_bo_session_app() -> None:
             chart_key_suffix = (
                 f"{metric}_{plot_metric}_{channel_layout}_"
                 f"{group_layout}_{group_color_label or 'categorical'}_"
+                f"{group_average_label or 'no_metadata_average'}_"
                 f"{'_'.join(trend_channels) or 'none'}"
             )
         else:
@@ -6536,15 +13093,31 @@ def render_bo_session_app() -> None:
                 group_layout,
                 group_color_values,
                 group_color_label,
+                group_average_values,
+                group_average_label,
+                reference_value=trend_reference_value,
+                reference_label=trend_reference_label,
             )
             chart_key_suffix = (
-                f"{metric}_{group_layout}_{group_color_label or 'categorical'}"
+                f"{metric}_{group_layout}_{group_color_label or 'categorical'}_"
+                f"{group_average_label or 'no_metadata_average'}"
             )
         chart_key_suffix = (
             f"{trend_scope_key}_{iteration_start}_{iteration_end}_"
             f"{chart_key_suffix}"
         )
-        trend_events = [_sized_plot_container(st, plot_width_percent).plotly_chart(
+        trend_y_limits = _manual_y_axis_range_control(
+            "trend",
+            f"bo_trend_{trend_scope_key}_{metric}",
+            [trend_figure],
+        )
+        if trend_y_limits is not None:
+            _apply_y_axis_range(trend_figure, *trend_y_limits)
+            chart_key_suffix = (
+                f"{chart_key_suffix}_ylim_{trend_y_limits[0]:g}_{trend_y_limits[1]:g}"
+            )
+        trend_events = [_plotly_chart_with_colorbars(
+            _sized_plot_container(st, plot_width_percent),
             trend_figure,
             use_container_width=True,
             on_select="rerun",
@@ -6554,6 +13127,1123 @@ def render_bo_session_app() -> None:
         trend_q_kind = _metric_q_kind(metric, paired_objective)
         if trend_q_kind:
             _render_q_equation(session["config"], trend_q_kind)
+
+        @st.fragment
+        def _render_hyperparameter_response_fragment() -> None:
+            hyperparameter_columns = _hyperparameter_response_columns(trend_history)
+            hyper_metric_options = list(metric_options)
+            if len(hyperparameter_columns) >= 2 and hyper_metric_options:
+                st.divider()
+                st.subheader("Hyperparameter response")
+                hp_columns = st.columns(7)
+                default_hp_metric = (
+                    "global::Q_run" if "global::Q_run" in hyper_metric_options
+                    else "global::best_so_far" if "global::best_so_far" in hyper_metric_options
+                    else hyper_metric_options[0]
+                )
+                _preserve_valid_widget_value(
+                    "bo_hp_response_metric",
+                    hyper_metric_options,
+                    default_hp_metric,
+                )
+                hp_metric = hp_columns[0].selectbox(
+                    "Response metric",
+                    hyper_metric_options,
+                    format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
+                    key="bo_hp_response_metric",
+                )
+                hp_metric_kind, hp_metric_name = hp_metric.split("::", 1)
+                hp_metric_key = hp_metric.split("::", 1)[1]
+                hp_metric_label = _metric_label(hp_metric_name)
+                hp_view_options = (
+                    ["2D heatmap", "3D heatmap"]
+                    if len(hyperparameter_columns) >= 3
+                    else ["2D heatmap"]
+                )
+                _preserve_valid_widget_value(
+                    "bo_hp_response_view",
+                    hp_view_options,
+                    hp_view_options[0],
+                )
+                hp_view = hp_columns[1].selectbox(
+                    "View",
+                    hp_view_options,
+                    key="bo_hp_response_view",
+                )
+                _preserve_valid_widget_value(
+                    "bo_hp_response_x",
+                    hyperparameter_columns,
+                    (
+                        "gp_falloff_value"
+                        if "gp_falloff_value" in hyperparameter_columns
+                        else hyperparameter_columns[0]
+                    ),
+                )
+                hp_x = hp_columns[2].selectbox(
+                    "X hyperparameter",
+                    hyperparameter_columns,
+                    format_func=_metric_label,
+                    key="bo_hp_response_x",
+                )
+                hp_y_options = [
+                    column for column in hyperparameter_columns if column != hp_x
+                ]
+                _preserve_valid_widget_value(
+                    "bo_hp_response_y",
+                    hp_y_options,
+                    (
+                        "exploration"
+                        if "exploration" in hp_y_options
+                        else hp_y_options[0]
+                    ),
+                )
+                hp_y = hp_columns[3].selectbox(
+                    "Y hyperparameter",
+                    hp_y_options,
+                    format_func=_metric_label,
+                    key="bo_hp_response_y",
+                )
+                hp_z = None
+                hp_2d_slice_column = None
+                hp_2d_slice_value = None
+                hp_3d_slice_axis = None
+                hp_3d_slice_value = None
+                hp_3d_slice_value_key = None
+                hp_3d_slice_values = []
+                hp_3d_mouse_mode = "Rotate/view 3D plot"
+                hp_voxel_face_opacity = 0.72
+                hp_voxel_internal_opacity = 0.0
+                hp_voxel_internal_point_size = 3
+                hp_voxel_internal_point_count = 27
+                if hp_view == "3D heatmap":
+                    hp_z_options = [
+                        column for column in hyperparameter_columns
+                        if column not in {hp_x, hp_y}
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_hp_response_z",
+                        hp_z_options,
+                        hp_z_options[0],
+                    )
+                    hp_z = hp_columns[4].selectbox(
+                        "Z hyperparameter",
+                        hp_z_options,
+                        format_func=_metric_label,
+                        key="bo_hp_response_z",
+                    )
+                    hp_3d_slice_axes = [hp_x, hp_y, hp_z]
+                    hp_3d_slice_axis_choices = [
+                        NO_HIGHLIGHTED_SLICE_LABEL,
+                        *hp_3d_slice_axes,
+                    ]
+                    slice_control_columns = st.columns(3)
+                    _preserve_valid_widget_value(
+                        "bo_hp_response_3d_slice_axis",
+                        hp_3d_slice_axis_choices,
+                        hp_z,
+                    )
+                    hp_3d_slice_axis_choice = slice_control_columns[0].selectbox(
+                        "Highlighted slice axis",
+                        hp_3d_slice_axis_choices,
+                        format_func=lambda value: (
+                            value
+                            if value == NO_HIGHLIGHTED_SLICE_LABEL
+                            else _metric_label(value)
+                        ),
+                        key="bo_hp_response_3d_slice_axis",
+                        help=(
+                            "Click a 3D heatmap point to set the slice value "
+                            "for this axis. The selected slice is drawn as a "
+                            "transparent red plane."
+                        ),
+                    )
+                    hp_3d_slice_axis = (
+                        None
+                        if hp_3d_slice_axis_choice == NO_HIGHLIGHTED_SLICE_LABEL
+                        else hp_3d_slice_axis_choice
+                    )
+                    mouse_mode_options = [
+                        "Rotate/view 3D plot",
+                        "Pick slice by clicking",
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_hp_response_3d_mouse_mode",
+                        mouse_mode_options,
+                        mouse_mode_options[0],
+                    )
+                    hp_3d_mouse_mode = slice_control_columns[2].selectbox(
+                        "Mouse mode",
+                        mouse_mode_options,
+                        key="bo_hp_response_3d_mouse_mode",
+                        help=(
+                            "Use rotate/view for normal 3D interaction. Switch "
+                            "to click-pick only when selecting a slice from the "
+                            "plot with the mouse."
+                        ),
+                    )
+                    st.caption(
+                        "Default mouse mode preserves 3D rotate/pan/zoom. To "
+                        "select with the mouse, switch to Pick slice by clicking, "
+                        "choose the slice axis, then click a 3D point."
+                    )
+                    if hp_3d_slice_axis is not None:
+                        hp_3d_slice_values = sorted(
+                            pd.to_numeric(
+                                trend_history[hp_3d_slice_axis],
+                                errors="coerce",
+                            ).dropna().unique().tolist()
+                        )
+                    if hp_3d_slice_axis is not None and hp_3d_slice_values:
+                        hp_3d_slice_value_key = (
+                            f"bo_hp_response_3d_slice_value_"
+                            f"{hp_x}_{hp_y}_{hp_z}_{hp_3d_slice_axis}"
+                        )
+                        _preserve_valid_widget_value(
+                            hp_3d_slice_value_key,
+                            hp_3d_slice_values,
+                            hp_3d_slice_values[0],
+                        )
+                        hp_3d_slice_value = float(
+                            slice_control_columns[1].selectbox(
+                                f"Slice {_metric_label(hp_3d_slice_axis)}",
+                                hp_3d_slice_values,
+                                format_func=lambda value: f"{float(value):g}",
+                                key=hp_3d_slice_value_key,
+                            )
+                        )
+                    render_settings_key = "bo_hp_response_3d_render_settings"
+                    st.session_state.setdefault(
+                        render_settings_key,
+                        {
+                            "face_opacity": 0.72,
+                            "internal_opacity": 0.2,
+                            "point_size": 3,
+                            "point_count": 27,
+                        },
+                    )
+                    applied_render_settings = dict(
+                        st.session_state[render_settings_key]
+                    )
+                    applied_render_settings.setdefault("point_count", 27)
+                    opacity_columns = st.columns(4)
+                    draft_face_opacity = float(opacity_columns[0].slider(
+                        "Voxel face alpha",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(applied_render_settings["face_opacity"]),
+                        step=0.05,
+                        key="bo_hp_response_voxel_face_opacity_draft",
+                    ))
+                    draft_internal_opacity = float(opacity_columns[1].slider(
+                        "Internal point opacity",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(applied_render_settings["internal_opacity"]),
+                        step=0.05,
+                        key="bo_hp_response_voxel_internal_opacity_draft",
+                    ))
+                    draft_point_size = int(opacity_columns[2].slider(
+                        "Internal point size",
+                        min_value=1,
+                        max_value=25,
+                        value=int(applied_render_settings["point_size"]),
+                        step=1,
+                        key="bo_hp_response_voxel_internal_point_size_draft",
+                    ))
+                    point_count_options = [1, 4, 27, 64]
+                    draft_point_count = int(opacity_columns[3].selectbox(
+                        "Internal point number",
+                        point_count_options,
+                        index=point_count_options.index(
+                            int(applied_render_settings["point_count"])
+                            if int(applied_render_settings["point_count"]) in point_count_options
+                            else 27
+                        ),
+                        key="bo_hp_response_voxel_internal_point_count_draft",
+                    ))
+                    hp_voxel_face_opacity = draft_face_opacity
+                    hp_voxel_internal_opacity = draft_internal_opacity
+                    hp_voxel_internal_point_size = draft_point_size
+                    hp_voxel_internal_point_count = draft_point_count
+                if hp_view == "2D heatmap":
+                    hp_2d_slice_options = [
+                        column for column in hyperparameter_columns
+                        if column not in {hp_x, hp_y}
+                    ]
+                    if hp_2d_slice_options:
+                        slice_columns = st.columns(2)
+                        hp_2d_slice_choices = [
+                            *hp_2d_slice_options,
+                            "Average all other unplotted values",
+                        ]
+                        hp_2d_slice_column_key = (
+                            f"bo_hp_response_2d_slice_column_{hp_x}_{hp_y}"
+                        )
+                        _preserve_valid_widget_value(
+                            hp_2d_slice_column_key,
+                            hp_2d_slice_choices,
+                            hp_2d_slice_options[0],
+                        )
+                        hp_2d_slice_choice = slice_columns[0].selectbox(
+                            "Fixed third parameter",
+                            hp_2d_slice_choices,
+                            format_func=lambda choice: (
+                                choice
+                                if choice == "Average all other unplotted values"
+                                else _metric_label(choice)
+                            ),
+                            key=hp_2d_slice_column_key,
+                        )
+                        if hp_2d_slice_choice != "Average all other unplotted values":
+                            hp_2d_slice_column = hp_2d_slice_choice
+                            hp_2d_slice_values = sorted(
+                                pd.to_numeric(
+                                    trend_history[hp_2d_slice_column],
+                                    errors="coerce",
+                                ).dropna().unique().tolist()
+                            )
+                            if hp_2d_slice_values:
+                                hp_2d_slice_value_key = (
+                                    f"bo_hp_response_2d_slice_value_"
+                                    f"{hp_x}_{hp_y}_{hp_2d_slice_column}"
+                                )
+                                hp_2d_slice_options_key = (
+                                    f"{hp_2d_slice_value_key}__options"
+                                )
+                                hp_2d_slice_options_signature = tuple(
+                                    round(float(value), 12)
+                                    for value in hp_2d_slice_values
+                                )
+                                if (
+                                    st.session_state.get(hp_2d_slice_options_key)
+                                    != hp_2d_slice_options_signature
+                                ):
+                                    st.session_state.pop(
+                                        f"{hp_2d_slice_value_key}__preferred",
+                                        None,
+                                    )
+                                    st.session_state[hp_2d_slice_options_key] = (
+                                        hp_2d_slice_options_signature
+                                    )
+                                _preserve_valid_widget_value(
+                                    hp_2d_slice_value_key,
+                                    hp_2d_slice_values,
+                                    hp_2d_slice_values[0],
+                                )
+                                hp_2d_slice_value = float(
+                                    slice_columns[1].selectbox(
+                                        f"Fixed {_metric_label(hp_2d_slice_column)}",
+                                        hp_2d_slice_values,
+                                        format_func=lambda value: f"{float(value):g}",
+                                        key=hp_2d_slice_value_key,
+                                    )
+                                )
+                hp_crop_ranges: dict[str, tuple[float, float]] = {}
+                hp_crop_axes = [
+                    axis for axis in [hp_x, hp_y, hp_z]
+                    if axis is not None
+                ]
+                with st.expander("Crop heatmap/tensor by parameter", expanded=False):
+                    hp_crop_enabled = st.checkbox(
+                        "Enable parameter crop",
+                        key=(
+                            f"bo_hp_response_crop_enabled_{trend_scope_key}_"
+                            f"{hp_view}_{hp_x}_{hp_y}_{hp_z or 'none'}"
+                        ),
+                    )
+                    if hp_crop_enabled:
+                        st.caption(
+                            "Crop limits are applied before aggregation and plotting."
+                        )
+                        crop_columns = st.columns(len(hp_crop_axes))
+                        for axis_index, axis_name in enumerate(hp_crop_axes):
+                            axis_values = pd.to_numeric(
+                                trend_history[axis_name],
+                                errors="coerce",
+                            ).dropna()
+                            if axis_values.empty:
+                                continue
+                            axis_min = float(axis_values.min())
+                            axis_max = float(axis_values.max())
+                            axis_step = max(
+                                abs(axis_max - axis_min) / 100.0,
+                                1e-9,
+                            )
+                            with crop_columns[axis_index]:
+                                st.markdown(f"**{_metric_label(axis_name)}**")
+                                crop_min = float(st.number_input(
+                                    "Min",
+                                    value=axis_min,
+                                    step=axis_step,
+                                    format="%.8g",
+                                    key=(
+                                        f"bo_hp_response_crop_min_"
+                                        f"{trend_scope_key}_{hp_view}_"
+                                        f"{hp_x}_{hp_y}_{hp_z or 'none'}_{axis_name}"
+                                    ),
+                                ))
+                                crop_max = float(st.number_input(
+                                    "Max",
+                                    value=axis_max,
+                                    step=axis_step,
+                                    format="%.8g",
+                                    key=(
+                                        f"bo_hp_response_crop_max_"
+                                        f"{trend_scope_key}_{hp_view}_"
+                                        f"{hp_x}_{hp_y}_{hp_z or 'none'}_{axis_name}"
+                                    ),
+                                ))
+                            if crop_min > crop_max:
+                                crop_min, crop_max = crop_max, crop_min
+                            hp_crop_ranges[axis_name] = (crop_min, crop_max)
+                hp_summary_options = [
+                    "Final iteration",
+                    "Best over iterations",
+                    "Mean over iterations",
+                    "Specific iteration",
+                ]
+                hp_threshold_metric = "q" in hp_metric_name.lower()
+                if hp_threshold_metric:
+                    hp_summary_options.append("Iterations to Q target")
+                _preserve_valid_widget_value(
+                    "bo_hp_response_summary",
+                    hp_summary_options,
+                    "Final iteration",
+                )
+                hp_summary = hp_columns[5].selectbox(
+                    "Run summary",
+                    hp_summary_options,
+                    key="bo_hp_response_summary",
+                )
+                hp_aggregate_options = ["Mean", "Median", "Maximum", "Minimum"]
+                _preserve_valid_widget_value(
+                    "bo_hp_response_aggregate",
+                    hp_aggregate_options,
+                    "Mean",
+                )
+                hp_aggregate = hp_columns[6].selectbox(
+                    "Repeat aggregation",
+                    hp_aggregate_options,
+                    key="bo_hp_response_aggregate",
+                )
+                hp_iteration = None
+                if hp_summary == "Specific iteration" and not available_trend_iterations.empty:
+                    hp_iteration = int(st.number_input(
+                        "Hyperparameter response iteration",
+                        min_value=int(available_trend_iterations.min()),
+                        max_value=int(available_trend_iterations.max()),
+                        value=int(available_trend_iterations.max()),
+                        step=1,
+                        key="bo_hp_response_iteration",
+                    ))
+                hp_q_target = None
+                hp_include_misses = False
+                if hp_summary == "Iterations to Q target":
+                    threshold_columns = st.columns([1, 1])
+                    hp_q_target = float(threshold_columns[0].number_input(
+                        "Target Q score",
+                        value=0.8,
+                        step=0.01,
+                        format="%.6g",
+                        key=f"bo_hp_response_q_target_{trend_scope_key}_{hp_metric_key}",
+                        help=(
+                            "Plots the first BO iteration where the run's best "
+                            "Q reaches or exceeds this value."
+                        ),
+                    ))
+                    hp_include_misses = threshold_columns[1].checkbox(
+                        "Plot runs that do not reach target",
+                        value=True,
+                        key=(
+                            f"bo_hp_response_q_target_include_misses_"
+                            f"{trend_scope_key}_{hp_metric_key}"
+                        ),
+                        help=(
+                            "Unreached runs are shown as one iteration past "
+                            "that run's last available iteration."
+                        ),
+                    )
+                hp_force_render_key = (
+                    f"bo_hp_response_force_render_{trend_scope_key}"
+                )
+                hp_pending_gif_key = (
+                    f"bo_hp_response_generate_gif_pending_{trend_scope_key}"
+                )
+                hp_apply_response_settings = st.button(
+                    "Render hyperparameter response",
+                    type="primary",
+                    key="bo_hp_response_render_button",
+                ) or bool(st.session_state.pop(hp_force_render_key, False))
+                if hp_apply_response_settings and hp_view == "3D heatmap":
+                    st.session_state[render_settings_key] = {
+                        "face_opacity": draft_face_opacity,
+                        "internal_opacity": draft_internal_opacity,
+                        "point_size": draft_point_size,
+                        "point_count": draft_point_count,
+                    }
+                    applied_render_settings = dict(
+                        st.session_state[render_settings_key]
+                    )
+                    hp_voxel_face_opacity = float(
+                        applied_render_settings["face_opacity"]
+                    )
+                    hp_voxel_internal_opacity = float(
+                        applied_render_settings["internal_opacity"]
+                    )
+                    hp_voxel_internal_point_size = int(
+                        applied_render_settings["point_size"]
+                    )
+                    hp_voxel_internal_point_count = int(
+                        applied_render_settings.get("point_count", 27)
+                    )
+                hp_render_cache_key = (
+                    f"bo_hp_response_render_cache_{trend_scope_key}"
+                )
+                hp_cached_render = st.session_state.get(hp_render_cache_key)
+                hp_needs_render_compute = (
+                    hp_apply_response_settings or hp_cached_render is not None
+                )
+                hp_response_history = trend_history
+                if hp_metric_kind == "channel":
+                    hp_channel_options = sorted(
+                        channel_metrics.get(hp_metric_name, {}),
+                        key=_channel_sort_key,
+                    )
+                    hp_channel_key = f"bo_hp_response_channels_{hp_metric_name}"
+                    hp_valid_channels, hp_display_channels = (
+                        _prepare_preferred_multiselect_value(
+                            hp_channel_key,
+                            f"{hp_channel_key}__preferred",
+                            hp_channel_options,
+                            hp_channel_options,
+                        )
+                    )
+                    hp_selected_channels = st.multiselect(
+                        "Response channels",
+                        hp_channel_options,
+                        default=hp_display_channels,
+                        format_func=lambda channel: f"Ch {channel}",
+                        key=hp_channel_key,
+                    )
+                    _sync_preferred_widget_value(
+                        hp_channel_key,
+                        f"{hp_channel_key}__preferred",
+                        hp_valid_channels,
+                        hp_display_channels,
+                    )
+                    if hp_needs_render_compute:
+                        hp_selected_columns = [
+                            channel_metrics[hp_metric_name][channel]
+                            for channel in hp_selected_channels
+                            if channel in channel_metrics.get(hp_metric_name, {})
+                        ]
+                        hp_metric_key = "__hp_channel_response_metric"
+                        hp_metric_label = _metric_label(hp_metric_name)
+                        hp_response_history = trend_history.copy()
+                        hp_response_history[hp_metric_key] = (
+                            hp_response_history[hp_selected_columns]
+                            .apply(pd.to_numeric, errors="coerce")
+                            .mean(axis=1)
+                            if hp_selected_columns
+                            else np.nan
+                        )
+                if not hp_apply_response_settings and hp_cached_render is None:
+                    st.info(
+                        "Click Render hyperparameter response to generate the plot "
+                        "for the current controls."
+                    )
+                else:
+                    response_frame = _hyperparameter_response_frame(
+                        hp_response_history,
+                        hp_metric_key,
+                        hp_summary,
+                        iteration=hp_iteration,
+                        q_target=hp_q_target,
+                        include_misses=hp_include_misses,
+                    )
+                    if response_frame.empty:
+                        st.info(
+                            "No run-level hyperparameter response values are available "
+                            "for the current scope and iteration range."
+                        )
+                    else:
+                        plot_response_frame = response_frame
+                        hp_slice_tokens: list[str] = []
+                        hp_slice_filters: dict[str, float | None] = {}
+                        hp_crop_tokens: list[str] = []
+                        for crop_axis, (crop_min, crop_max) in hp_crop_ranges.items():
+                            if crop_axis not in plot_response_frame.columns:
+                                continue
+                            crop_values = pd.to_numeric(
+                                plot_response_frame[crop_axis],
+                                errors="coerce",
+                            )
+                            plot_response_frame = plot_response_frame[
+                                crop_values.between(
+                                    float(crop_min),
+                                    float(crop_max),
+                                    inclusive="both",
+                                )
+                            ]
+                            hp_crop_tokens.append(
+                                f"{crop_axis}={float(crop_min):g}:{float(crop_max):g}"
+                            )
+                        if (
+                            hp_view == "2D heatmap"
+                            and hp_2d_slice_column is not None
+                            and hp_2d_slice_value is not None
+                            and hp_2d_slice_column in response_frame.columns
+                        ):
+                            plot_response_frame = plot_response_frame[
+                                np.isclose(
+                                    pd.to_numeric(
+                                        plot_response_frame[hp_2d_slice_column],
+                                        errors="coerce",
+                                    ),
+                                    float(hp_2d_slice_value),
+                                    rtol=1e-9,
+                                    atol=1e-12,
+                                    equal_nan=False,
+                                )
+                            ]
+                            hp_slice_tokens.append(
+                                f"{hp_2d_slice_column}={float(hp_2d_slice_value):g}"
+                            )
+                            hp_slice_filters[hp_2d_slice_column] = float(hp_2d_slice_value)
+                        elif hp_view == "2D heatmap":
+                            hp_slice_tokens.append("all_unplotted=average")
+                        if plot_response_frame.empty:
+                            st.info(
+                                "No hyperparameter response values match the selected "
+                                "crop or 2D slice filters."
+                            )
+                        else:
+                            hp_render_signature = (
+                                trend_scope_key,
+                                iteration_start,
+                                iteration_end,
+                                hp_metric_key,
+                                hp_view,
+                                hp_x,
+                                hp_y,
+                                hp_z,
+                                hp_summary,
+                                hp_aggregate,
+                                hp_iteration,
+                                hp_q_target,
+                                hp_include_misses,
+                                hp_3d_slice_axis,
+                                hp_3d_slice_value,
+                                hp_voxel_face_opacity,
+                                hp_voxel_internal_opacity,
+                                hp_voxel_internal_point_size,
+                                hp_voxel_internal_point_count,
+                                tuple(hp_crop_tokens),
+                                tuple(hp_slice_tokens),
+                            )
+                            hp_render_cache_key = (
+                                f"bo_hp_response_render_cache_{trend_scope_key}"
+                            )
+                            cached_render = st.session_state.get(
+                                hp_render_cache_key
+                            )
+                            use_cached_render = (
+                                cached_render is not None
+                                and not hp_apply_response_settings
+                                and cached_render.get("signature")
+                                == hp_render_signature
+                            )
+                            if use_cached_render:
+                                hp_figure = cached_render["figure"]
+                                rendered_response_frame = cached_render["response_frame"]
+                                rendered_sort_columns = cached_render["sort_columns"]
+                                rendered_key_suffix = cached_render["key_suffix"]
+                            else:
+                                hp_plot_metric_label = (
+                                    "Iterations to target Q"
+                                    if hp_summary == "Iterations to Q target"
+                                    else hp_metric_label
+                                )
+                                hp_figure = _plot_hyperparameter_response(
+                                    plot_response_frame,
+                                    x_axis=hp_x,
+                                    y_axis=hp_y,
+                                    z_axis=hp_z,
+                                    metric_label=hp_plot_metric_label,
+                                    aggregate=hp_aggregate,
+                                    voxel_face_opacity=hp_voxel_face_opacity,
+                                    voxel_internal_opacity=hp_voxel_internal_opacity,
+                                    voxel_internal_point_size=hp_voxel_internal_point_size,
+                                    voxel_internal_point_count=hp_voxel_internal_point_count,
+                                    slice_axis=hp_3d_slice_axis,
+                                    slice_value=hp_3d_slice_value,
+                                )
+                                if hp_summary == "Iterations to Q target":
+                                    hp_figure.update_layout(
+                                        title=(
+                                            f"{hp_aggregate} iterations to "
+                                            f"{hp_metric_label} >= "
+                                            f"{float(hp_q_target):g}"
+                                        )
+                                    )
+                                rendered_response_frame = plot_response_frame
+                                rendered_sort_columns = [
+                                    column for column in [hp_z, hp_y, hp_x]
+                                    if column is not None
+                                    and column in rendered_response_frame.columns
+                                ]
+                                rendered_key_suffix = (
+                                    f"{iteration_end}_{hp_metric_key}_{hp_view}_{hp_x}_{hp_y}_"
+                                    f"{hp_z or 'none'}_{hp_summary}_{hp_aggregate}_"
+                                    f"{hp_iteration}_{hp_q_target}_{int(hp_include_misses)}_"
+                                    f"{hp_3d_slice_axis or 'no_slice'}_{hp_3d_slice_value}_"
+                                    f"{hp_voxel_face_opacity:g}_"
+                                    f"{hp_voxel_internal_opacity:g}_"
+                                    f"{hp_voxel_internal_point_size}_"
+                                    f"{hp_voxel_internal_point_count}_"
+                                    f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
+                                    f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
+                                )
+                                rendered_gif_key = (
+                                    f"bo_hp_response_gif_{trend_scope_key}_"
+                                    f"{hp_metric_key}_{hp_view}_{hp_x}_{hp_y}_"
+                                    f"{hp_z or 'none'}_{hp_aggregate}_"
+                                    f"{iteration_start}_{iteration_end}_"
+                                    f"{hp_q_target}_{int(hp_include_misses)}_"
+                                    f"{hp_3d_slice_axis or 'no_slice'}_{hp_3d_slice_value}_"
+                                    f"{hp_voxel_face_opacity:g}_"
+                                    f"{hp_voxel_internal_opacity:g}_"
+                                    f"{hp_voxel_internal_point_size}_"
+                                    f"{hp_voxel_internal_point_count}_"
+                                    f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
+                                    f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
+                                )
+                                st.session_state[hp_render_cache_key] = {
+                                    "figure": hp_figure,
+                                    "response_frame": rendered_response_frame,
+                                    "sort_columns": rendered_sort_columns,
+                                    "key_suffix": rendered_key_suffix,
+                                    "signature": hp_render_signature,
+                                    "gif_key": rendered_gif_key,
+                                    "allow_gif": hp_summary != "Iterations to Q target",
+                                }
+                            hp_plot_column = _sized_plot_container(
+                                st,
+                                plot_width_percent,
+                            )
+                            hp_plot_event = None
+                            hp_clicked_points = None
+                            hp_plot_key = (
+                                f"bo_hp_response_{trend_scope_key}_{iteration_start}_"
+                                f"{rendered_key_suffix}"
+                            )
+                            hp_click_pick_enabled = (
+                                hp_view == "3D heatmap"
+                                and hp_3d_slice_axis is not None
+                                and hp_3d_mouse_mode == "Pick slice by clicking"
+                            )
+                            hp_plot_key = (
+                                f"{hp_plot_key}_click_pick"
+                                if hp_click_pick_enabled
+                                else f"{hp_plot_key}_rotate"
+                            )
+                            if hp_click_pick_enabled and plotly_events is not None:
+                                _apply_plotly_colorbar_height(hp_figure)
+                                with hp_plot_column:
+                                    hp_clicked_points = plotly_events(
+                                        hp_figure,
+                                        click_event=True,
+                                        hover_event=False,
+                                        select_event=False,
+                                        override_height=plot_3d_height,
+                                        override_width="100%",
+                                        key=hp_plot_key,
+                                    )
+                            elif hp_view == "3D heatmap":
+                                _render_downloadable_plotly(
+                                    hp_plot_column,
+                                    hp_figure,
+                                    key=hp_plot_key,
+                                    camera_storage_key=hp_plot_key,
+                                    file_stem=(
+                                        f"hyperparameter_response_{hp_metric_label}_"
+                                        f"{hp_x}_{hp_y}_{hp_z or 'none'}"
+                                    ),
+                                    width_percent=100,
+                                    export_width=1200,
+                                    export_height=plot_3d_height,
+                                )
+                            else:
+                                hp_plot_event = _plotly_chart_with_colorbars(
+                                    hp_plot_column,
+                                    hp_figure,
+                                    use_container_width=True,
+                                    key=hp_plot_key,
+                                    on_select=(
+                                        "rerun"
+                                        if hp_click_pick_enabled
+                                        else "ignore"
+                                    ),
+                                    selection_mode="points",
+                                )
+                            if hp_click_pick_enabled and plotly_events is None:
+                                st.caption(
+                                    "Mouse click slice picking requires "
+                                    "`streamlit-plotly-events`; install the "
+                                    "updated requirements and restart Streamlit."
+                                )
+                            if (
+                                hp_view == "3D heatmap"
+                                and hp_3d_slice_axis is not None
+                                and hp_3d_slice_value_key is not None
+                                and hp_3d_slice_values
+                                and hp_click_pick_enabled
+                            ):
+                                selected_slice_coordinate = (
+                                    _clicked_3d_coordinate(
+                                        hp_clicked_points,
+                                        hp_3d_slice_axis,
+                                        (hp_x, hp_y, hp_z),
+                                    )
+                                    if hp_clicked_points is not None
+                                    else _selected_3d_coordinate(
+                                        hp_plot_event,
+                                        hp_3d_slice_axis,
+                                        (hp_x, hp_y, hp_z),
+                                    )
+                                )
+                                if selected_slice_coordinate is not None:
+                                    nearest_slice_value = min(
+                                        hp_3d_slice_values,
+                                        key=lambda value: abs(
+                                            float(value)
+                                            - float(selected_slice_coordinate)
+                                        ),
+                                    )
+                                    slice_preference_key = (
+                                        f"{hp_3d_slice_value_key}__preferred"
+                                    )
+                                    if (
+                                        st.session_state.get(slice_preference_key)
+                                        != nearest_slice_value
+                                    ):
+                                        st.session_state[slice_preference_key] = (
+                                            nearest_slice_value
+                                        )
+                                        st.rerun()
+                            if (
+                                hp_view == "3D heatmap"
+                                and hp_3d_slice_axis is not None
+                                and hp_3d_slice_value is not None
+                                and hp_3d_slice_axis in rendered_response_frame.columns
+                            ):
+                                slice_heatmap_key = (
+                                    f"bo_hp_response_2d_slice_heatmap_"
+                                    f"{trend_scope_key}_{rendered_key_suffix}"
+                                )
+                                generate_slice_heatmap = st.button(
+                                    "Generate 2D heatmap for highlighted slice",
+                                    key=f"{slice_heatmap_key}_button",
+                                )
+                                if generate_slice_heatmap:
+                                    slice_remaining_axes = [
+                                        axis for axis in (hp_x, hp_y, hp_z)
+                                        if axis != hp_3d_slice_axis
+                                    ]
+                                    slice_frame = rendered_response_frame[
+                                        np.isclose(
+                                            pd.to_numeric(
+                                                rendered_response_frame[
+                                                    hp_3d_slice_axis
+                                                ],
+                                                errors="coerce",
+                                            ),
+                                            float(hp_3d_slice_value),
+                                            rtol=1e-9,
+                                            atol=1e-12,
+                                            equal_nan=False,
+                                        )
+                                    ].copy()
+                                    if len(slice_remaining_axes) == 2 and not slice_frame.empty:
+                                        slice_metric_label = (
+                                            "Iterations to target Q"
+                                            if hp_summary == "Iterations to Q target"
+                                            else hp_metric_label
+                                        )
+                                        slice_figure = _plot_hyperparameter_response(
+                                            slice_frame,
+                                            x_axis=slice_remaining_axes[0],
+                                            y_axis=slice_remaining_axes[1],
+                                            z_axis=None,
+                                            metric_label=slice_metric_label,
+                                            aggregate=hp_aggregate,
+                                        )
+                                        slice_figure.update_layout(
+                                            title=(
+                                                f"{hp_aggregate} {slice_metric_label} | "
+                                                f"{hp_3d_slice_axis}="
+                                                f"{float(hp_3d_slice_value):g}"
+                                            )
+                                        )
+                                        st.session_state[slice_heatmap_key] = {
+                                            "figure": slice_figure,
+                                            "frame": slice_frame,
+                                            "sort_columns": [
+                                                slice_remaining_axes[1],
+                                                slice_remaining_axes[0],
+                                            ],
+                                        }
+                                    else:
+                                        st.session_state.pop(
+                                            slice_heatmap_key,
+                                            None,
+                                        )
+                                        st.warning(
+                                            "No response values match the highlighted "
+                                            "3D slice."
+                                        )
+                                slice_heatmap = st.session_state.get(
+                                    slice_heatmap_key
+                                )
+                                if slice_heatmap is not None:
+                                    st.markdown("##### Highlighted slice heatmap")
+                                    _plotly_chart_with_colorbars(
+                                        _sized_plot_container(
+                                            st,
+                                            plot_width_percent,
+                                        ),
+                                        slice_heatmap["figure"],
+                                        use_container_width=True,
+                                        key=f"{slice_heatmap_key}_plot",
+                                    )
+                                    with st.expander("Highlighted slice table"):
+                                        st.dataframe(
+                                            slice_heatmap["frame"].sort_values(
+                                                slice_heatmap["sort_columns"]
+                                            ),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                            with st.expander("Hyperparameter response table"):
+                                st.dataframe(
+                                    rendered_response_frame.sort_values(
+                                        rendered_sort_columns
+                                    ),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            gif_iterations = sorted(
+                                pd.to_numeric(
+                                    trend_history.get(
+                                        "iteration",
+                                        pd.Series(dtype=float),
+                                    ),
+                                    errors="coerce",
+                                ).dropna().astype(int).unique().tolist()
+                            )
+                            if (
+                                gif_iterations
+                                and hp_summary != "Iterations to Q target"
+                            ):
+                                st.markdown("##### Hyperparameter response GIF")
+                                gif_controls = st.columns(3)
+                                hp_gif_duration = int(gif_controls[0].slider(
+                                    "Frame duration (ms)",
+                                    min_value=100,
+                                    max_value=1500,
+                                    value=350,
+                                    step=50,
+                                    key=(
+                                        f"bo_hp_response_gif_duration_"
+                                        f"{trend_scope_key}_{hp_view}"
+                                    ),
+                                ))
+                                hp_gif_width = int(gif_controls[1].number_input(
+                                    "GIF width",
+                                    min_value=500,
+                                    max_value=1800,
+                                    value=1000,
+                                    step=100,
+                                    key=(
+                                        f"bo_hp_response_gif_width_"
+                                        f"{trend_scope_key}_{hp_view}"
+                                    ),
+                                ))
+                                hp_gif_height = int(gif_controls[2].number_input(
+                                    "GIF height",
+                                    min_value=400,
+                                    max_value=1400,
+                                    value=700 if hp_view == "3D heatmap" else 560,
+                                    step=100,
+                                    key=(
+                                        f"bo_hp_response_gif_height_"
+                                        f"{trend_scope_key}_{hp_view}"
+                                    ),
+                                ))
+                                hp_gif_key = rendered_gif_key
+                                generate_hp_gif = st.button(
+                                    "Generate hyperparameter response GIF",
+                                    key=f"{hp_gif_key}_button",
+                                ) or bool(
+                                    st.session_state.pop(
+                                        hp_pending_gif_key,
+                                        False,
+                                    )
+                                )
+                                if generate_hp_gif:
+                                    try:
+                                        progress = st.progress(
+                                            0.0,
+                                            text="Preparing hyperparameter response frames...",
+                                        )
+                                        frame_rows: list[tuple[int, pd.DataFrame]] = []
+                                        for prep_index, frame_iteration in enumerate(
+                                            gif_iterations,
+                                            start=1,
+                                        ):
+                                            progress.progress(
+                                                0.02
+                                                + 0.18
+                                                * prep_index
+                                                / max(1, len(gif_iterations)),
+                                                text=(
+                                                    "Preparing hyperparameter response "
+                                                    f"frame {prep_index}/"
+                                                    f"{len(gif_iterations)}..."
+                                                ),
+                                            )
+                                            frame_response = _hyperparameter_response_frame(
+                                                hp_response_history,
+                                                hp_metric_key,
+                                                "Specific iteration",
+                                                iteration=frame_iteration,
+                                            )
+                                            if frame_response.empty:
+                                                continue
+                                            for slice_column, slice_value in (
+                                                hp_slice_filters.items()
+                                            ):
+                                                if slice_value is None:
+                                                    continue
+                                                frame_response = frame_response[
+                                                    np.isclose(
+                                                        pd.to_numeric(
+                                                            frame_response[slice_column],
+                                                            errors="coerce",
+                                                        ),
+                                                        float(slice_value),
+                                                        rtol=1e-9,
+                                                        atol=1e-12,
+                                                        equal_nan=False,
+                                                    )
+                                                ]
+                                            if not frame_response.empty:
+                                                frame_rows.append(
+                                                    (frame_iteration, frame_response)
+                                                )
+                                        if not frame_rows:
+                                            raise ValueError(
+                                                "No iteration frames match the current "
+                                                "hyperparameter response settings."
+                                            )
+
+                                        def hp_gif_figures():
+                                            total = max(1, len(frame_rows))
+                                            for frame_index, (
+                                                frame_iteration,
+                                                frame_response,
+                                            ) in enumerate(frame_rows, start=1):
+                                                progress.progress(
+                                                    0.20
+                                                    + 0.30
+                                                    * (frame_index - 1)
+                                                    / total,
+                                                    text=(
+                                                        "Building hyperparameter response "
+                                                        f"figure {frame_index}/{total}..."
+                                                    ),
+                                                )
+                                                figure = _plot_hyperparameter_response(
+                                                    frame_response,
+                                                    x_axis=hp_x,
+                                                    y_axis=hp_y,
+                                                    z_axis=hp_z,
+                                                    metric_label=hp_metric_label,
+                                                    aggregate=hp_aggregate,
+                                                    voxel_face_opacity=hp_voxel_face_opacity,
+                                                    voxel_internal_opacity=(
+                                                        hp_voxel_internal_opacity
+                                                    ),
+                                                    voxel_internal_point_size=(
+                                                        hp_voxel_internal_point_size
+                                                    ),
+                                                    voxel_internal_point_count=(
+                                                        hp_voxel_internal_point_count
+                                                    ),
+                                                )
+                                                figure.update_layout(
+                                                    title=(
+                                                        f"{hp_aggregate} {hp_metric_label} "
+                                                        "by hyperparameters | "
+                                                        f"iteration {frame_iteration}"
+                                                    )
+                                                )
+                                                yield figure
+
+                                        def hp_gif_progress(done: int, total: int) -> None:
+                                            progress.progress(
+                                                0.50 + 0.45 * done / max(1, total),
+                                                text=(
+                                                    "Encoding hyperparameter response GIF: "
+                                                    f"frame {done}/{total}"
+                                                ),
+                                            )
+
+                                        gif_bytes = _figures_to_gif(
+                                            hp_gif_figures(),
+                                            hp_gif_duration,
+                                            plotly_width=hp_gif_width,
+                                            plotly_height=hp_gif_height,
+                                            total_frames=len(frame_rows),
+                                            progress_callback=hp_gif_progress,
+                                        )
+                                        progress.progress(
+                                            1.0,
+                                            text=(
+                                                "Hyperparameter response GIF complete "
+                                                f"({len(frame_rows)} frames)."
+                                            ),
+                                        )
+                                        st.session_state[hp_gif_key] = gif_bytes
+                                    except Exception as exc:
+                                        st.session_state.pop(hp_gif_key, None)
+                                        st.error(
+                                            "Hyperparameter response GIF generation "
+                                            f"failed: {exc}"
+                                        )
+                                hp_gif_bytes = st.session_state.get(hp_gif_key)
+                                if hp_gif_bytes:
+                                    st.image(hp_gif_bytes)
+                                    safe_hp_gif_name = re.sub(
+                                        r"[^A-Za-z0-9._-]+",
+                                        "_",
+                                        (
+                                            f"{hp_metric_label}_{hp_view}_{hp_x}_"
+                                            f"{hp_y}_{hp_z or '2d'}"
+                                        ),
+                                    ).strip("_")
+                                    st.download_button(
+                                        "Download hyperparameter response GIF",
+                                        data=hp_gif_bytes,
+                                        file_name=(
+                                            f"hyperparameter_response_"
+                                            f"{safe_hp_gif_name}.gif"
+                                        ),
+                                        mime="image/gif",
+                                        key=f"{hp_gif_key}_download",
+                                    )
+
+        _render_hyperparameter_response_fragment()
         clicked_iteration = next(
             (
                 iteration
@@ -6591,13 +14281,19 @@ def render_bo_session_app() -> None:
         ):
             st.divider()
             st.subheader("Buffer vs target trends")
+            paired_metric_options = _q_relevant_metrics(
+                PAIRED_TREND_METRICS,
+                session["config"],
+                paired_objective=True,
+            )
+            _preserve_valid_widget_value(
+                "bo_paired_trend_metric",
+                paired_metric_options,
+                paired_metric_options[0],
+            )
             paired_metric = st.selectbox(
                 "Buffer/target metric",
-                _q_relevant_metrics(
-                    PAIRED_TREND_METRICS,
-                    session["config"],
-                    paired_objective=True,
-                ),
+                paired_metric_options,
                 key="bo_paired_trend_metric",
             )
             paired_series = _paired_trend_values(
@@ -6605,18 +14301,44 @@ def render_bo_session_app() -> None:
                 paired_metric,
             )
             paired_channels = sorted(paired_series, key=_channel_sort_key)
+            paired_channels_key = f"bo_paired_channels_{paired_metric}"
+            paired_channels_valid, paired_channels_display = (
+                _prepare_preferred_multiselect_value(
+                    paired_channels_key,
+                    f"{paired_channels_key}__preferred",
+                    paired_channels,
+                    paired_channels,
+                )
+            )
             selected_paired_channels = st.multiselect(
                 "Buffer/target channels",
                 paired_channels,
-                default=paired_channels,
+                default=paired_channels_display,
                 format_func=lambda channel: f"Ch {channel}",
-                key=f"bo_paired_channels_{paired_metric}",
+                key=paired_channels_key,
+            )
+            _sync_preferred_widget_value(
+                paired_channels_key,
+                f"{paired_channels_key}__preferred",
+                paired_channels_valid,
+                paired_channels_display,
+            )
+            paired_layout_options = [
+                "Overlay selected channels",
+                "Separate plots",
+                "Average selected channels",
+            ]
+            paired_layout_key = f"bo_paired_layout_{paired_metric}"
+            _preserve_valid_widget_value(
+                paired_layout_key,
+                paired_layout_options,
+                paired_layout_options[0],
             )
             paired_layout = st.radio(
                 "Buffer/target display",
-                ["Overlay selected channels", "Separate plots", "Average selected channels"],
+                paired_layout_options,
                 horizontal=True,
-                key=f"bo_paired_layout_{paired_metric}",
+                key=paired_layout_key,
             )
             if selected_paired_channels:
                 paired_figure = _plot_paired_phase_trend(
@@ -6636,53 +14358,74 @@ def render_bo_session_app() -> None:
                 f"{iteration_start}_{iteration_end}_{paired_metric}_{paired_layout}_"
                 f"{'_'.join(selected_paired_channels) or 'none'}"
             )
+            paired_figures = [paired_figure]
+            paired_overlay_figure = None
+            paired_separate_figure = None
+            if (
+                paired_layout == "Average selected channels"
+                and selected_paired_channels
+            ):
+                paired_overlay_figure = _plot_paired_phase_trend(
+                    paired_series,
+                    paired_metric,
+                    selected_paired_channels,
+                    "Overlay selected channels",
+                )
+                paired_separate_figure = _plot_paired_phase_trend(
+                    paired_series,
+                    paired_metric,
+                    selected_paired_channels,
+                    "Separate plots",
+                )
+                paired_figures.extend([
+                    paired_overlay_figure,
+                    paired_separate_figure,
+                ])
+            paired_y_limits = _manual_y_axis_range_control(
+                "buffer/target trend",
+                f"bo_paired_trend_{paired_metric}_{paired_layout}",
+                paired_figures,
+            )
+            if paired_y_limits is not None:
+                for figure in paired_figures:
+                    _apply_y_axis_range(figure, *paired_y_limits)
+                paired_chart_suffix = (
+                    f"{paired_chart_suffix}_ylim_"
+                    f"{paired_y_limits[0]:g}_{paired_y_limits[1]:g}"
+                )
             paired_events = []
             if (
                 paired_layout == "Average selected channels"
                 and selected_paired_channels
             ):
                 average_column, overlay_column = st.columns(2)
-                paired_events.append(_sized_plot_container(
-                    average_column, plot_width_percent
-                ).plotly_chart(
+                paired_events.append(_plotly_chart_with_colorbars(
+                    _sized_plot_container(average_column, plot_width_percent),
                     paired_figure,
                     use_container_width=True,
                     on_select="rerun",
                     selection_mode="points",
                     key=f"bo_paired_trend_{paired_chart_suffix}_average",
                 ))
-                paired_events.append(_sized_plot_container(
-                    overlay_column, plot_width_percent
-                ).plotly_chart(
-                    _plot_paired_phase_trend(
-                        paired_series,
-                        paired_metric,
-                        selected_paired_channels,
-                        "Overlay selected channels",
-                    ),
+                paired_events.append(_plotly_chart_with_colorbars(
+                    _sized_plot_container(overlay_column, plot_width_percent),
+                    paired_overlay_figure,
                     use_container_width=True,
                     on_select="rerun",
                     selection_mode="points",
                     key=f"bo_paired_trend_{paired_chart_suffix}_overlay",
                 ))
-                paired_events.append(_sized_plot_container(
-                    st, plot_width_percent
-                ).plotly_chart(
-                    _plot_paired_phase_trend(
-                        paired_series,
-                        paired_metric,
-                        selected_paired_channels,
-                        "Separate plots",
-                    ),
+                paired_events.append(_plotly_chart_with_colorbars(
+                    _sized_plot_container(st, plot_width_percent),
+                    paired_separate_figure,
                     use_container_width=True,
                     on_select="rerun",
                     selection_mode="points",
                     key=f"bo_paired_trend_{paired_chart_suffix}_separate",
                 ))
             else:
-                paired_events.append(_sized_plot_container(
-                    st, plot_width_percent
-                ).plotly_chart(
+                paired_events.append(_plotly_chart_with_colorbars(
+                    _sized_plot_container(st, plot_width_percent),
                     paired_figure,
                     use_container_width=True,
                     on_select="rerun",
@@ -6724,30 +14467,64 @@ def render_bo_session_app() -> None:
 
             st.divider()
             st.subheader("Chronological plot")
+            chronological_metric_options = _q_relevant_metrics(
+                PAIRED_TREND_METRICS,
+                session["config"],
+                paired_objective=True,
+            )
+            _preserve_valid_widget_value(
+                "bo_chronological_metric",
+                chronological_metric_options,
+                chronological_metric_options[0],
+            )
             chronological_metric = st.selectbox(
                 "Chronological metric",
-                _q_relevant_metrics(
-                    PAIRED_TREND_METRICS,
-                    session["config"],
-                    paired_objective=True,
-                ),
+                chronological_metric_options,
                 key="bo_chronological_metric",
             )
             chronological_channels = _real_data_channels(
                 plot_observations
             )
+            chronological_channels_key = (
+                f"bo_chronological_channels_{chronological_metric}"
+            )
+            chronological_channels_valid, chronological_channels_display = (
+                _prepare_preferred_multiselect_value(
+                    chronological_channels_key,
+                    f"{chronological_channels_key}__preferred",
+                    chronological_channels,
+                    chronological_channels,
+                )
+            )
             selected_chronological_channels = st.multiselect(
                 "Chronological channels",
                 chronological_channels,
-                default=chronological_channels,
+                default=chronological_channels_display,
                 format_func=lambda channel: f"Ch {channel}",
-                key=f"bo_chronological_channels_{chronological_metric}",
+                key=chronological_channels_key,
+            )
+            _sync_preferred_widget_value(
+                chronological_channels_key,
+                f"{chronological_channels_key}__preferred",
+                chronological_channels_valid,
+                chronological_channels_display,
+            )
+            chronological_mode_options = [
+                "Overlay selected channels",
+                "Separate plots",
+                "Average selected channels",
+            ]
+            chronological_mode_key = f"bo_chronological_mode_{chronological_metric}"
+            _preserve_valid_widget_value(
+                chronological_mode_key,
+                chronological_mode_options,
+                chronological_mode_options[0],
             )
             chronological_mode = st.radio(
                 "Chronological display",
-                ["Overlay selected channels", "Separate plots", "Average selected channels"],
+                chronological_mode_options,
                 horizontal=True,
-                key=f"bo_chronological_mode_{chronological_metric}",
+                key=chronological_mode_key,
             )
             chronological_points, phase_transitions = _chronological_points(
                 plot_observations,
@@ -6776,61 +14553,81 @@ def render_bo_session_app() -> None:
                     f"{chronological_metric}_{chronological_mode}_"
                     f"{'_'.join(selected_chronological_channels)}"
                 )
+                if chronological_raw_points is not None:
+                    chronological_average_figure = _plot_chronological(
+                        chronological_points,
+                        phase_transitions,
+                        chronological_metric,
+                        "Average selected channels",
+                    )
+                    chronological_overlay_figure = _plot_chronological(
+                        chronological_raw_points,
+                        phase_transitions,
+                        chronological_metric,
+                        "Overlay selected channels",
+                    )
+                    chronological_separate_figure = _plot_chronological(
+                        chronological_raw_points,
+                        phase_transitions,
+                        chronological_metric,
+                        "Separate plots",
+                    )
+                    chronological_figures = [
+                        chronological_average_figure,
+                        chronological_overlay_figure,
+                        chronological_separate_figure,
+                    ]
+                else:
+                    chronological_figure = _plot_chronological(
+                        chronological_points,
+                        phase_transitions,
+                        chronological_metric,
+                        chronological_mode,
+                    )
+                    chronological_figures = [chronological_figure]
+                chronological_y_limits = _manual_y_axis_range_control(
+                    "chronological",
+                    f"bo_chronological_{chronological_metric}_{chronological_mode}",
+                    chronological_figures,
+                )
+                if chronological_y_limits is not None:
+                    for figure in chronological_figures:
+                        _apply_y_axis_range(figure, *chronological_y_limits)
+                    chronological_suffix = (
+                        f"{chronological_suffix}_ylim_"
+                        f"{chronological_y_limits[0]:g}_{chronological_y_limits[1]:g}"
+                    )
                 chronological_events = []
                 if chronological_raw_points is not None:
                     average_column, overlay_column = st.columns(2)
-                    chronological_events.append(_sized_plot_container(
-                        average_column, plot_width_percent
-                    ).plotly_chart(
-                        _plot_chronological(
-                            chronological_points,
-                            phase_transitions,
-                            chronological_metric,
-                            "Average selected channels",
-                        ),
+                    chronological_events.append(_plotly_chart_with_colorbars(
+                        _sized_plot_container(average_column, plot_width_percent),
+                        chronological_average_figure,
                         use_container_width=True,
                         on_select="rerun",
                         selection_mode="points",
                         key=f"bo_chronological_{chronological_suffix}_average",
                     ))
-                    chronological_events.append(_sized_plot_container(
-                        overlay_column, plot_width_percent
-                    ).plotly_chart(
-                        _plot_chronological(
-                            chronological_raw_points,
-                            phase_transitions,
-                            chronological_metric,
-                            "Overlay selected channels",
-                        ),
+                    chronological_events.append(_plotly_chart_with_colorbars(
+                        _sized_plot_container(overlay_column, plot_width_percent),
+                        chronological_overlay_figure,
                         use_container_width=True,
                         on_select="rerun",
                         selection_mode="points",
                         key=f"bo_chronological_{chronological_suffix}_overlay",
                     ))
-                    chronological_events.append(_sized_plot_container(
-                        st, plot_width_percent
-                    ).plotly_chart(
-                        _plot_chronological(
-                            chronological_raw_points,
-                            phase_transitions,
-                            chronological_metric,
-                            "Separate plots",
-                        ),
+                    chronological_events.append(_plotly_chart_with_colorbars(
+                        _sized_plot_container(st, plot_width_percent),
+                        chronological_separate_figure,
                         use_container_width=True,
                         on_select="rerun",
                         selection_mode="points",
                         key=f"bo_chronological_{chronological_suffix}_separate",
                     ))
                 else:
-                    chronological_events.append(_sized_plot_container(
-                        st, plot_width_percent
-                    ).plotly_chart(
-                        _plot_chronological(
-                            chronological_points,
-                            phase_transitions,
-                            chronological_metric,
-                            chronological_mode,
-                        ),
+                    chronological_events.append(_plotly_chart_with_colorbars(
+                        _sized_plot_container(st, plot_width_percent),
+                        chronological_figure,
                         use_container_width=True,
                         on_select="rerun",
                         selection_mode="points",
@@ -6872,7 +14669,103 @@ def render_bo_session_app() -> None:
                         st.rerun()
 
         st.subheader("History")
-        st.dataframe(history, use_container_width=True, hide_index=True)
+        if history.empty:
+            st.info("No history rows are available.")
+        else:
+            preferred_history_columns = [
+                column for column in [
+                    "group_id",
+                    "group_name",
+                    "iteration",
+                    "Q_run",
+                    "best_Q",
+                    "best_so_far",
+                    "exploration",
+                    "initial_random_points",
+                    "gp_falloff_parameter",
+                    "gp_falloff_value",
+                    "selection_mode",
+                    "objective",
+                ]
+                if column in history.columns
+            ]
+            if not preferred_history_columns:
+                preferred_history_columns = list(history.columns[:12])
+            history_column_key = f"bo_history_columns_{trend_scope_key}"
+            history_columns_valid, history_columns_display = (
+                _prepare_preferred_multiselect_value(
+                    history_column_key,
+                    f"{history_column_key}__preferred",
+                    list(history.columns),
+                    preferred_history_columns,
+                )
+            )
+            history_controls = st.columns([2, 1, 1])
+            selected_history_columns = history_controls[0].multiselect(
+                "History columns",
+                list(history.columns),
+                default=history_columns_display,
+                key=history_column_key,
+            )
+            _sync_preferred_widget_value(
+                history_column_key,
+                f"{history_column_key}__preferred",
+                history_columns_valid,
+                history_columns_display,
+            )
+            history_row_options = [100, 250, 500, 1000, 2500, 5000]
+            history_rows_key = f"bo_history_preview_rows_{trend_scope_key}"
+            _preserve_valid_widget_value(
+                history_rows_key,
+                history_row_options,
+                500,
+            )
+            history_row_limit = history_controls[1].selectbox(
+                "Rows to show",
+                history_row_options,
+                key=history_rows_key,
+            )
+            history_order_key = f"bo_history_preview_order_{trend_scope_key}"
+            history_order_options = ["Most recent first", "Original order"]
+            _preserve_valid_widget_value(
+                history_order_key,
+                history_order_options,
+                history_order_options[0],
+            )
+            history_order = history_controls[2].selectbox(
+                "Table order",
+                history_order_options,
+                key=history_order_key,
+            )
+            history_preview = history[
+                selected_history_columns or preferred_history_columns
+            ].copy()
+            if history_order == "Most recent first" and "iteration" in history.columns:
+                sort_columns = [
+                    column for column in ["group_id", "iteration"]
+                    if column in history_preview.columns
+                ]
+                if sort_columns:
+                    history_preview = history_preview.sort_values(
+                        sort_columns,
+                        ascending=False,
+                        kind="mergesort",
+                    )
+                else:
+                    history_preview = history_preview.iloc[::-1]
+            history_preview = history_preview.head(int(history_row_limit))
+            st.caption(
+                f"Showing {len(history_preview):,} of {len(history):,} rows "
+                f"and {len(history_preview.columns):,} of {len(history.columns):,} columns."
+            )
+            st.dataframe(history_preview, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download displayed history CSV",
+                data=history_preview.to_csv(index=False).encode(),
+                file_name="bo_history_preview.csv",
+                mime="text/csv",
+                key=f"bo_history_download_{trend_scope_key}",
+            )
         if not observation_is_single:
             st.info(
                 "Select one group and one iteration to inspect per-channel "
@@ -6942,22 +14835,81 @@ def render_bo_session_app() -> None:
                 "The recorded CSVs must remain inside or beside the experiment folder."
             )
         else:
+            trace_phase_options = {
+                "Buffer and target": ("buffer", "target"),
+                "Buffer only": ("buffer",),
+                "Target only": ("target",),
+            }
+            trace_has_paired_phases = any(
+                str(trace.get("phase", "")).lower() in ("buffer", "target")
+                for trace in available_traces
+            )
+            selected_trace_phase_label = "Buffer and target"
+            selected_trace_phases = None
+            if trace_has_paired_phases:
+                trace_phase_key = (
+                    f"bo_trace_phase_filter_{selected_observation_group_scope}_"
+                    f"{selected_iteration_scope}"
+                )
+                _preserve_valid_widget_value(
+                    trace_phase_key,
+                    list(trace_phase_options),
+                    selected_trace_phase_label,
+                )
+                selected_trace_phase_label = st.radio(
+                    "Paired trace phases",
+                    list(trace_phase_options),
+                    horizontal=True,
+                    key=trace_phase_key,
+                )
+                selected_trace_phases = trace_phase_options[
+                    selected_trace_phase_label
+                ]
+            selected_trace_phase_set = (
+                {phase.lower() for phase in selected_trace_phases}
+                if selected_trace_phases is not None
+                else None
+            )
+            display_trace_entries = [
+                (trace_observation, trace)
+                for trace_observation, trace in trace_entries
+                if (
+                    selected_trace_phase_set is None
+                    or str(trace.get("phase", "")).lower()
+                    in selected_trace_phase_set
+                )
+            ]
+            display_available_traces = [
+                trace for _observation, trace in display_trace_entries
+            ]
             trace_channels_key = (
                 f"bo_trace_channels_{selected_observation_group_scope}_"
-                f"{selected_iteration_scope}"
+                f"{selected_iteration_scope}_{selected_trace_phase_label}"
             )
-            current_trace_channels = st.session_state.get(trace_channels_key)
-            if current_trace_channels and any(
-                channel not in available_channels
-                for channel in current_trace_channels
-            ):
-                st.session_state[trace_channels_key] = available_channels
+            available_channels = sorted(
+                {_trace_channel_key(item) for item in display_available_traces},
+                key=_channel_sort_key,
+            )
+            trace_channels_valid, trace_channels_display = (
+                _prepare_preferred_multiselect_value(
+                    trace_channels_key,
+                    f"{trace_channels_key}__preferred",
+                    available_channels,
+                    available_channels,
+                )
+            )
             selected_channels = st.multiselect(
                 "Channels to display",
                 available_channels,
-                default=available_channels,
+                default=trace_channels_display,
                 format_func=_trace_channel_label,
                 key=trace_channels_key,
+            )
+            _sync_preferred_widget_value(
+                trace_channels_key,
+                f"{trace_channels_key}__preferred",
+                trace_channels_valid,
+                trace_channels_display,
             )
             trace_layout_options = [
                 "Overlay selected channels",
@@ -6965,14 +14917,20 @@ def render_bo_session_app() -> None:
             ]
             if trace_all_mode:
                 trace_layout_options.append("Chronological diagonal stack")
+            trace_layout_key = (
+                f"bo_trace_layout_{selected_observation_group_scope}_"
+                f"{selected_iteration_scope}"
+            )
+            _preserve_valid_widget_value(
+                trace_layout_key,
+                trace_layout_options,
+                trace_layout_options[0],
+            )
             trace_layout = st.radio(
                 "Plot layout",
                 trace_layout_options,
                 horizontal=True,
-                key=(
-                    f"bo_trace_layout_{selected_observation_group_scope}_"
-                    f"{selected_iteration_scope}"
-                ),
+                key=trace_layout_key,
             )
             selected_trace_type = st.radio(
                 "Trace type",
@@ -6993,10 +14951,60 @@ def render_bo_session_app() -> None:
                 if selected_trace_type == "Normalized raw"
                 else "smoothed_corrected_current"
             )
+            analysis_settings = _bo_analysis_settings(session["config"])
+            trace_voltage_columns = st.columns(2)
+            trace_voltage_min = float(trace_voltage_columns[0].number_input(
+                "Voltage crop min (V)",
+                value=float(analysis_settings["crop_min_v"]),
+                step=0.01,
+                format="%.4f",
+                key=(
+                    f"bo_trace_voltage_min_"
+                    f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                ),
+            ))
+            trace_voltage_max = float(trace_voltage_columns[1].number_input(
+                "Voltage crop max (V)",
+                value=float(analysis_settings["crop_max_v"]),
+                step=0.01,
+                format="%.4f",
+                key=(
+                    f"bo_trace_voltage_max_"
+                    f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                ),
+            ))
+            if trace_voltage_min > trace_voltage_max:
+                st.warning(
+                    "Voltage crop min is greater than max; applying the "
+                    "bounds in ascending order."
+                )
+                trace_voltage_min, trace_voltage_max = (
+                    trace_voltage_max,
+                    trace_voltage_min,
+                )
             stack_x_offset = None
             stack_y_offset = None
             stack_trace_height = 1.0
+            stack_voltage_min = trace_voltage_min
+            stack_voltage_max = trace_voltage_max
+            stack_y_min = None
+            stack_y_max = None
+            stack_phase_display = "Overlay buffer and target"
             if trace_layout == "Chronological diagonal stack":
+                if selected_trace_phase_set == {"buffer", "target"}:
+                    stack_phase_display = st.radio(
+                        "Paired trace display",
+                        [
+                            "Overlay buffer and target",
+                            "Separate buffer and target plots",
+                        ],
+                        horizontal=True,
+                        key=(
+                            f"bo_trace_stack_phase_display_"
+                            f"{selected_observation_group_scope}_"
+                            f"{selected_iteration_scope}"
+                        ),
+                    )
                 offset_columns = st.columns(3)
                 stack_x_offset = offset_columns[0].number_input(
                     "X offset per iteration (V)",
@@ -7034,6 +15042,84 @@ def render_bo_session_app() -> None:
                     ),
                     help="Scales each SWV vertically before applying the chronological offset.",
                 )
+                manual_stack_y_limits = st.checkbox(
+                    "Crop each SWV trace by current before stacking",
+                    key=(
+                        f"bo_trace_stack_manual_y_limits_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{normalize_to_peak}"
+                    ),
+                )
+                if manual_stack_y_limits:
+                    default_stack_y_min = -0.2 if normalize_to_peak else -1.0
+                    default_stack_y_max = 1.2 if normalize_to_peak else 1.0
+                    stack_bounds_loaded, _stack_bounds_errors, _stack_bounds_entries = (
+                        _chronological_swv_stack_entries(
+                            display_trace_entries,
+                            corrected,
+                            selected_channels,
+                            trace_analysis,
+                            session["config"],
+                            normalize_to_peak,
+                            corrected_trace_key,
+                            stack_trace_height,
+                            stack_voltage_min,
+                            stack_voltage_max,
+                            selected_phases=selected_trace_phases,
+                        )
+                    )
+                    if stack_bounds_loaded and not normalize_to_peak:
+                        stack_current_values = np.concatenate([
+                            row["current"] for row in stack_bounds_loaded
+                        ])
+                        default_stack_y_min = float(np.nanmin(stack_current_values))
+                        default_stack_y_max = float(np.nanmax(stack_current_values))
+                        stack_y_padding = max(
+                            (default_stack_y_max - default_stack_y_min) * 0.05,
+                            1e-9,
+                        )
+                        default_stack_y_min -= stack_y_padding
+                        default_stack_y_max += stack_y_padding
+                    y_limit_columns = st.columns(2)
+                    stack_y_min_key = (
+                        f"bo_trace_stack_trace_y_min_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{normalize_to_peak}"
+                    )
+                    stack_y_max_key = (
+                        f"bo_trace_stack_trace_y_max_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{normalize_to_peak}"
+                    )
+                    st.session_state.setdefault(
+                        stack_y_min_key,
+                        default_stack_y_min,
+                    )
+                    st.session_state.setdefault(
+                        stack_y_max_key,
+                        default_stack_y_max,
+                    )
+                    stack_y_min = float(y_limit_columns[0].number_input(
+                        "Per-trace current minimum",
+                        value=float(st.session_state[stack_y_min_key]),
+                        step=0.1,
+                        format="%.4f",
+                        key=stack_y_min_key,
+                    ))
+                    stack_y_max = float(y_limit_columns[1].number_input(
+                        "Per-trace current maximum",
+                        value=float(st.session_state[stack_y_max_key]),
+                        step=0.1,
+                        format="%.4f",
+                        key=stack_y_max_key,
+                    ))
+                    if stack_y_min >= stack_y_max:
+                        st.warning(
+                            "Per-trace current minimum must be less than the "
+                            "maximum; no current crop is being applied."
+                        )
+                        stack_y_min = None
+                        stack_y_max = None
             trace_gif_duration = st.slider(
                 "SWV GIF frame duration (ms)",
                 min_value=100,
@@ -7058,6 +15144,15 @@ def render_bo_session_app() -> None:
             if not selected_channels:
                 st.info("Select at least one channel to display traces.")
             for channel_group in channel_groups:
+                phase_targets = [(None, selected_trace_phases)]
+                if (
+                    trace_layout == "Chronological diagonal stack"
+                    and stack_phase_display == "Separate buffer and target plots"
+                ):
+                    phase_targets = [
+                        ("buffer", ("buffer",)),
+                        ("target", ("target",)),
+                    ]
                 if trace_layout in (
                     "Separate plot per channel",
                     "Chronological diagonal stack",
@@ -7066,72 +15161,93 @@ def render_bo_session_app() -> None:
                     st.markdown(
                         f"#### {_trace_channel_label(channel)}"
                     )
-                with st.spinner(
-                    "Processing corrected traces..."
-                    if corrected
-                    else "Loading raw traces..."
-                ):
-                    if trace_layout == "Chronological diagonal stack":
-                        figure, errors = _plot_chronological_swv_stack(
-                            trace_entries,
-                            corrected,
-                            channel_group,
-                            trace_analysis,
-                            correction_label,
-                            trace_selection_label,
-                            normalize_to_peak,
-                            corrected_trace_key,
-                            stack_x_offset,
-                            stack_y_offset,
-                            stack_trace_height,
-                        )
-                    elif trace_all_mode:
-                        figure, errors = _plot_iteration_trace_overlay(
-                            trace_entries,
-                            corrected,
-                            channel_group,
-                            trace_analysis,
-                            correction_label,
-                            trace_selection_label,
-                            normalize_to_peak,
-                            corrected_trace_key,
-                        )
-                    else:
-                        figure, errors = _plot_traces(
-                            session,
-                            observation,
-                            corrected,
-                            channel_group,
-                            trace_analysis,
-                            correction_label,
-                            trace_layout == "Overlay selected channels",
-                            available_traces,
-                            normalize_to_peak,
-                            corrected_trace_key,
-                        )
-                trace_file_stem = (
-                    f"swv_traces_{selected_trace_type}_{trace_layout}_"
-                    f"{selected_group_label}_{selected_iteration_label}_"
-                    f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
-                )
-                _render_downloadable_pyplot(
-                    st,
-                    figure,
-                    key=(
-                        f"bo_trace_plot_{selected_observation_group_scope}_"
-                        f"{selected_iteration_scope}_{trace_layout}_"
-                        f"{selected_trace_type}_{'_'.join(map(str, channel_group))}"
-                    ),
-                    file_stem=trace_file_stem,
-                    width_percent=plot_width_percent,
-                )
-                for error in errors:
-                    st.warning(error)
+                for phase_label, selected_stack_phases in phase_targets:
+                    if phase_label is not None:
+                        st.markdown(f"**{phase_label.title()}**")
+                    with st.spinner(
+                        "Processing corrected traces..."
+                        if corrected
+                        else "Loading raw traces..."
+                    ):
+                        if trace_layout == "Chronological diagonal stack":
+                            figure, errors = _plot_chronological_swv_stack(
+                                display_trace_entries,
+                                corrected,
+                                channel_group,
+                                trace_analysis,
+                                session["config"],
+                                correction_label,
+                                trace_selection_label,
+                                normalize_to_peak,
+                                corrected_trace_key,
+                                stack_x_offset,
+                                stack_y_offset,
+                                stack_trace_height,
+                                stack_voltage_min,
+                                stack_voltage_max,
+                                stack_y_min,
+                                stack_y_max,
+                                selected_stack_phases,
+                            )
+                        elif trace_all_mode:
+                            figure, errors = _plot_iteration_trace_overlay(
+                                display_trace_entries,
+                                corrected,
+                                channel_group,
+                                trace_analysis,
+                                correction_label,
+                                trace_selection_label,
+                                normalize_to_peak,
+                                corrected_trace_key,
+                                trace_voltage_min,
+                                trace_voltage_max,
+                            )
+                        else:
+                            figure, errors = _plot_traces(
+                                session,
+                                observation,
+                                corrected,
+                                channel_group,
+                                trace_analysis,
+                                correction_label,
+                                trace_layout == "Overlay selected channels",
+                                display_available_traces,
+                                normalize_to_peak,
+                                corrected_trace_key,
+                                trace_voltage_min,
+                                trace_voltage_max,
+                            )
+                    trace_file_stem = (
+                        f"swv_traces_{selected_trace_type}_{trace_layout}_"
+                        f"{selected_group_label}_{selected_iteration_label}_"
+                        f"{selected_trace_phase_label}_"
+                        f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                        f"{phase_label + '_' if phase_label else ''}"
+                        f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
+                    )
+                    _render_downloadable_pyplot(
+                        st,
+                        figure,
+                        key=(
+                            f"bo_trace_plot_{selected_observation_group_scope}_"
+                            f"{selected_iteration_scope}_{trace_layout}_"
+                            f"{selected_trace_type}_{phase_label or 'all'}_"
+                            f"{selected_trace_phase_label}_"
+                            f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                            f"{'_'.join(map(str, channel_group))}"
+                        ),
+                        file_stem=trace_file_stem,
+                        width_percent=plot_width_percent,
+                    )
+                    for error in errors:
+                        st.warning(error)
 
             if trace_all_mode and selected_channels:
                 trace_gif_key = (
                     f"bo_trace_gif_{selected_observation_group_scope}_"
                     f"{selected_iteration_scope}_{trace_layout}_{selected_trace_type}_"
+                    f"{selected_trace_phase_label}_"
+                    f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
                     f"{'_'.join(selected_channels)}"
                 )
                 if st.button(
@@ -7158,7 +15274,7 @@ def render_bo_session_app() -> None:
                             selected_raw_channels = sorted(
                                 {
                                     trace["channel"]
-                                    for _trace_observation, trace in trace_entries
+                                    for _trace_observation, trace in display_trace_entries
                                     if _trace_channel_key(trace) in selected_channels
                                 },
                                 key=_channel_sort_key,
@@ -7171,6 +15287,9 @@ def render_bo_session_app() -> None:
                                 trace_analysis,
                                 normalize_to_peak,
                                 corrected_trace_key,
+                                selected_trace_phases,
+                                trace_voltage_min,
+                                trace_voltage_max,
                             )
 
                             def swv_frames():
@@ -7194,6 +15313,12 @@ def render_bo_session_app() -> None:
                                         )
                                         for trace in frame_traces
                                     ]
+                                    if selected_trace_phase_set is not None:
+                                        frame_traces = [
+                                            trace for trace in frame_traces
+                                            if str(trace.get("phase", "")).lower()
+                                            in selected_trace_phase_set
+                                        ]
                                     if not frame_traces:
                                         continue
                                     if trace_layout == "Separate plot per channel":
@@ -7210,6 +15335,8 @@ def render_bo_session_app() -> None:
                                                 trace_items=frame_traces,
                                                 normalize_to_peak=normalize_to_peak,
                                                 corrected_trace_key=corrected_trace_key,
+                                                voltage_min=trace_voltage_min,
+                                                voltage_max=trace_voltage_max,
                                             )
                                             if errors:
                                                 fig.text(
@@ -7271,6 +15398,8 @@ def render_bo_session_app() -> None:
                                             trace_items=frame_traces,
                                             normalize_to_peak=normalize_to_peak,
                                             corrected_trace_key=corrected_trace_key,
+                                            voltage_min=trace_voltage_min,
+                                            voltage_max=trace_voltage_max,
                                         )
                                         if errors:
                                             fig.text(
@@ -7290,7 +15419,12 @@ def render_bo_session_app() -> None:
                                 progress_callback=(
                                     lambda current, total:
                                     trace_progress.progress(
-                                        min(0.95, 0.95 * current / max(total, 1)),
+                                        _progress_fraction(
+                                            current,
+                                            total,
+                                            start=0.05,
+                                            end=0.95,
+                                        ),
                                         text=(
                                             f"Rendering SWV frame {current}/"
                                             f"{max(total, current)}"
@@ -7364,12 +15498,14 @@ def render_bo_session_app() -> None:
                 )
         real_scope_key = str(selected_observation_group_scope)
         real_metric_options = [
-            *_q_relevant_metrics(
+            metric for metric in _q_relevant_metrics(
                 REAL_DATA_METRICS,
                 session["config"],
                 paired_objective,
                 phase=None,
-            ),
+            )
+            if paired_objective or metric != "Paired Q"
+        ] + [
             "Count",
         ]
         _preserve_valid_widget_value(
@@ -7383,6 +15519,7 @@ def render_bo_session_app() -> None:
             key="bo_real_metric",
         )
         count_mode = real_metric == "Count"
+        paired_q_mode = real_metric == "Paired Q"
         if count_mode:
             real_phase = "measurement"
             st.caption(
@@ -7413,6 +15550,14 @@ def render_bo_session_app() -> None:
                     key="bo_count_step_bin",
                 )),
             }
+        elif paired_q_mode:
+            real_phase = "measurement"
+            count_bin_sizes = {}
+            st.caption(
+                "Paired Q is independent of buffer/target phase. Channel and "
+                "group plots use stored per-channel paired Q values when "
+                "available, with run-level Q_run as a fallback."
+            )
         else:
             real_phase_options = (
                 ["buffer", "target", "both"]
@@ -7446,19 +15591,37 @@ def render_bo_session_app() -> None:
         ]
         if real_groups and not count_mode:
             handling_options.append("Plot channel groups")
+        real_channel_mode_key = f"bo_real_channel_mode_{real_metric}_{real_phase}"
+        _preserve_valid_widget_value(
+            real_channel_mode_key,
+            handling_options,
+            handling_options[0],
+        )
         real_channel_mode = st.radio(
             "Channel handling",
             handling_options,
             horizontal=True,
-            key=f"bo_real_channel_mode_{real_metric}_{real_phase}",
+            key=real_channel_mode_key,
         )
         selected_real_groups = []
         selected_real_channels = []
         if real_channel_mode == "Plot channel groups":
+            real_group_options = [group["id"] for group in real_groups]
+            real_groups_key = (
+                f"bo_real_groups_{real_scope_key}_{real_metric}_{real_phase}"
+            )
+            real_groups_valid, real_groups_display = (
+                _prepare_preferred_multiselect_value(
+                    real_groups_key,
+                    f"{real_groups_key}__preferred",
+                    real_group_options,
+                    real_group_options,
+                )
+            )
             selected_group_ids = st.multiselect(
                 "Metric channel groups",
-                [group["id"] for group in real_groups],
-                default=[group["id"] for group in real_groups],
+                real_group_options,
+                default=real_groups_display,
                 format_func=lambda group_id: next(
                     (
                         f"{group['name']} (channels "
@@ -7468,7 +15631,13 @@ def render_bo_session_app() -> None:
                     ),
                     f"Group {group_id}",
                 ),
-                key=f"bo_real_groups_{real_scope_key}_{real_metric}_{real_phase}",
+                key=real_groups_key,
+            )
+            _sync_preferred_widget_value(
+                real_groups_key,
+                f"{real_groups_key}__preferred",
+                real_groups_valid,
+                real_groups_display,
             )
             selected_real_groups = [
                 group for group in real_groups
@@ -7476,12 +15645,29 @@ def render_bo_session_app() -> None:
             ]
         else:
             real_channels = _real_data_channels(all_real_observations)
+            real_channels_key = (
+                f"bo_real_channels_{real_scope_key}_{real_metric}_{real_phase}"
+            )
+            real_channels_valid, real_channels_display = (
+                _prepare_preferred_multiselect_value(
+                    real_channels_key,
+                    f"{real_channels_key}__preferred",
+                    real_channels,
+                    real_channels,
+                )
+            )
             selected_real_channels = st.multiselect(
                 "Metric channels",
                 real_channels,
-                default=real_channels,
+                default=real_channels_display,
                 format_func=lambda channel: f"Ch {channel}",
-                key=f"bo_real_channels_{real_scope_key}_{real_metric}_{real_phase}",
+                key=real_channels_key,
+            )
+            _sync_preferred_widget_value(
+                real_channels_key,
+                f"{real_channels_key}__preferred",
+                real_channels_valid,
+                real_channels_display,
             )
         real_color_by = "Measured value"
         real_group_color_values = None
@@ -7533,10 +15719,16 @@ def render_bo_session_app() -> None:
                         metadata_values,
                         f"{parameter_label} GP falloff",
                     )
+            real_color_key = f"bo_real_overlay_color_{real_metric}_{real_phase}"
+            _preserve_valid_widget_value(
+                real_color_key,
+                list(real_color_options),
+                "Measured value",
+            )
             real_color_by = st.selectbox(
                 "Overlay color",
                 list(real_color_options),
-                key=f"bo_real_overlay_color_{real_metric}_{real_phase}",
+                key=real_color_key,
             )
             real_group_color_values, real_group_color_label = (
                 real_color_options[real_color_by]
@@ -7557,6 +15749,14 @@ def render_bo_session_app() -> None:
                     real_observations,
                     count_channels,
                 )
+            }
+        elif (
+            real_channel_mode != "Plot channel groups"
+            and not selected_real_channels
+        ):
+            real_points_by_phase = {
+                phase: pd.DataFrame()
+                for phase in requested_phases
             }
         else:
             real_points_by_phase = {
@@ -7590,6 +15790,11 @@ def render_bo_session_app() -> None:
             ],
             ignore_index=True,
         ) if any(not points.empty for points in real_points_by_phase.values()) else pd.DataFrame()
+        unsliced_real_points_by_phase = {
+            phase: points.copy()
+            for phase, points in real_points_by_phase.items()
+        }
+        unsliced_real_iteration_path = real_iteration_path.copy()
         if combined_real_points.empty:
             st.info(
                 "No recorded values are available for this metric, phase, "
@@ -7659,6 +15864,152 @@ def render_bo_session_app() -> None:
                     st.selectbox("Real-data Z", real_z_options, key="bo_real_z")
                     if real_view == "3D tensor" else None
                 )
+                real_2d_slice_column = None
+                real_2d_slice_value = None
+                real_2d_sweep_values: list[float] = []
+                real_2d_sweep_token = "no_sweep"
+                real_2d_slice_token = "all_unplotted"
+                real_2d_title_note = None
+                if real_view == "2D map":
+                    real_2d_slice_options = [
+                        name for name in real_dimensions
+                        if name not in {real_x, real_y}
+                    ]
+                    if real_2d_slice_options:
+                        slice_columns = st.columns(2)
+                        real_2d_slice_choices = [
+                            "Average all other unplotted values",
+                            *real_2d_slice_options,
+                        ]
+                        real_2d_slice_column_key = (
+                            f"bo_real_2d_slice_column_{real_scope_key}_"
+                            f"{real_metric}_{real_x}_{real_y}"
+                        )
+                        _preserve_valid_widget_value(
+                            real_2d_slice_column_key,
+                            real_2d_slice_choices,
+                            real_2d_slice_choices[0],
+                        )
+                        real_2d_slice_choice = slice_columns[0].selectbox(
+                            "Fixed unplotted parameter",
+                            real_2d_slice_choices,
+                            format_func=lambda value: (
+                                value if value.startswith("Average")
+                                else _metric_label(value)
+                            ),
+                            key=real_2d_slice_column_key,
+                        )
+                        if (
+                            real_2d_slice_choice
+                            != "Average all other unplotted values"
+                        ):
+                            real_2d_slice_column = real_2d_slice_choice
+                            real_2d_slice_values = _numeric_slice_values(
+                                combined_real_points,
+                                real_2d_slice_column,
+                            )
+                            if real_2d_slice_values:
+                                real_2d_slice_value_key = (
+                                    f"bo_real_2d_slice_value_{real_scope_key}_"
+                                    f"{real_metric}_{real_x}_{real_y}_"
+                                    f"{real_2d_slice_column}"
+                                )
+                                _preserve_valid_widget_value(
+                                    real_2d_slice_value_key,
+                                    real_2d_slice_values,
+                                    real_2d_slice_values[0],
+                                )
+                                real_2d_slice_value = float(
+                                    slice_columns[1].selectbox(
+                                        f"Fixed {_metric_label(real_2d_slice_column)}",
+                                        real_2d_slice_values,
+                                        format_func=lambda value: f"{float(value):g}",
+                                        key=real_2d_slice_value_key,
+                                    )
+                                )
+                                real_2d_slice_token = _numeric_slice_token(
+                                    real_2d_slice_column,
+                                    real_2d_slice_value,
+                                )
+                                real_2d_title_note = _numeric_slice_title_note(
+                                    real_2d_slice_column,
+                                    real_2d_slice_value,
+                                )
+                                real_2d_sweep_key = (
+                                    f"bo_real_2d_slice_sweep_{real_scope_key}_"
+                                    f"{real_metric}_{real_x}_{real_y}_"
+                                    f"{real_2d_slice_column}"
+                                )
+                                real_2d_sweep_valid, real_2d_sweep_display = (
+                                    _prepare_preferred_multiselect_value(
+                                        real_2d_sweep_key,
+                                        f"{real_2d_sweep_key}__preferred",
+                                        real_2d_slice_values,
+                                        [real_2d_slice_value],
+                                    )
+                                )
+                                real_2d_sweep_display = slice_columns[1].multiselect(
+                                    "Slice sweep values",
+                                    real_2d_slice_values,
+                                    default=real_2d_sweep_display,
+                                    format_func=lambda value: f"{float(value):g}",
+                                    key=real_2d_sweep_key,
+                                )
+                                _sync_preferred_widget_value(
+                                    real_2d_sweep_key,
+                                    f"{real_2d_sweep_key}__preferred",
+                                    real_2d_sweep_valid,
+                                    real_2d_sweep_display,
+                                )
+                                real_2d_sweep_values = [
+                                    float(value)
+                                    for value in real_2d_sweep_display
+                                ]
+                                real_2d_sweep_token = _numeric_slice_values_token(
+                                    real_2d_slice_column,
+                                    real_2d_sweep_values,
+                                )
+                        else:
+                            slice_columns[1].caption(
+                                "2D map aggregates over unplotted parameters."
+                            )
+                if real_2d_slice_column is not None and real_2d_slice_value is not None:
+                    real_points_by_phase = {
+                        phase: _apply_numeric_slice(
+                            points,
+                            real_2d_slice_column,
+                            real_2d_slice_value,
+                        ).reset_index(drop=True)
+                        for phase, points in real_points_by_phase.items()
+                    }
+                    real_movie_source_by_phase = {
+                        phase: _apply_numeric_slice(
+                            points,
+                            real_2d_slice_column,
+                            real_2d_slice_value,
+                        ).reset_index(drop=True)
+                        for phase, points in real_movie_source_by_phase.items()
+                    }
+                    real_iteration_path = _apply_numeric_slice(
+                        real_iteration_path,
+                        real_2d_slice_column,
+                        real_2d_slice_value,
+                    ).reset_index(drop=True)
+                    combined_real_points = pd.concat(
+                        [
+                            points.assign(phase=phase)
+                            for phase, points in real_points_by_phase.items()
+                            if not points.empty
+                        ],
+                        ignore_index=True,
+                    ) if any(
+                        not points.empty for points in real_points_by_phase.values()
+                    ) else pd.DataFrame()
+                    if combined_real_points.empty:
+                        st.info(
+                            "The selected 2D slice has no real-data points for "
+                            "this metric, phase, and channel selection."
+                        )
                 if count_mode:
                     count_dimensions = [
                         dimension
@@ -7689,6 +16040,11 @@ def render_bo_session_app() -> None:
                     full_range_points = _real_count_occurrences(
                         all_real_observations,
                         count_channels,
+                    )
+                    full_range_points = _apply_numeric_slice(
+                        full_range_points,
+                        real_2d_slice_column,
+                        real_2d_slice_value,
                     )
                     full_range_points = _bin_real_count_points(
                         full_range_points,
@@ -7730,29 +16086,187 @@ def render_bo_session_app() -> None:
                                 ),
                             )
                         )
+                        full_points = _apply_numeric_slice(
+                            full_points,
+                            real_2d_slice_column,
+                            real_2d_slice_value,
+                        )
                         if not full_points.empty:
                             full_value_frames.append(full_points)
+                real_crop_axes = [
+                    dimension
+                    for dimension in (real_x, real_y, real_z)
+                    if dimension is not None
+                ]
+                real_crop_ranges = _parameter_crop_ranges(
+                    combined_real_points,
+                    real_crop_axes,
+                    key_prefix=(
+                        f"bo_real_parameter_crop_{real_scope_key}_"
+                        f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                        f"{real_view}_{real_x}_{real_y or 'none'}_"
+                        f"{real_z or 'none'}_{real_2d_slice_token}"
+                    ),
+                    label="Crop landscape by parameter",
+                    help_text=(
+                        "Crop limits are applied to the real-data landscape, "
+                        "interpolation source, data table, and generated GIF."
+                    ),
+                )
+                if real_crop_ranges:
+                    real_points_by_phase = {
+                        phase: _apply_parameter_crop(
+                            points,
+                            real_crop_ranges,
+                        ).reset_index(drop=True)
+                        for phase, points in real_points_by_phase.items()
+                    }
+                    real_movie_source_by_phase = {
+                        phase: _apply_parameter_crop(
+                            points,
+                            real_crop_ranges,
+                        ).reset_index(drop=True)
+                        for phase, points in real_movie_source_by_phase.items()
+                    }
+                    real_iteration_path = _apply_parameter_crop(
+                        real_iteration_path,
+                        real_crop_ranges,
+                    ).reset_index(drop=True)
+                    full_value_frames = [
+                        _apply_parameter_crop(
+                            points,
+                            real_crop_ranges,
+                        ).reset_index(drop=True)
+                        for points in full_value_frames
+                    ]
+                    combined_real_points = pd.concat(
+                        [
+                            points.assign(phase=phase)
+                            for phase, points in real_points_by_phase.items()
+                            if not points.empty
+                        ],
+                        ignore_index=True,
+                    ) if any(
+                        not points.empty for points in real_points_by_phase.values()
+                    ) else pd.DataFrame()
+                    if combined_real_points.empty:
+                        st.info(
+                            "The current parameter crop excludes all real-data "
+                            "points for this selection."
+                        )
+                    real_axis_ranges = {
+                        **real_axis_ranges,
+                        **real_crop_ranges,
+                    }
                 full_values = pd.concat(
                     full_value_frames,
                     ignore_index=True,
                 )["value"] if full_value_frames else pd.Series(dtype=float)
-                real_value_range = (
+                full_values = pd.to_numeric(
+                    full_values,
+                    errors="coerce",
+                )
+                full_values = full_values[np.isfinite(full_values)]
+                real_auto_value_range = (
                     (float(full_values.min()), float(full_values.max()))
                     if not full_values.empty
                     else None
+                )
+                real_value_range = None
+                if real_auto_value_range is not None:
+                    manual_real_value_range = st.checkbox(
+                        "Set measured metric display range manually",
+                        key=(
+                            f"bo_real_manual_value_range_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_channel_mode}"
+                        ),
+                        help=(
+                            "Sets the color scale range for maps/tensors and "
+                            "the y-axis range for 1D slices."
+                        ),
+                    )
+                    if manual_real_value_range:
+                        value_range_columns = st.columns(2)
+                        real_value_min = float(value_range_columns[0].number_input(
+                            f"{real_metric} minimum",
+                            value=float(real_auto_value_range[0]),
+                            format="%.6g",
+                            key=(
+                                f"bo_real_value_min_{real_scope_key}_"
+                                f"{real_metric}_{real_phase}_{real_channel_mode}"
+                            ),
+                        ))
+                        real_value_max = float(value_range_columns[1].number_input(
+                            f"{real_metric} maximum",
+                            value=float(real_auto_value_range[1]),
+                            format="%.6g",
+                            key=(
+                                f"bo_real_value_max_{real_scope_key}_"
+                                f"{real_metric}_{real_phase}_{real_channel_mode}"
+                            ),
+                        ))
+                        if real_value_min < real_value_max:
+                            real_value_range = (real_value_min, real_value_max)
+                        else:
+                            st.warning(
+                                "Measured metric range minimum must be less "
+                                "than the maximum; using per-plot autoscaling."
+                            )
+                real_log_frequency_key = "bo_real_log_frequency"
+                real_log_frequency_preference_key = (
+                    f"{real_log_frequency_key}__preferred"
+                )
+                _initialize_preference(
+                    real_log_frequency_preference_key,
+                    real_log_frequency_key,
+                    default=False,
+                )
+                _capture_widget_preference(
+                    real_log_frequency_key,
+                    real_log_frequency_preference_key,
+                )
+                st.session_state[real_log_frequency_key] = bool(
+                    st.session_state.get(real_log_frequency_preference_key, False)
                 )
                 real_log_frequency = st.checkbox(
                     "Log-scale frequency axis",
                     value=False,
                     disabled="frequency" not in (real_x, real_y, real_z),
                     help="Uses a logarithmic axis whenever frequency is a displayed dimension.",
-                    key="bo_real_log_frequency",
+                    key=real_log_frequency_key,
+                )
+                st.session_state[real_log_frequency_preference_key] = (
+                    real_log_frequency
+                )
+                real_iteration_path_key = "bo_real_show_iteration_path"
+                real_iteration_path_preference_key = (
+                    f"{real_iteration_path_key}__preferred"
+                )
+                _initialize_preference(
+                    real_iteration_path_preference_key,
+                    real_iteration_path_key,
+                    default=True,
+                )
+                _capture_widget_preference(
+                    real_iteration_path_key,
+                    real_iteration_path_preference_key,
+                )
+                st.session_state[real_iteration_path_key] = bool(
+                    st.session_state.get(real_iteration_path_preference_key, True)
                 )
                 real_show_iteration_path = st.checkbox(
                     "Show iteration path",
                     value=True,
-                    key="bo_real_show_iteration_path",
+                    key=real_iteration_path_key,
                     help="Shows the chronological red-to-black path and iteration colorbar.",
+                )
+                st.session_state[real_iteration_path_preference_key] = (
+                    real_show_iteration_path
+                )
+                real_plot_state_key = (
+                    f"v3_{real_color_by}_{real_group_color_label or 'categorical'}_"
+                    f"log{int(bool(real_log_frequency))}_"
+                    f"path{int(bool(real_show_iteration_path))}"
                 )
                 if real_phase == "both" and real_view == "1D slice":
                     if real_channel_mode == "Plot channels individually":
@@ -7763,43 +16277,17 @@ def render_bo_session_app() -> None:
                         )
                         for channel in individual_channels:
                             st.markdown(f"#### Ch {channel}")
-                            _sized_plot_container(
-                                st, plot_width_percent
-                            ).plotly_chart(
-                                _plot_real_data_both_1d(
-                                    real_points_by_phase["buffer"].loc[
-                                        real_points_by_phase["buffer"]["channel"] == channel
-                                    ],
-                                    real_points_by_phase["target"].loc[
-                                        real_points_by_phase["target"]["channel"] == channel
-                                    ],
-                                    real_metric,
-                                    real_x,
-                                    dot_size=plot_dot_size,
-                                    log_frequency=real_log_frequency,
-                                    color_by=real_color_by,
-                                    group_color_values=real_group_color_values,
-                                    group_color_label=real_group_color_label,
-                                    show_iteration_path=real_show_iteration_path,
-                                    axis_ranges=real_axis_ranges,
-                                    value_range=real_value_range,
-                                ),
-                                use_container_width=True,
-                                key=(
-                                    f"bo_real_plot_both_{channel}_{real_metric}_{real_x}_"
-                                    f"{real_scope_key}"
-                                ),
-                            )
-                    else:
-                        _sized_plot_container(
-                            st, plot_width_percent
-                        ).plotly_chart(
-                            _plot_real_data_both_1d(
-                                real_points_by_phase["buffer"],
-                                real_points_by_phase["target"],
+                            real_figure = _plot_real_data_both_1d(
+                                real_points_by_phase["buffer"].loc[
+                                    real_points_by_phase["buffer"]["channel"] == channel
+                                ],
+                                real_points_by_phase["target"].loc[
+                                    real_points_by_phase["target"]["channel"] == channel
+                                ],
                                 real_metric,
                                 real_x,
                                 dot_size=plot_dot_size,
+                                dot_opacity=plot_dot_opacity,
                                 log_frequency=real_log_frequency,
                                 color_by=real_color_by,
                                 group_color_values=real_group_color_values,
@@ -7807,11 +16295,52 @@ def render_bo_session_app() -> None:
                                 show_iteration_path=real_show_iteration_path,
                                 axis_ranges=real_axis_ranges,
                                 value_range=real_value_range,
-                            ),
+                            )
+                            if (
+                                real_color_by in {"Group", "Channel"}
+                                and not real_group_color_values
+                                and not real_show_iteration_path
+                            ):
+                                real_figure = _strip_plotly_color_references(real_figure)
+                            _plotly_chart_with_colorbars(
+                                _sized_plot_container(st, plot_width_percent),
+                                real_figure,
+                                use_container_width=True,
+                                key=(
+                                    f"bo_real_plot_both_{real_plot_state_key}_"
+                                    f"{channel}_{real_metric}_{real_x}_{real_scope_key}"
+                                ),
+                            )
+                    else:
+                        real_figure = _plot_real_data_both_1d(
+                            real_points_by_phase["buffer"],
+                            real_points_by_phase["target"],
+                            real_metric,
+                            real_x,
+                            dot_size=plot_dot_size,
+                            dot_opacity=plot_dot_opacity,
+                            log_frequency=real_log_frequency,
+                            color_by=real_color_by,
+                            group_color_values=real_group_color_values,
+                            group_color_label=real_group_color_label,
+                            show_iteration_path=real_show_iteration_path,
+                            axis_ranges=real_axis_ranges,
+                            value_range=real_value_range,
+                        )
+                        if (
+                            real_color_by in {"Group", "Channel"}
+                            and not real_group_color_values
+                            and not real_show_iteration_path
+                        ):
+                            real_figure = _strip_plotly_color_references(real_figure)
+                        _plotly_chart_with_colorbars(
+                            _sized_plot_container(st, plot_width_percent),
+                            real_figure,
                             use_container_width=True,
                             key=(
-                                f"bo_real_plot_both_{real_metric}_{real_x}_"
-                                f"{real_channel_mode}_{real_scope_key}"
+                                f"bo_real_plot_both_{real_plot_state_key}_"
+                                f"{real_metric}_{real_x}_{real_channel_mode}_"
+                                f"{real_scope_key}"
                             ),
                         )
                 elif real_phase == "both":
@@ -7841,36 +16370,66 @@ def render_bo_session_app() -> None:
                                         else str(series_name)
                                     )
                                     column.markdown(f"**{series_heading}**")
-                                _sized_plot_container(
-                                    column, plot_width_percent
-                                ).plotly_chart(
-                                    _plot_real_data_landscape(
-                                        series_points,
-                                        real_metric,
-                                        phase,
-                                        real_view,
-                                        real_x,
-                                        real_y,
-                                        real_z,
-                                        tensor_height=plot_3d_height,
-                                        dot_size=plot_dot_size,
-                                        log_frequency=real_log_frequency,
-                                        color_by=real_color_by,
-                                        group_color_values=real_group_color_values,
-                                        group_color_label=real_group_color_label,
-                                        iteration_path=real_iteration_path,
-                                        show_iteration_path=real_show_iteration_path,
-                                        count_bin_sizes=count_bin_sizes,
-                                        axis_ranges=real_axis_ranges,
-                                        value_range=real_value_range,
+                                real_figure = _plot_real_data_landscape(
+                                    series_points,
+                                    real_metric,
+                                    phase,
+                                    real_view,
+                                    real_x,
+                                    real_y,
+                                    real_z,
+                                    tensor_height=plot_3d_height,
+                                    dot_size=plot_dot_size,
+                                    dot_opacity=plot_dot_opacity,
+                                    log_frequency=real_log_frequency,
+                                    color_by=real_color_by,
+                                    group_color_values=real_group_color_values,
+                                    group_color_label=real_group_color_label,
+                                    iteration_path=(
+                                        real_iteration_path
+                                        if count_mode
+                                        else series_points
                                     ),
-                                    use_container_width=True,
-                                    key=(
-                                        f"bo_real_plot_{phase}_{series_name}_{real_metric}_"
-                                        f"{real_view}_{real_x}_{real_y}_{real_z}_"
-                                        f"{real_channel_mode}_{real_scope_key}"
-                                    ),
+                                    show_iteration_path=real_show_iteration_path,
+                                    count_bin_sizes=count_bin_sizes,
+                                    axis_ranges=real_axis_ranges,
+                                    value_range=real_value_range,
+                                    title_note=real_2d_title_note,
                                 )
+                                plot_key = (
+                                    f"bo_real_plot_{real_plot_state_key}_{phase}_"
+                                    f"{series_name}_{real_metric}_"
+                                    f"{real_view}_{real_x}_{real_y}_{real_z}_"
+                                    f"{real_channel_mode}_{real_scope_key}_"
+                                    f"{real_2d_slice_token}"
+                                )
+                                if real_view == "3D tensor":
+                                    camera_storage_key = (
+                                        f"real_3d_{real_scope_key}_{phase}_"
+                                        f"{series_name}_{real_metric}_{real_channel_mode}_"
+                                        f"{real_color_by}_{real_x}_{real_y}_{real_z}_"
+                                        f"log{int(bool(real_log_frequency))}"
+                                    )
+                                    _render_downloadable_plotly(
+                                        column,
+                                        real_figure,
+                                        key=plot_key,
+                                        file_stem=(
+                                            f"real_data_{phase}_{series_name}_"
+                                            f"{real_metric}_3d_tensor_"
+                                            f"{real_x}_{real_y}_{real_z}"
+                                        ),
+                                        width_percent=plot_width_percent,
+                                        export_height=plot_3d_height,
+                                        camera_storage_key=camera_storage_key,
+                                    )
+                                else:
+                                    _plotly_chart_with_colorbars(
+                                        _sized_plot_container(column, plot_width_percent),
+                                        real_figure,
+                                        use_container_width=True,
+                                        key=plot_key,
+                                    )
                 else:
                     phase_points = real_points_by_phase[real_phase]
                     plot_series = (
@@ -7891,36 +16450,699 @@ def render_bo_session_app() -> None:
                                 else str(series_name)
                             )
                             st.markdown(f"#### {series_heading}")
-                        _sized_plot_container(
-                            st, plot_width_percent
-                        ).plotly_chart(
-                            _plot_real_data_landscape(
-                                series_points,
-                                real_metric,
-                                real_phase,
-                                real_view,
-                                real_x,
-                                real_y,
-                                real_z,
-                                tensor_height=plot_3d_height,
-                                dot_size=plot_dot_size,
-                                log_frequency=real_log_frequency,
-                                color_by=real_color_by,
-                                group_color_values=real_group_color_values,
-                                group_color_label=real_group_color_label,
-                                iteration_path=real_iteration_path,
-                                show_iteration_path=real_show_iteration_path,
-                                count_bin_sizes=count_bin_sizes,
-                                axis_ranges=real_axis_ranges,
-                                value_range=real_value_range,
+                        real_figure = _plot_real_data_landscape(
+                            series_points,
+                            real_metric,
+                            real_phase,
+                            real_view,
+                            real_x,
+                            real_y,
+                            real_z,
+                            tensor_height=plot_3d_height,
+                            dot_size=plot_dot_size,
+                            dot_opacity=plot_dot_opacity,
+                            log_frequency=real_log_frequency,
+                            color_by=real_color_by,
+                            group_color_values=real_group_color_values,
+                            group_color_label=real_group_color_label,
+                            iteration_path=(
+                                real_iteration_path
+                                if count_mode
+                                else series_points
                             ),
-                            use_container_width=True,
-                            key=(
-                                f"bo_real_plot_{series_name}_{real_metric}_{real_phase}_"
-                                f"{real_view}_{real_x}_{real_y}_{real_z}_"
-                                f"{real_channel_mode}_{real_scope_key}"
-                            ),
+                            show_iteration_path=real_show_iteration_path,
+                            count_bin_sizes=count_bin_sizes,
+                            axis_ranges=real_axis_ranges,
+                            value_range=real_value_range,
+                            title_note=real_2d_title_note,
                         )
+                        if (
+                            real_view == "1D slice"
+                            and real_color_by in {"Group", "Channel"}
+                            and not real_group_color_values
+                            and not real_show_iteration_path
+                        ):
+                            real_figure = _strip_plotly_color_references(real_figure)
+                        plot_key = (
+                            f"bo_real_plot_{real_plot_state_key}_{series_name}_"
+                            f"{real_metric}_{real_phase}_"
+                            f"{real_view}_{real_x}_{real_y}_{real_z}_"
+                            f"{real_channel_mode}_{real_scope_key}_"
+                            f"{real_2d_slice_token}"
+                        )
+                        if real_view == "3D tensor":
+                            camera_storage_key = (
+                                f"real_3d_{real_scope_key}_{real_phase}_"
+                                f"{series_name}_{real_metric}_{real_channel_mode}_"
+                                f"{real_color_by}_{real_x}_{real_y}_{real_z}_"
+                                f"log{int(bool(real_log_frequency))}"
+                            )
+                            _render_downloadable_plotly(
+                                st,
+                                real_figure,
+                                key=plot_key,
+                                file_stem=(
+                                    f"real_data_{real_phase}_{series_name}_"
+                                    f"{real_metric}_3d_tensor_"
+                                    f"{real_x}_{real_y}_{real_z}"
+                                ),
+                                width_percent=plot_width_percent,
+                                export_height=plot_3d_height,
+                                camera_storage_key=camera_storage_key,
+                            )
+                        else:
+                            _plotly_chart_with_colorbars(
+                                _sized_plot_container(st, plot_width_percent),
+                                real_figure,
+                                use_container_width=True,
+                                key=plot_key,
+                            )
+
+                if (
+                    real_view == "2D map"
+                    and real_2d_slice_column is not None
+                    and len(real_2d_sweep_values) > 1
+                ):
+                    with st.expander("2D slice sweep", expanded=True):
+                        for sweep_value in real_2d_sweep_values:
+                            sweep_token = _numeric_slice_token(
+                                real_2d_slice_column,
+                                sweep_value,
+                            )
+                            st.markdown(
+                                f"#### {_metric_label(real_2d_slice_column)} = "
+                                f"{float(sweep_value):g}"
+                            )
+                            sweep_points_by_phase = {
+                                phase: _apply_numeric_slice(
+                                    points,
+                                    real_2d_slice_column,
+                                    sweep_value,
+                                ).reset_index(drop=True)
+                                for phase, points
+                                in unsliced_real_points_by_phase.items()
+                            }
+                            sweep_iteration_path = _apply_numeric_slice(
+                                unsliced_real_iteration_path,
+                                real_2d_slice_column,
+                                sweep_value,
+                            ).reset_index(drop=True)
+                            if count_mode:
+                                sweep_points_by_phase = {
+                                    phase: _bin_real_count_points(
+                                        points,
+                                        count_dimensions,
+                                        count_bin_sizes,
+                                        average_channels=(
+                                            real_channel_mode
+                                            == "Average selected channels"
+                                        ),
+                                    )
+                                    for phase, points
+                                    in sweep_points_by_phase.items()
+                                }
+                            if real_crop_ranges:
+                                sweep_points_by_phase = {
+                                    phase: _apply_parameter_crop(
+                                        points,
+                                        real_crop_ranges,
+                                    ).reset_index(drop=True)
+                                    for phase, points
+                                    in sweep_points_by_phase.items()
+                                }
+                                sweep_iteration_path = _apply_parameter_crop(
+                                    sweep_iteration_path,
+                                    real_crop_ranges,
+                                ).reset_index(drop=True)
+                            if real_phase == "both":
+                                sweep_columns = st.columns(2)
+                                phase_targets = (
+                                    (sweep_columns[0], "buffer"),
+                                    (sweep_columns[1], "target"),
+                                )
+                            else:
+                                phase_targets = ((st, real_phase),)
+                            for sweep_container, sweep_phase in phase_targets:
+                                sweep_phase_points = sweep_points_by_phase.get(
+                                    sweep_phase,
+                                    pd.DataFrame(),
+                                )
+                                if real_phase == "both":
+                                    sweep_container.subheader(sweep_phase.title())
+                                if sweep_phase_points.empty:
+                                    sweep_container.info(
+                                        f"No {sweep_phase} values are available "
+                                        "for this slice."
+                                    )
+                                    continue
+                                sweep_plot_series = (
+                                    list(sweep_phase_points.groupby(
+                                        "channel",
+                                        sort=False,
+                                    ))
+                                    if real_channel_mode in (
+                                        "Plot channels individually",
+                                        "Plot channel groups",
+                                    )
+                                    else [(None, sweep_phase_points)]
+                                )
+                                for sweep_series_name, sweep_series_points in (
+                                    sweep_plot_series
+                                ):
+                                    if sweep_series_name is not None:
+                                        sweep_heading = (
+                                            f"Ch {sweep_series_name}"
+                                            if real_channel_mode
+                                            == "Plot channels individually"
+                                            else str(sweep_series_name)
+                                        )
+                                        sweep_container.markdown(
+                                            f"**{sweep_heading}**"
+                                        )
+                                    sweep_figure = _plot_real_data_landscape(
+                                        sweep_series_points,
+                                        real_metric,
+                                        sweep_phase,
+                                        real_view,
+                                        real_x,
+                                        real_y,
+                                        real_z,
+                                        tensor_height=plot_3d_height,
+                                        dot_size=plot_dot_size,
+                                        dot_opacity=plot_dot_opacity,
+                                        log_frequency=real_log_frequency,
+                                        color_by=real_color_by,
+                                        group_color_values=real_group_color_values,
+                                        group_color_label=real_group_color_label,
+                                        iteration_path=(
+                                            sweep_iteration_path
+                                            if count_mode
+                                            else sweep_series_points
+                                        ),
+                                        show_iteration_path=real_show_iteration_path,
+                                        count_bin_sizes=count_bin_sizes,
+                                        axis_ranges=real_axis_ranges,
+                                        value_range=real_value_range,
+                                        title_note=_numeric_slice_title_note(
+                                            real_2d_slice_column,
+                                            sweep_value,
+                                        ),
+                                    )
+                                    _plotly_chart_with_colorbars(
+                                        _sized_plot_container(
+                                            sweep_container,
+                                            plot_width_percent,
+                                        ),
+                                        sweep_figure,
+                                        use_container_width=True,
+                                        key=(
+                                            f"bo_real_slice_sweep_{real_plot_state_key}_"
+                                            f"{sweep_phase}_{sweep_series_name}_"
+                                            f"{real_metric}_{real_x}_{real_y}_"
+                                            f"{real_channel_mode}_{real_scope_key}_"
+                                            f"{sweep_token}_{real_2d_sweep_token}"
+                                        ),
+                                    )
+
+                if real_view == "3D tensor" and not count_mode:
+                    st.divider()
+                    with st.expander(
+                        "Interpolated 3D fitness landscape",
+                        expanded=False,
+                    ):
+                        st.caption(
+                            "Builds a simulator-style discrete 3D tensor grid "
+                            "from the currently selected real observations. "
+                            "Duplicate parameter coordinates are averaged "
+                            "before interpolation."
+                        )
+                        interpolation_phase_options = [
+                            phase for phase, points in real_points_by_phase.items()
+                            if not points.empty
+                        ]
+                        if not interpolation_phase_options:
+                            st.info("No points are available to interpolate.")
+                        else:
+                            if len(interpolation_phase_options) > 1:
+                                _preserve_valid_widget_value(
+                                    "bo_real_interpolation_phase",
+                                    interpolation_phase_options,
+                                    interpolation_phase_options[0],
+                                )
+                                interpolation_phase = st.selectbox(
+                                    "Interpolation phase",
+                                    interpolation_phase_options,
+                                    format_func=str.title,
+                                    key="bo_real_interpolation_phase",
+                                )
+                            else:
+                                interpolation_phase = interpolation_phase_options[0]
+                            interp_columns = st.columns(3)
+                            interpolation_resolution = int(interp_columns[0].slider(
+                                "Grid resolution per axis",
+                                min_value=8,
+                                max_value=50,
+                                value=25,
+                                step=1,
+                                key="bo_real_3d_interpolation_resolution",
+                                help=(
+                                    "Total grid rows are resolution cubed. "
+                                    "Higher values are smoother but slower."
+                                ),
+                            ))
+                            interpolation_method_options = ["rbf", "linear", "nearest"]
+                            interpolation_method_labels = {
+                                "rbf": "RBF smooth",
+                                "linear": "Linear griddata",
+                                "nearest": "Nearest neighbor",
+                            }
+                            _preserve_valid_widget_value(
+                                "bo_real_3d_interpolation_method",
+                                interpolation_method_options,
+                                "rbf",
+                            )
+                            interpolation_method = interp_columns[1].selectbox(
+                                "Interpolation",
+                                interpolation_method_options,
+                                format_func=lambda option: interpolation_method_labels.get(
+                                    option,
+                                    option,
+                                ),
+                                key="bo_real_3d_interpolation_method",
+                            )
+                            interpolation_fill_nearest = interp_columns[2].checkbox(
+                                "Fill gaps with nearest",
+                                value=True,
+                                key="bo_real_3d_interpolation_fill_nearest",
+                                disabled=interpolation_method != "linear",
+                                help=(
+                                    "Linear interpolation only covers the convex "
+                                    "hull of measured points unless gaps are filled."
+                                ),
+                            )
+                            interpolation_key = (
+                                f"bo_real_interpolated_3d_{real_scope_key}_"
+                                f"{real_metric}_{interpolation_phase}_{real_x}_"
+                                f"{real_y}_{real_z}_{interpolation_resolution}_"
+                                f"{interpolation_method}_{interpolation_fill_nearest}_"
+                                f"{real_log_frequency}_{real_channel_mode}_"
+                                f"{real_2d_slice_token}_{INTERPOLATION_CACHE_VERSION}"
+                            )
+                            if st.button(
+                                "Generate interpolated landscape",
+                                key=f"{interpolation_key}_button",
+                            ):
+                                progress = st.progress(
+                                    0.05,
+                                    text="Interpolating 3D fitness landscape...",
+                                )
+                                source_points = real_points_by_phase[
+                                    interpolation_phase
+                                ]
+                                valid_points, grid_frame, error = _interpolated_3d_grid(
+                                    source_points,
+                                    real_x,
+                                    real_y,
+                                    real_z,
+                                    resolution=interpolation_resolution,
+                                    method=interpolation_method,
+                                    fill_nearest=interpolation_fill_nearest,
+                                    log_frequency=real_log_frequency,
+                                )
+                                progress.progress(
+                                    0.7,
+                                    text="Building 3D tensor-grid preview...",
+                                )
+                                st.session_state[interpolation_key] = {
+                                    "valid_points": valid_points,
+                                    "grid_frame": grid_frame,
+                                    "error": error,
+                                }
+                                progress.progress(
+                                    1.0,
+                                    text="Interpolated landscape ready.",
+                                )
+                            interpolation_result = st.session_state.get(
+                                interpolation_key
+                            )
+                            if interpolation_result is not None:
+                                valid_points = interpolation_result["valid_points"]
+                                grid_frame = interpolation_result["grid_frame"]
+                                error = interpolation_result["error"]
+                                if error:
+                                    st.warning(error)
+                                elif grid_frame.empty:
+                                    st.warning("No interpolated grid rows were generated.")
+                                else:
+                                    st.caption(
+                                        f"Interpolated {len(grid_frame):,} grid "
+                                        f"points from {len(valid_points):,} measured "
+                                        "observations."
+                                    )
+                                    slice_control_columns = st.columns(3)
+                                    interpolation_slice_axes = [
+                                        real_x,
+                                        real_y,
+                                        real_z,
+                                    ]
+                                    interpolation_slice_axis_choices = [
+                                        NO_HIGHLIGHTED_SLICE_LABEL,
+                                        *interpolation_slice_axes,
+                                    ]
+                                    interpolation_slice_axis_key = (
+                                        f"{interpolation_key}_slice_axis"
+                                    )
+                                    _preserve_valid_widget_value(
+                                        interpolation_slice_axis_key,
+                                        interpolation_slice_axis_choices,
+                                        real_z,
+                                    )
+                                    interpolation_slice_axis_choice = (
+                                        slice_control_columns[0].selectbox(
+                                            "Highlighted slice axis",
+                                            interpolation_slice_axis_choices,
+                                            format_func=lambda value: (
+                                                value
+                                                if value == NO_HIGHLIGHTED_SLICE_LABEL
+                                                else _metric_label(value)
+                                            ),
+                                            key=interpolation_slice_axis_key,
+                                            help=(
+                                                "Click a 3D tensor point to set "
+                                                "the slice value for this axis. "
+                                                "The selected slice is drawn as "
+                                                "a transparent red plane."
+                                            ),
+                                        )
+                                    )
+                                    interpolation_slice_axis = (
+                                        None
+                                        if interpolation_slice_axis_choice
+                                        == NO_HIGHLIGHTED_SLICE_LABEL
+                                        else interpolation_slice_axis_choice
+                                    )
+                                    interpolation_slice_values = (
+                                        _numeric_slice_values(
+                                            grid_frame,
+                                            interpolation_slice_axis,
+                                        )
+                                        if interpolation_slice_axis is not None
+                                        else []
+                                    )
+                                    interpolation_slice_value = None
+                                    interpolation_slice_value_key = None
+                                    interpolation_slice_token = "no_slice"
+                                    if interpolation_slice_values:
+                                        interpolation_slice_value_key = (
+                                            f"{interpolation_key}_slice_value_"
+                                            f"{interpolation_slice_axis}"
+                                        )
+                                        _preserve_valid_widget_value(
+                                            interpolation_slice_value_key,
+                                            interpolation_slice_values,
+                                            interpolation_slice_values[0],
+                                        )
+                                        interpolation_slice_value = float(
+                                            slice_control_columns[1].selectbox(
+                                                (
+                                                    "Slice "
+                                                    f"{_metric_label(interpolation_slice_axis)}"
+                                                ),
+                                                interpolation_slice_values,
+                                                format_func=(
+                                                    lambda value: f"{float(value):g}"
+                                                ),
+                                                key=interpolation_slice_value_key,
+                                            )
+                                        )
+                                        interpolation_slice_token = (
+                                            _numeric_slice_token(
+                                                interpolation_slice_axis,
+                                                interpolation_slice_value,
+                                            )
+                                        )
+                                    interpolation_mouse_mode_options = [
+                                        "Rotate/view 3D plot",
+                                        "Pick slice by clicking",
+                                    ]
+                                    interpolation_mouse_mode_key = (
+                                        f"{interpolation_key}_mouse_mode"
+                                    )
+                                    _preserve_valid_widget_value(
+                                        interpolation_mouse_mode_key,
+                                        interpolation_mouse_mode_options,
+                                        interpolation_mouse_mode_options[0],
+                                    )
+                                    interpolation_mouse_mode = (
+                                        slice_control_columns[2].selectbox(
+                                            "Mouse mode",
+                                            interpolation_mouse_mode_options,
+                                            key=interpolation_mouse_mode_key,
+                                            help=(
+                                                "Use rotate/view for normal 3D "
+                                                "interaction. Switch to click-pick "
+                                                "only when selecting a slice from "
+                                                "the plot with the mouse."
+                                            ),
+                                        )
+                                    )
+                                    interpolation_figure = (
+                                        _plot_interpolated_3d_landscape(
+                                            valid_points,
+                                            grid_frame,
+                                            real_metric,
+                                            real_x,
+                                            real_y,
+                                            real_z,
+                                            tensor_height=plot_3d_height,
+                                            dot_size=plot_dot_size,
+                                            dot_opacity=plot_dot_opacity,
+                                            log_frequency=real_log_frequency,
+                                            value_range=real_value_range,
+                                            slice_axis=interpolation_slice_axis,
+                                            slice_value=interpolation_slice_value,
+                                        )
+                                    )
+                                    interpolation_plot_key = (
+                                        f"{interpolation_key}_plot_"
+                                        f"{interpolation_slice_token}"
+                                    )
+                                    interpolation_click_pick_enabled = (
+                                        interpolation_slice_axis is not None
+                                        and
+                                        interpolation_mouse_mode
+                                        == "Pick slice by clicking"
+                                    )
+                                    interpolation_clicked_points = None
+                                    if (
+                                        interpolation_click_pick_enabled
+                                        and plotly_events is not None
+                                    ):
+                                        _apply_plotly_colorbar_height(
+                                            interpolation_figure
+                                        )
+                                        with _sized_plot_container(
+                                            st,
+                                            plot_width_percent,
+                                        ):
+                                            interpolation_clicked_points = (
+                                                plotly_events(
+                                                    interpolation_figure,
+                                                    click_event=True,
+                                                    hover_event=False,
+                                                    select_event=False,
+                                                    override_height=plot_3d_height,
+                                                    override_width="100%",
+                                                    key=(
+                                                        f"{interpolation_plot_key}_"
+                                                        "click_pick"
+                                                    ),
+                                                )
+                                            )
+                                    else:
+                                        _render_downloadable_plotly(
+                                            st,
+                                            interpolation_figure,
+                                            key=f"{interpolation_plot_key}_rotate",
+                                            file_stem=(
+                                                "interpolated_3d_"
+                                                f"{_safe_download_stem(real_metric)}_"
+                                                f"{real_x}_{real_y}_{real_z}"
+                                            ),
+                                            width_percent=plot_width_percent,
+                                            export_height=plot_3d_height,
+                                            camera_storage_key=(
+                                                f"real_interpolated_3d_"
+                                                f"{real_scope_key}_{real_metric}_"
+                                                f"{interpolation_phase}_{real_x}_"
+                                                f"{real_y}_{real_z}_"
+                                                f"{interpolation_slice_token}"
+                                            ),
+                                        )
+                                    if (
+                                        interpolation_click_pick_enabled
+                                        and plotly_events is None
+                                    ):
+                                        st.caption(
+                                            "Mouse click slice picking requires "
+                                            "`streamlit-plotly-events`; install "
+                                            "the updated requirements and restart "
+                                            "Streamlit."
+                                        )
+                                    if (
+                                        interpolation_click_pick_enabled
+                                        and interpolation_slice_value_key is not None
+                                        and interpolation_slice_values
+                                    ):
+                                        selected_slice_coordinate = (
+                                            _clicked_3d_coordinate(
+                                                interpolation_clicked_points,
+                                                interpolation_slice_axis,
+                                                (real_x, real_y, real_z),
+                                            )
+                                        )
+                                        if selected_slice_coordinate is not None:
+                                            nearest_slice_value = min(
+                                                interpolation_slice_values,
+                                                key=lambda value: abs(
+                                                    float(value)
+                                                    - float(selected_slice_coordinate)
+                                                ),
+                                            )
+                                            slice_preference_key = (
+                                                f"{interpolation_slice_value_key}"
+                                                "__preferred"
+                                            )
+                                            if (
+                                                st.session_state.get(
+                                                    slice_preference_key
+                                                )
+                                                != nearest_slice_value
+                                            ):
+                                                st.session_state[
+                                                    slice_preference_key
+                                                ] = nearest_slice_value
+                                                st.rerun()
+                                    if (
+                                        interpolation_slice_axis is not None
+                                        and interpolation_slice_value is not None
+                                    ):
+                                        interpolation_slice_plot_key = (
+                                            f"{interpolation_key}_2d_slice_"
+                                            f"{interpolation_slice_token}"
+                                        )
+                                        if st.button(
+                                            "Generate 2D plot for highlighted slice",
+                                            key=(
+                                                f"{interpolation_slice_plot_key}_"
+                                                "button"
+                                            ),
+                                        ):
+                                            interpolation_slice_plot_axes = [
+                                                axis
+                                                for axis in (real_x, real_y, real_z)
+                                                if axis != interpolation_slice_axis
+                                            ]
+                                            slice_grid = _apply_numeric_slice(
+                                                grid_frame,
+                                                interpolation_slice_axis,
+                                                interpolation_slice_value,
+                                            ).reset_index(drop=True)
+                                            if (
+                                                len(interpolation_slice_plot_axes) == 2
+                                                and not slice_grid.empty
+                                            ):
+                                                slice_figure = (
+                                                    _plot_interpolated_2d_slice(
+                                                        valid_points,
+                                                        grid_frame,
+                                                        real_metric,
+                                                        interpolation_slice_plot_axes[0],
+                                                        interpolation_slice_plot_axes[1],
+                                                        interpolation_slice_axis,
+                                                        interpolation_slice_value,
+                                                        log_frequency=real_log_frequency,
+                                                        value_range=real_value_range,
+                                                    )
+                                                )
+                                                st.session_state[
+                                                    interpolation_slice_plot_key
+                                                ] = {
+                                                    "figure": slice_figure,
+                                                    "axes": (
+                                                        interpolation_slice_plot_axes
+                                                    ),
+                                                    "frame": slice_grid,
+                                                }
+                                            else:
+                                                st.session_state.pop(
+                                                    interpolation_slice_plot_key,
+                                                    None,
+                                                )
+                                                st.warning(
+                                                    "No interpolated grid values "
+                                                    "match the highlighted 3D slice."
+                                                )
+                                        highlighted_interpolation_slice = (
+                                            st.session_state.get(
+                                                interpolation_slice_plot_key
+                                            )
+                                        )
+                                        if highlighted_interpolation_slice is not None:
+                                            st.markdown(
+                                                "##### Highlighted slice 2D map"
+                                            )
+                                            slice_axes = (
+                                                highlighted_interpolation_slice["axes"]
+                                            )
+                                            _render_downloadable_plotly(
+                                                st,
+                                                highlighted_interpolation_slice[
+                                                    "figure"
+                                                ],
+                                                key=(
+                                                    f"{interpolation_slice_plot_key}_"
+                                                    "plot"
+                                                ),
+                                                file_stem=(
+                                                    "interpolated_2d_slice_"
+                                                    f"{_safe_download_stem(real_metric)}_"
+                                                    f"{slice_axes[0]}_{slice_axes[1]}_"
+                                                    f"{interpolation_slice_token}"
+                                                ),
+                                                width_percent=plot_width_percent,
+                                                export_height=460,
+                                            )
+                                            with st.expander(
+                                                "Highlighted slice grid values"
+                                            ):
+                                                st.dataframe(
+                                                    highlighted_interpolation_slice[
+                                                        "frame"
+                                                    ].sort_values(slice_axes),
+                                                    use_container_width=True,
+                                                    hide_index=True,
+                                                )
+                                    st.download_button(
+                                        "Download interpolated grid CSV",
+                                        data=grid_frame.to_csv(index=False).encode(),
+                                        file_name=(
+                                            f"interpolated_3d_{_safe_download_stem(real_metric)}_"
+                                            f"{real_x}_{real_y}_{real_z}.csv"
+                                        ),
+                                        mime="text/csv",
+                                        key=f"{interpolation_key}_download_grid",
+                                    )
+                                    st.download_button(
+                                        "Download source observations CSV",
+                                        data=valid_points.to_csv(index=False).encode(),
+                                        file_name=(
+                                            f"interpolation_source_{_safe_download_stem(real_metric)}_"
+                                            f"{real_x}_{real_y}_{real_z}.csv"
+                                        ),
+                                        mime="text/csv",
+                                        key=f"{interpolation_key}_download_source",
+                                    )
 
                 st.divider()
                 st.markdown("#### Real-data landscape animation")
@@ -7935,7 +17157,15 @@ def render_bo_session_app() -> None:
                 )
                 real_gif_key = (
                     f"bo_real_gif_{real_scope_key}_{real_metric}_{real_phase}_"
-                    f"{real_channel_mode}_{real_view}_{real_x}_{real_y}_{real_z}"
+                    f"{real_channel_mode}_{real_view}_{real_x}_{real_y}_{real_z}_"
+                    f"{real_2d_slice_token}_"
+                    f"{real_value_range[0]:g}_{real_value_range[1]:g}"
+                    if real_value_range is not None
+                    else (
+                        f"bo_real_gif_{real_scope_key}_{real_metric}_{real_phase}_"
+                        f"{real_channel_mode}_{real_view}_{real_x}_{real_y}_{real_z}_"
+                        f"{real_2d_slice_token}"
+                    )
                 )
                 if st.button(
                     "Generate real-data GIF",
@@ -8016,6 +17246,7 @@ def render_bo_session_app() -> None:
                                                 errors="coerce",
                                             ) <= frame_iteration
                                         ].copy()
+                                        frame_path = frame_points
                                         if count_mode:
                                             frame_points = _bin_real_count_points(
                                                 frame_points,
@@ -8026,10 +17257,6 @@ def render_bo_session_app() -> None:
                                                     == "Average selected channels"
                                                 ),
                                             )
-                                        frame_path = real_iteration_path.loc[
-                                            real_iteration_path["iteration"]
-                                            <= frame_iteration
-                                        ]
                                         yield _plot_real_data_landscape(
                                             frame_points,
                                             real_metric,
@@ -8040,6 +17267,7 @@ def render_bo_session_app() -> None:
                                             real_z,
                                             tensor_height=plot_3d_height,
                                             dot_size=plot_dot_size,
+                                            dot_opacity=plot_dot_opacity,
                                             log_frequency=real_log_frequency,
                                             color_by=real_color_by,
                                             group_color_values=(
@@ -8055,6 +17283,7 @@ def render_bo_session_app() -> None:
                                             count_bin_sizes=count_bin_sizes,
                                             axis_ranges=real_axis_ranges,
                                             value_range=real_value_range,
+                                            title_note=real_2d_title_note,
                                         )
 
                                 generated_gifs[target_name] = _figures_to_gif(
@@ -8071,11 +17300,11 @@ def render_bo_session_app() -> None:
                                         offset=completed_movie_frames,
                                         name=target_name:
                                         movie_progress.progress(
-                                            min(
-                                                0.95,
-                                                0.95
-                                                * (offset + current)
-                                                / total_movie_frames,
+                                            _progress_fraction(
+                                                offset + current,
+                                                total_movie_frames,
+                                                start=0.02,
+                                                end=0.95,
                                             ),
                                             text=(
                                                 f"Rendering {name}: frame "
@@ -8119,6 +17348,8 @@ def render_bo_session_app() -> None:
                     )
                 if real_metric == "Classic Q":
                     _render_q_equation(session["config"], "classic")
+                elif real_metric == "Paired Q":
+                    _render_q_equation(session["config"], "paired")
                 st.dataframe(combined_real_points, use_container_width=True, hide_index=True)
 
     with surrogate:
@@ -8129,35 +17360,37 @@ def render_bo_session_app() -> None:
         available_surrogate_groups = [
             group for group in groups if grouped_surrogate_files[group["id"]]
         ]
-        surrogate_state_prefix = (
+        legacy_surrogate_state_prefix = (
             f"bo_surrogate_"
             f"{session['state'].get('session_id', session['root'].name)}"
         )
+        surrogate_state_prefix = "bo_surrogate"
+        surrogate_output_prefix = legacy_surrogate_state_prefix
         if available_surrogate_groups:
             surrogate_group_options = [
                 group["id"] for group in available_surrogate_groups
             ]
-            default_surrogate_groups = (
-                [int(selected_observation_group_scope)]
-                if (
-                    selected_observation_group_scope != "all"
-                    and int(selected_observation_group_scope) in surrogate_group_options
-                )
-                else surrogate_group_options
-            )
+            default_surrogate_groups = surrogate_group_options
             surrogate_groups_key = f"{surrogate_state_prefix}_groups"
-            stored_surrogate_groups = st.session_state.get(
+            surrogate_groups_preference_key = f"{surrogate_state_prefix}_pref_groups"
+            _initialize_preference(
+                surrogate_groups_preference_key,
                 surrogate_groups_key,
-                default_surrogate_groups,
+                f"{legacy_surrogate_state_prefix}_groups",
+                default=default_surrogate_groups,
             )
-            st.session_state[surrogate_groups_key] = [
-                group_id for group_id in stored_surrogate_groups
-                if group_id in surrogate_group_options
-            ] or default_surrogate_groups
+            groups_preference_valid, surrogate_groups_display = (
+                _prepare_preferred_multiselect_value(
+                    surrogate_groups_key,
+                    surrogate_groups_preference_key,
+                    surrogate_group_options,
+                    default_surrogate_groups,
+                )
+            )
             selected_surrogate_groups = st.multiselect(
                 "Surrogate channel groups",
                 surrogate_group_options,
-                default=default_surrogate_groups,
+                default=surrogate_groups_display,
                 format_func=lambda group_id: next(
                     (
                         f"{group['name']} (channels "
@@ -8168,6 +17401,12 @@ def render_bo_session_app() -> None:
                     f"Group {group_id}",
                 ),
                 key=surrogate_groups_key,
+            )
+            _sync_preferred_widget_value(
+                surrogate_groups_key,
+                surrogate_groups_preference_key,
+                groups_preference_valid,
+                surrogate_groups_display,
             )
             selected_surrogates = [
                 (
@@ -8201,15 +17440,40 @@ def render_bo_session_app() -> None:
                 if available_surrogate_groups
                 else "bo_surrogate_ungrouped_artifact_iteration"
             )
-            _preserve_valid_widget_value(
+            legacy_surrogate_iteration_key = (
+                f"{legacy_surrogate_state_prefix}_artifact_iteration"
+                if available_surrogate_groups
+                else "bo_surrogate_ungrouped_artifact_iteration"
+            )
+            surrogate_iteration_preference_key = (
+                f"{surrogate_state_prefix}_pref_artifact_iteration"
+                if available_surrogate_groups
+                else "bo_surrogate_ungrouped_pref_artifact_iteration"
+            )
+            _initialize_preference(
+                surrogate_iteration_preference_key,
                 surrogate_iteration_key,
-                artifact_iterations,
-                artifact_iterations[-1],
+                legacy_surrogate_iteration_key,
+                default=artifact_iterations[-1],
+            )
+            iteration_preference_valid, iteration_display = (
+                _prepare_preferred_widget_value(
+                    surrogate_iteration_key,
+                    surrogate_iteration_preference_key,
+                    artifact_iterations,
+                    artifact_iterations[-1],
+                )
             )
             artifact_iteration = st.selectbox(
                 "Artifact iteration",
                 artifact_iterations,
                 key=surrogate_iteration_key,
+            )
+            _sync_preferred_widget_value(
+                surrogate_iteration_key,
+                surrogate_iteration_preference_key,
+                iteration_preference_valid,
+                iteration_display,
             )
             available_at_iteration = [
                 (
@@ -8250,22 +17514,48 @@ def render_bo_session_app() -> None:
                 if all(name in predictions.columns for predictions in predictions_frames)
             ]
             surrogate_value_key = f"{surrogate_state_prefix}_value"
-            _preserve_valid_widget_value(
+            surrogate_value_preference_key = f"{surrogate_state_prefix}_pref_value"
+            _initialize_preference(
+                surrogate_value_preference_key,
                 surrogate_value_key,
-                values,
-                values[0],
+                f"{legacy_surrogate_state_prefix}_value",
+                default=values[0],
+            )
+            value_preference_valid, value_display = (
+                _prepare_preferred_widget_value(
+                    surrogate_value_key,
+                    surrogate_value_preference_key,
+                    values,
+                    values[0],
+                )
             )
             value = st.selectbox("Value", values, key=surrogate_value_key)
+            _sync_preferred_widget_value(
+                surrogate_value_key,
+                surrogate_value_preference_key,
+                value_preference_valid,
+                value_display,
+            )
             view_options = ["1D slice"]
             if len(dimensions) >= 2:
                 view_options.append("2D map")
             if len(dimensions) >= 3:
                 view_options.append("3D tensor")
             surrogate_view_key = f"{surrogate_state_prefix}_view"
-            _preserve_valid_widget_value(
+            surrogate_view_preference_key = f"{surrogate_state_prefix}_pref_view"
+            _initialize_preference(
+                surrogate_view_preference_key,
                 surrogate_view_key,
-                view_options,
-                "1D slice",
+                f"{legacy_surrogate_state_prefix}_view",
+                default="1D slice",
+            )
+            view_preference_valid, view_display = (
+                _prepare_preferred_widget_value(
+                    surrogate_view_key,
+                    surrogate_view_preference_key,
+                    view_options,
+                    "1D slice",
+                )
             )
             view = st.radio(
                 "View",
@@ -8273,51 +17563,412 @@ def render_bo_session_app() -> None:
                 horizontal=True,
                 key=surrogate_view_key,
             )
+            _sync_preferred_widget_value(
+                surrogate_view_key,
+                surrogate_view_preference_key,
+                view_preference_valid,
+                view_display,
+            )
             surrogate_x_key = f"{surrogate_state_prefix}_x"
-            _preserve_valid_widget_value(
+            surrogate_x_preference_key = f"{surrogate_state_prefix}_pref_x"
+            _initialize_preference(
+                surrogate_x_preference_key,
                 surrogate_x_key,
-                dimensions,
-                dimensions[0],
+                f"{legacy_surrogate_state_prefix}_x",
+                default=dimensions[0],
+            )
+            x_preference_valid, x_display = (
+                _prepare_preferred_widget_value(
+                    surrogate_x_key,
+                    surrogate_x_preference_key,
+                    dimensions,
+                    dimensions[0],
+                )
             )
             x_name = st.selectbox("X", dimensions, key=surrogate_x_key)
+            _sync_preferred_widget_value(
+                surrogate_x_key,
+                surrogate_x_preference_key,
+                x_preference_valid,
+                x_display,
+            )
             y_options = [name for name in dimensions if name != x_name]
             surrogate_y_key = f"{surrogate_state_prefix}_y"
+            surrogate_y_preference_key = f"{surrogate_state_prefix}_pref_y"
+            _initialize_preference(
+                surrogate_y_preference_key,
+                surrogate_y_key,
+                f"{legacy_surrogate_state_prefix}_y",
+                default=y_options[0] if y_options else None,
+            )
             if view != "1D slice":
-                _preserve_valid_widget_value(
-                    surrogate_y_key,
-                    y_options,
-                    y_options[0],
+                y_preference_valid, y_display = (
+                    _prepare_preferred_widget_value(
+                        surrogate_y_key,
+                        surrogate_y_preference_key,
+                        y_options,
+                        y_options[0],
+                    )
                 )
-            y_name = st.selectbox(
-                "Y",
-                y_options,
-                key=surrogate_y_key,
-            ) if view != "1D slice" else None
+                y_name = st.selectbox(
+                    "Y",
+                    y_options,
+                    key=surrogate_y_key,
+                )
+                _sync_preferred_widget_value(
+                    surrogate_y_key,
+                    surrogate_y_preference_key,
+                    y_preference_valid,
+                    y_display,
+                )
+            else:
+                y_name = None
             z_options = [name for name in dimensions if name not in (x_name, y_name)]
             surrogate_z_key = f"{surrogate_state_prefix}_z"
+            surrogate_z_preference_key = f"{surrogate_state_prefix}_pref_z"
+            _initialize_preference(
+                surrogate_z_preference_key,
+                surrogate_z_key,
+                f"{legacy_surrogate_state_prefix}_z",
+                default=z_options[0] if z_options else None,
+            )
             if view == "3D tensor":
-                _preserve_valid_widget_value(
-                    surrogate_z_key,
-                    z_options,
-                    z_options[0],
+                z_preference_valid, z_display = (
+                    _prepare_preferred_widget_value(
+                        surrogate_z_key,
+                        surrogate_z_preference_key,
+                        z_options,
+                        z_options[0],
+                    )
                 )
-            z_name = st.selectbox(
-                "Z",
-                z_options,
-                key=surrogate_z_key,
-            ) if view == "3D tensor" else None
+                z_name = st.selectbox(
+                    "Z",
+                    z_options,
+                    key=surrogate_z_key,
+                )
+                _sync_preferred_widget_value(
+                    surrogate_z_key,
+                    surrogate_z_preference_key,
+                    z_preference_valid,
+                    z_display,
+                )
+            else:
+                z_name = None
+            surrogate_crop_source = (
+                pd.concat(predictions_frames, ignore_index=True)
+                if predictions_frames
+                else pd.DataFrame()
+            )
+            surrogate_3d_slice_axis = None
+            surrogate_3d_slice_value = None
+            surrogate_3d_slice_value_key = None
+            surrogate_3d_slice_values: list[float] = []
+            surrogate_3d_slice_sweep_values: list[float] = []
+            surrogate_3d_slice_sweep_token = "no_sweep"
+            surrogate_3d_mouse_mode = "Rotate/view 3D plot"
+            surrogate_3d_slice_token = "no_slice"
+            surrogate_2d_slice_column = None
+            surrogate_2d_slice_value = None
+            surrogate_2d_sweep_values: list[float] = []
+            surrogate_2d_sweep_token = "no_sweep"
+            surrogate_2d_slice_token = "all_unplotted"
+            surrogate_2d_title_note = None
+            if view == "2D map":
+                surrogate_2d_slice_options = [
+                    name for name in dimensions if name not in {x_name, y_name}
+                ]
+                if surrogate_2d_slice_options:
+                    slice_columns = st.columns(2)
+                    surrogate_2d_slice_choices = [
+                        "Average all other unplotted values",
+                        *surrogate_2d_slice_options,
+                    ]
+                    surrogate_2d_slice_column_key = (
+                        f"{surrogate_state_prefix}_2d_slice_column_"
+                        f"{value}_{x_name}_{y_name}"
+                    )
+                    _preserve_valid_widget_value(
+                        surrogate_2d_slice_column_key,
+                        surrogate_2d_slice_choices,
+                        surrogate_2d_slice_choices[0],
+                    )
+                    surrogate_2d_slice_choice = slice_columns[0].selectbox(
+                        "Fixed unplotted parameter",
+                        surrogate_2d_slice_choices,
+                        format_func=lambda option: (
+                            option if option.startswith("Average")
+                            else _metric_label(option)
+                        ),
+                        key=surrogate_2d_slice_column_key,
+                    )
+                    if (
+                        surrogate_2d_slice_choice
+                        != "Average all other unplotted values"
+                    ):
+                        surrogate_2d_slice_column = surrogate_2d_slice_choice
+                        surrogate_2d_slice_values = _numeric_slice_values(
+                            surrogate_crop_source,
+                            surrogate_2d_slice_column,
+                        )
+                        if surrogate_2d_slice_values:
+                            surrogate_2d_slice_value_key = (
+                                f"{surrogate_state_prefix}_2d_slice_value_"
+                                f"{value}_{x_name}_{y_name}_"
+                                f"{surrogate_2d_slice_column}"
+                            )
+                            _preserve_valid_widget_value(
+                                surrogate_2d_slice_value_key,
+                                surrogate_2d_slice_values,
+                                surrogate_2d_slice_values[0],
+                            )
+                            surrogate_2d_slice_value = float(
+                                slice_columns[1].selectbox(
+                                    f"Fixed {_metric_label(surrogate_2d_slice_column)}",
+                                    surrogate_2d_slice_values,
+                                    format_func=lambda value: f"{float(value):g}",
+                                    key=surrogate_2d_slice_value_key,
+                                )
+                            )
+                            surrogate_2d_slice_token = _numeric_slice_token(
+                                surrogate_2d_slice_column,
+                                surrogate_2d_slice_value,
+                            )
+                            surrogate_2d_title_note = _numeric_slice_title_note(
+                                surrogate_2d_slice_column,
+                                surrogate_2d_slice_value,
+                            )
+                            surrogate_2d_sweep_key = (
+                                f"{surrogate_state_prefix}_2d_slice_sweep_"
+                                f"{value}_{x_name}_{y_name}_"
+                                f"{surrogate_2d_slice_column}"
+                            )
+                            surrogate_2d_sweep_valid, surrogate_2d_sweep_display = (
+                                _prepare_preferred_multiselect_value(
+                                    surrogate_2d_sweep_key,
+                                    f"{surrogate_2d_sweep_key}__preferred",
+                                    surrogate_2d_slice_values,
+                                    [surrogate_2d_slice_value],
+                                )
+                            )
+                            surrogate_2d_sweep_display = (
+                                slice_columns[1].multiselect(
+                                    "Slice sweep values",
+                                    surrogate_2d_slice_values,
+                                    default=surrogate_2d_sweep_display,
+                                    format_func=lambda value: f"{float(value):g}",
+                                    key=surrogate_2d_sweep_key,
+                                )
+                            )
+                            _sync_preferred_widget_value(
+                                surrogate_2d_sweep_key,
+                                f"{surrogate_2d_sweep_key}__preferred",
+                                surrogate_2d_sweep_valid,
+                                surrogate_2d_sweep_display,
+                            )
+                            surrogate_2d_sweep_values = [
+                                float(value)
+                                for value in surrogate_2d_sweep_display
+                            ]
+                            surrogate_2d_sweep_token = _numeric_slice_values_token(
+                                surrogate_2d_slice_column,
+                                surrogate_2d_sweep_values,
+                            )
+                    else:
+                        slice_columns[1].caption(
+                            "2D map aggregates over unplotted parameters."
+                        )
+            if (
+                surrogate_2d_slice_column is not None
+                and surrogate_2d_slice_value is not None
+            ):
+                surrogate_crop_source = _apply_numeric_slice(
+                    surrogate_crop_source,
+                    surrogate_2d_slice_column,
+                    surrogate_2d_slice_value,
+                ).reset_index(drop=True)
+            surrogate_crop_ranges = _parameter_crop_ranges(
+                surrogate_crop_source,
+                [x_name, y_name, z_name],
+                key_prefix=(
+                    f"bo_surrogate_parameter_crop_{surrogate_state_prefix}_"
+                    f"{artifact_iteration}_{value}_{view}_{x_name}_"
+                    f"{y_name or 'none'}_{z_name or 'none'}_"
+                    f"{surrogate_2d_slice_token}"
+                ),
+                label="Crop landscape by parameter",
+                help_text=(
+                    "Crop limits are applied to surrogate plots, candidate "
+                    "accounting, and generated GIFs."
+                ),
+            )
+            surrogate_crop_token = "_".join(
+                f"{axis}_{crop_min:g}_{crop_max:g}"
+                for axis, (crop_min, crop_max)
+                in surrogate_crop_ranges.items()
+            ) or "full"
+            surrogate_log_frequency_key = f"{surrogate_state_prefix}_log_frequency"
+            surrogate_log_frequency_preference_key = (
+                f"{surrogate_state_prefix}_pref_log_frequency"
+            )
+            _initialize_preference(
+                surrogate_log_frequency_preference_key,
+                surrogate_log_frequency_key,
+                f"{legacy_surrogate_state_prefix}_log_frequency",
+                default=False,
+            )
+            _capture_widget_preference(
+                surrogate_log_frequency_key,
+                surrogate_log_frequency_preference_key,
+            )
+            st.session_state[surrogate_log_frequency_key] = bool(
+                st.session_state.get(
+                    surrogate_log_frequency_preference_key,
+                    False,
+                )
+            )
             surrogate_log_frequency = st.checkbox(
                 "Log-scale frequency axis",
                 value=False,
                 disabled="frequency" not in (x_name, y_name, z_name),
                 help="Uses a logarithmic axis whenever frequency is a displayed dimension.",
-                key=f"{surrogate_state_prefix}_log_frequency",
+                key=surrogate_log_frequency_key,
+            )
+            st.session_state[surrogate_log_frequency_preference_key] = (
+                surrogate_log_frequency
+            )
+            surrogate_iteration_path_key = (
+                f"{surrogate_state_prefix}_show_iteration_path"
+            )
+            surrogate_iteration_path_preference_key = (
+                f"{surrogate_state_prefix}_pref_show_iteration_path"
+            )
+            _initialize_preference(
+                surrogate_iteration_path_preference_key,
+                surrogate_iteration_path_key,
+                f"{legacy_surrogate_state_prefix}_show_iteration_path",
+                default=True,
+            )
+            _capture_widget_preference(
+                surrogate_iteration_path_key,
+                surrogate_iteration_path_preference_key,
+            )
+            st.session_state[surrogate_iteration_path_key] = bool(
+                st.session_state.get(
+                    surrogate_iteration_path_preference_key,
+                    True,
+                )
             )
             surrogate_show_iteration_path = st.checkbox(
                 "Show iteration path",
                 value=True,
-                key=f"{surrogate_state_prefix}_show_iteration_path",
+                key=surrogate_iteration_path_key,
                 help="Shows the chronological red-to-black path and iteration colorbar.",
+            )
+            st.session_state[surrogate_iteration_path_preference_key] = (
+                surrogate_show_iteration_path
+            )
+            surrogate_show_observed_points = True
+            if view in ("2D map", "3D tensor"):
+                surrogate_observed_points_key = (
+                    f"{surrogate_state_prefix}_show_observed_points"
+                )
+                surrogate_observed_points_preference_key = (
+                    f"{surrogate_state_prefix}_pref_show_observed_points"
+                )
+                _initialize_preference(
+                    surrogate_observed_points_preference_key,
+                    surrogate_observed_points_key,
+                    default=True,
+                )
+                _capture_widget_preference(
+                    surrogate_observed_points_key,
+                    surrogate_observed_points_preference_key,
+                )
+                st.session_state[surrogate_observed_points_key] = bool(
+                    st.session_state.get(
+                        surrogate_observed_points_preference_key,
+                        True,
+                    )
+                )
+                surrogate_show_observed_points = st.checkbox(
+                    "Show observed runs",
+                    value=True,
+                    key=surrogate_observed_points_key,
+                    help=(
+                        "Shows measured BO observations as black markers on "
+                        "surrogate 2D maps."
+                    ),
+                )
+                st.session_state[
+                    surrogate_observed_points_preference_key
+                ] = surrogate_show_observed_points
+            source_columns = [
+                _surrogate_pool_source_column(predictions)
+                for predictions in predictions_frames
+            ]
+            local_counts = [
+                int(_surrogate_local_pool_mask(predictions).sum())
+                for predictions in predictions_frames
+            ]
+            local_pool_available = any(count > 0 for count in local_counts)
+            surrogate_local_pool_key = f"{surrogate_state_prefix}_show_local_pool"
+            surrogate_local_pool_preference_key = (
+                f"{surrogate_state_prefix}_pref_show_local_pool"
+            )
+            _initialize_preference(
+                surrogate_local_pool_preference_key,
+                surrogate_local_pool_key,
+                default=False,
+            )
+            if local_pool_available:
+                _capture_widget_preference(
+                    surrogate_local_pool_key,
+                    surrogate_local_pool_preference_key,
+                )
+                st.session_state[surrogate_local_pool_key] = bool(
+                    st.session_state.get(
+                        surrogate_local_pool_preference_key,
+                        False,
+                    )
+                )
+                surrogate_show_local_pool = st.checkbox(
+                    "Show local-pool candidates",
+                    value=False,
+                    key=surrogate_local_pool_key,
+                    help=(
+                        "Includes saved local-pool candidate rows when the "
+                        "artifact identifies them. Local-pool candidates use "
+                        "the same marker style as other candidates."
+                    ),
+                )
+                st.session_state[surrogate_local_pool_preference_key] = (
+                    surrogate_show_local_pool
+                )
+            else:
+                surrogate_show_local_pool = False
+            surrogate_gif_duration_key = f"{surrogate_state_prefix}_gif_duration"
+            surrogate_gif_duration_preference_key = (
+                f"{surrogate_state_prefix}_pref_gif_duration"
+            )
+            _initialize_preference(
+                surrogate_gif_duration_preference_key,
+                surrogate_gif_duration_key,
+                f"{legacy_surrogate_state_prefix}_gif_duration",
+                default=400,
+            )
+            _capture_widget_preference(
+                surrogate_gif_duration_key,
+                surrogate_gif_duration_preference_key,
+            )
+            st.session_state[surrogate_gif_duration_key] = max(
+                100,
+                min(
+                    2000,
+                    int(st.session_state.get(
+                        surrogate_gif_duration_preference_key,
+                        400,
+                    )),
+                ),
             )
             surrogate_gif_duration = st.slider(
                 "Surrogate GIF frame duration",
@@ -8326,7 +17977,10 @@ def render_bo_session_app() -> None:
                 value=400,
                 step=100,
                 format="%d ms",
-                key=f"{surrogate_state_prefix}_gif_duration",
+                key=surrogate_gif_duration_key,
+            )
+            st.session_state[surrogate_gif_duration_preference_key] = (
+                surrogate_gif_duration
             )
             st.caption(
                 "Surrogate predictions and acquisition values are reconstructed "
@@ -8334,8 +17988,167 @@ def render_bo_session_app() -> None:
                 "falloff fractions, and recorded NumPy GP equations. Tested "
                 "candidates are excluded from acquisition surfaces."
             )
+            if local_pool_available:
+                st.caption(
+                    f"Local-pool candidate rows detected: {sum(local_counts):,}. "
+                    "They are hidden unless Show local-pool candidates is enabled."
+                )
+            elif any(column is not None for column in source_columns):
+                st.caption(
+                    "This artifact has candidate source metadata, but no rows "
+                    "are marked as local-pool candidates."
+                )
+            if view == "3D tensor":
+                st.markdown("#### Highlighted slice")
+                surrogate_3d_slice_axes = [x_name, y_name, z_name]
+                surrogate_3d_slice_axis_choices = [
+                    NO_HIGHLIGHTED_SLICE_LABEL,
+                    *surrogate_3d_slice_axes,
+                ]
+                slice_control_columns = st.columns(3)
+                surrogate_3d_slice_axis_key = (
+                    f"{surrogate_state_prefix}_3d_slice_axis_{value}_"
+                    f"{x_name}_{y_name}_{z_name}"
+                )
+                _preserve_valid_widget_value(
+                    surrogate_3d_slice_axis_key,
+                    surrogate_3d_slice_axis_choices,
+                    z_name,
+                )
+                surrogate_3d_slice_axis_choice = slice_control_columns[0].selectbox(
+                    "Highlighted slice axis",
+                    surrogate_3d_slice_axis_choices,
+                    format_func=lambda value: (
+                        value
+                        if value == NO_HIGHLIGHTED_SLICE_LABEL
+                        else _metric_label(value)
+                    ),
+                    key=surrogate_3d_slice_axis_key,
+                    help=(
+                        "Click a 3D tensor point to set the slice value for "
+                        "this axis. The selected slice is drawn as a "
+                        "transparent red plane."
+                    ),
+                )
+                surrogate_3d_slice_axis = (
+                    None
+                    if surrogate_3d_slice_axis_choice == NO_HIGHLIGHTED_SLICE_LABEL
+                    else surrogate_3d_slice_axis_choice
+                )
+                surrogate_3d_slice_values = (
+                    _numeric_slice_values(
+                        surrogate_crop_source,
+                        surrogate_3d_slice_axis,
+                    )
+                    if surrogate_3d_slice_axis is not None
+                    else []
+                )
+                if surrogate_3d_slice_axis is not None and surrogate_3d_slice_values:
+                    surrogate_3d_slice_value_key = (
+                        f"{surrogate_state_prefix}_3d_slice_value_{value}_"
+                        f"{x_name}_{y_name}_{z_name}_{surrogate_3d_slice_axis}"
+                    )
+                    _preserve_valid_widget_value(
+                        surrogate_3d_slice_value_key,
+                        surrogate_3d_slice_values,
+                        surrogate_3d_slice_values[0],
+                    )
+                    surrogate_3d_slice_value = float(
+                        slice_control_columns[1].selectbox(
+                            f"Slice {_metric_label(surrogate_3d_slice_axis)}",
+                            surrogate_3d_slice_values,
+                            format_func=lambda value: f"{float(value):g}",
+                            key=surrogate_3d_slice_value_key,
+                        )
+                    )
+                    surrogate_3d_slice_token = _numeric_slice_token(
+                        surrogate_3d_slice_axis,
+                        surrogate_3d_slice_value,
+                    )
+                    surrogate_3d_slice_sweep_key = (
+                        f"{surrogate_state_prefix}_3d_slice_sweep_"
+                        f"{value}_{x_name}_{y_name}_{z_name}_"
+                        f"{surrogate_3d_slice_axis}"
+                    )
+                    (
+                        surrogate_3d_sweep_valid,
+                        surrogate_3d_sweep_display,
+                    ) = _prepare_preferred_multiselect_value(
+                        surrogate_3d_slice_sweep_key,
+                        f"{surrogate_3d_slice_sweep_key}__preferred",
+                        surrogate_3d_slice_values,
+                        [surrogate_3d_slice_value],
+                    )
+                    surrogate_3d_sweep_display = slice_control_columns[1].multiselect(
+                        "Highlighted slice sweep values",
+                        surrogate_3d_slice_values,
+                        default=surrogate_3d_sweep_display,
+                        format_func=lambda value: f"{float(value):g}",
+                        key=surrogate_3d_slice_sweep_key,
+                    )
+                    _sync_preferred_widget_value(
+                        surrogate_3d_slice_sweep_key,
+                        f"{surrogate_3d_slice_sweep_key}__preferred",
+                        surrogate_3d_sweep_valid,
+                        surrogate_3d_sweep_display,
+                    )
+                    surrogate_3d_slice_sweep_values = [
+                        float(value)
+                        for value in surrogate_3d_sweep_display
+                    ]
+                    if not any(
+                        np.isclose(
+                            float(value),
+                            float(surrogate_3d_slice_value),
+                            rtol=1e-9,
+                            atol=1e-12,
+                        )
+                        for value in surrogate_3d_slice_sweep_values
+                    ):
+                        surrogate_3d_slice_sweep_values.append(
+                            surrogate_3d_slice_value
+                        )
+                    surrogate_3d_slice_sweep_values = sorted(
+                        surrogate_3d_slice_sweep_values
+                    )
+                    surrogate_3d_slice_sweep_token = _numeric_slice_values_token(
+                        surrogate_3d_slice_axis,
+                        surrogate_3d_slice_sweep_values,
+                    )
+                surrogate_3d_mouse_mode_options = [
+                    "Rotate/view 3D plot",
+                    "Pick slice by clicking",
+                ]
+                surrogate_3d_mouse_mode_key = (
+                    f"{surrogate_state_prefix}_3d_mouse_mode_{value}_"
+                    f"{x_name}_{y_name}_{z_name}"
+                )
+                _preserve_valid_widget_value(
+                    surrogate_3d_mouse_mode_key,
+                    surrogate_3d_mouse_mode_options,
+                    surrogate_3d_mouse_mode_options[0],
+                )
+                surrogate_3d_mouse_mode = slice_control_columns[2].selectbox(
+                    "Mouse mode",
+                    surrogate_3d_mouse_mode_options,
+                    key=surrogate_3d_mouse_mode_key,
+                    help=(
+                        "Use rotate/view for normal 3D interaction. Switch "
+                        "to click-pick only when selecting a slice from the "
+                        "plot with the mouse."
+                    ),
+                )
             for group, surrogate_session, predictions in available_at_iteration:
                 surrogate_group_id = group["id"] if group is not None else "ungrouped"
+                plot_prediction_source = _apply_numeric_slice(
+                    predictions,
+                    surrogate_2d_slice_column,
+                    surrogate_2d_slice_value,
+                )
+                plot_predictions = _apply_parameter_crop(
+                    plot_prediction_source,
+                    surrogate_crop_ranges,
+                ).reset_index(drop=True)
                 group_files = next(
                     files
                     for selected_group, _group_session, files
@@ -8357,37 +18170,453 @@ def render_bo_session_app() -> None:
                         f"#### {group['name']} "
                         f"(channels {', '.join(map(str, group['channels']))})"
                     )
+                if plot_predictions.empty:
+                    st.info(
+                        f"The current parameter crop excludes all {group_name} "
+                        "surrogate candidates."
+                    )
+                    continue
+                st.caption(
+                    _surrogate_candidate_accounting_text(
+                        full_session,
+                        group,
+                        plot_predictions,
+                        value,
+                        view,
+                        x_name,
+                        y_name,
+                        z_name,
+                        show_local_pool=surrogate_show_local_pool,
+                    )
+                )
+                st.markdown(f"##### {group_name} animation")
+                surrogate_gif_key = (
+                    f"{surrogate_output_prefix}_gif_{surrogate_group_id}_"
+                    f"{view}_{value}_{x_name}_{y_name}_{z_name}_"
+                    f"{surrogate_crop_token}_{surrogate_2d_slice_token}_"
+                    f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
+                    f"obs{int(bool(surrogate_show_observed_points))}"
+                )
+                surrogate_gif_camera_storage_key = (
+                    f"surrogate_3d_{surrogate_group_id}_"
+                    f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
+                    f"log{int(bool(surrogate_log_frequency))}_"
+                    f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}"
+                    if view == "3D tensor"
+                    else None
+                )
+                surrogate_static_preview_key = (
+                    f"{surrogate_output_prefix}_static_preview_{surrogate_group_id}_"
+                    f"{artifact_iteration}_{value}_{view}_{x_name}_{y_name}_"
+                    f"{z_name}_{surrogate_crop_token}_{surrogate_2d_slice_token}_"
+                    f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
+                    f"obs{int(bool(surrogate_show_observed_points))}"
+                )
+                if st.button(
+                    f"Generate {group_name} GIF",
+                    key=f"{surrogate_gif_key}_button",
+                ):
+                    try:
+                        preview_placeholder = st.empty()
+                        cached_preview = st.session_state.get(
+                            surrogate_static_preview_key
+                        )
+                        if cached_preview is not None:
+                            _sized_plot_container(
+                                preview_placeholder,
+                                plot_width_percent,
+                            ).image(
+                                cached_preview,
+                                use_container_width=True,
+                            )
+                        surrogate_progress = st.progress(
+                            0.01,
+                            text=f"Preparing {group_name} frames...",
+                        )
+                        surrogate_gif_camera = _stored_plotly_camera(
+                            surrogate_gif_camera_storage_key
+                        )
+
+                        def surrogate_frames():
+                            frame_iterations = sorted(group_files)
+                            total_frame_iterations = max(1, len(frame_iterations))
+                            for frame_index, frame_iteration in enumerate(
+                                frame_iterations,
+                                start=1,
+                            ):
+                                surrogate_progress.progress(
+                                    _progress_fraction(
+                                        frame_index,
+                                        total_frame_iterations,
+                                        start=0.01,
+                                        end=0.85,
+                                    ),
+                                    text=(
+                                        f"Preparing {group_name} frame "
+                                        f"{frame_index}/{total_frame_iterations}"
+                                    ),
+                                )
+                                frame_predictions = pd.read_csv(
+                                    group_files[frame_iteration]
+                                )
+                                frame_predictions = (
+                                    _recompute_group_surrogate(
+                                        surrogate_session,
+                                        frame_predictions,
+                                        frame_iteration,
+                                    )
+                                )
+                                frame_predictions = _apply_numeric_slice(
+                                    frame_predictions,
+                                    surrogate_2d_slice_column,
+                                    surrogate_2d_slice_value,
+                                )
+                                frame_predictions = _apply_parameter_crop(
+                                    frame_predictions,
+                                    surrogate_crop_ranges,
+                                ).reset_index(drop=True)
+                                required_columns = [
+                                    name for name in (
+                                        x_name,
+                                        y_name,
+                                        z_name,
+                                        value,
+                                    )
+                                    if name is not None
+                                ]
+                                if not all(
+                                    name in frame_predictions.columns
+                                    for name in required_columns
+                                ):
+                                    continue
+                                if frame_predictions.empty:
+                                    continue
+                                yield _plot_surrogate(
+                                    surrogate_session,
+                                    frame_predictions,
+                                    frame_iteration,
+                                    value,
+                                    view,
+                                    x_name,
+                                    y_name,
+                                    z_name,
+                                    tensor_height=plot_3d_height,
+                                    dot_size=plot_dot_size,
+                                    dot_opacity=plot_dot_opacity,
+                                    log_frequency=surrogate_log_frequency,
+                                    show_iteration_path=(
+                                        surrogate_show_iteration_path
+                                    ),
+                                    show_observed_points=surrogate_show_observed_points,
+                                    show_local_pool=surrogate_show_local_pool,
+                                    axis_ranges=surrogate_crop_ranges,
+                                    slice_axis=surrogate_3d_slice_axis,
+                                    slice_value=surrogate_3d_slice_value,
+                                    slice_sweep_values=surrogate_3d_slice_sweep_values,
+                                    observed_slice_axis=surrogate_2d_slice_column,
+                                    observed_slice_value=surrogate_2d_slice_value,
+                                    title_note=surrogate_2d_title_note,
+                                )
+
+                        gif_bytes = _figures_to_gif(
+                            surrogate_frames(),
+                            surrogate_gif_duration,
+                            plotly_width=max(
+                                500,
+                                int(1200 * plot_width_percent / 100),
+                            ),
+                            plotly_height=plot_3d_height,
+                            plotly_camera=surrogate_gif_camera,
+                            total_frames=len(group_files),
+                            progress_callback=(
+                                lambda current, _total:
+                                surrogate_progress.progress(
+                                    _progress_fraction(
+                                        current,
+                                        len(group_files),
+                                        start=0.85,
+                                        end=0.98,
+                                    ),
+                                    text=(
+                                        f"Encoding {group_name} GIF: frame "
+                                        f"{current}/{len(group_files)}"
+                                    ),
+                                )
+                            ),
+                        )
+                        surrogate_progress.progress(
+                            1.0,
+                            text=(
+                                f"{group_name} GIF complete "
+                                f"({len(group_files)} frames)"
+                            ),
+                        )
+                        st.session_state[surrogate_gif_key] = gif_bytes
+                        preview_placeholder.empty()
+                    except Exception as exc:
+                        st.session_state.pop(surrogate_gif_key, None)
+                        st.error(
+                            f"{group_name} GIF generation failed: {exc}"
+                        )
                 surrogate_figure = _plot_surrogate(
-                    surrogate_session, predictions, artifact_iteration, value, view,
-                    x_name, y_name, z_name,
+                    surrogate_session, plot_predictions, artifact_iteration,
+                    value, view, x_name, y_name, z_name,
                     tensor_height=plot_3d_height,
                     dot_size=plot_dot_size,
+                    dot_opacity=plot_dot_opacity,
                     log_frequency=surrogate_log_frequency,
                     show_iteration_path=surrogate_show_iteration_path,
+                    show_observed_points=surrogate_show_observed_points,
+                    show_local_pool=surrogate_show_local_pool,
+                    axis_ranges=surrogate_crop_ranges,
+                    slice_axis=surrogate_3d_slice_axis,
+                    slice_value=surrogate_3d_slice_value,
+                    slice_sweep_values=surrogate_3d_slice_sweep_values,
+                    observed_slice_axis=surrogate_2d_slice_column,
+                    observed_slice_value=surrogate_2d_slice_value,
+                    title_note=surrogate_2d_title_note,
                 )
                 if view == "3D tensor":
-                    _render_downloadable_plotly(
-                        st,
-                        surrogate_figure,
-                        key=(
-                            f"bo_surrogate_3d_{surrogate_group_id}_"
-                            f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}"
-                        ),
-                        file_stem=(
-                            f"surrogate_{group_name}_{artifact_iteration}_"
-                            f"{value}_3d_tensor_{x_name}_{y_name}_{z_name}"
-                        ),
-                        width_percent=plot_width_percent,
-                        export_height=plot_3d_height,
+                    camera_storage_key = (
+                        f"surrogate_3d_{surrogate_group_id}_"
+                        f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
+                        f"log{int(bool(surrogate_log_frequency))}_"
+                        f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}"
                     )
+                    surrogate_3d_plot_key = (
+                        f"bo_surrogate_3d_{surrogate_group_id}_"
+                        f"{artifact_iteration}_{value}_{x_name}_{y_name}_"
+                        f"{z_name}_{surrogate_crop_token}_"
+                        f"{surrogate_2d_slice_token}_{surrogate_3d_slice_token}_"
+                        f"{surrogate_3d_slice_sweep_token}"
+                    )
+                    surrogate_click_pick_enabled = (
+                        surrogate_3d_slice_axis is not None
+                        and surrogate_3d_mouse_mode == "Pick slice by clicking"
+                    )
+                    surrogate_clicked_points = None
+                    if surrogate_click_pick_enabled and plotly_events is not None:
+                        _apply_plotly_colorbar_height(surrogate_figure)
+                        with _sized_plot_container(st, plot_width_percent):
+                            surrogate_clicked_points = plotly_events(
+                                surrogate_figure,
+                                click_event=True,
+                                hover_event=False,
+                                select_event=False,
+                                override_height=plot_3d_height,
+                                override_width="100%",
+                                key=f"{surrogate_3d_plot_key}_click_pick",
+                            )
+                    else:
+                        _render_downloadable_plotly(
+                            st,
+                            surrogate_figure,
+                            key=f"{surrogate_3d_plot_key}_rotate",
+                            file_stem=(
+                                f"surrogate_{group_name}_{artifact_iteration}_"
+                                f"{value}_3d_tensor_{x_name}_{y_name}_{z_name}"
+                            ),
+                            width_percent=plot_width_percent,
+                            export_height=plot_3d_height,
+                            camera_storage_key=camera_storage_key,
+                        )
+                    if surrogate_click_pick_enabled and plotly_events is None:
+                        st.caption(
+                            "Mouse click slice picking requires "
+                            "`streamlit-plotly-events`; install the updated "
+                            "requirements and restart Streamlit."
+                        )
+                    if (
+                        surrogate_click_pick_enabled
+                        and surrogate_3d_slice_axis is not None
+                        and surrogate_3d_slice_value_key is not None
+                        and surrogate_3d_slice_values
+                    ):
+                        selected_slice_coordinate = _clicked_3d_coordinate(
+                            surrogate_clicked_points,
+                            surrogate_3d_slice_axis,
+                            (x_name, y_name, z_name),
+                        )
+                        if selected_slice_coordinate is not None:
+                            nearest_slice_value = min(
+                                surrogate_3d_slice_values,
+                                key=lambda value: abs(
+                                    float(value)
+                                    - float(selected_slice_coordinate)
+                                ),
+                            )
+                            slice_preference_key = (
+                                f"{surrogate_3d_slice_value_key}__preferred"
+                            )
+                            if (
+                                st.session_state.get(slice_preference_key)
+                                != nearest_slice_value
+                            ):
+                                st.session_state[slice_preference_key] = (
+                                    nearest_slice_value
+                                )
+                                st.rerun()
+                    if (
+                        surrogate_3d_slice_axis is not None
+                        and surrogate_3d_slice_value is not None
+                    ):
+                        slice_plot_key = (
+                            f"bo_surrogate_highlighted_2d_slice_"
+                            f"{surrogate_group_id}_{artifact_iteration}_{value}_"
+                            f"{x_name}_{y_name}_{z_name}_{surrogate_crop_token}_"
+                            f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
+                            f"obs{int(bool(surrogate_show_observed_points))}"
+                        )
+                        requested_slice_values = (
+                            surrogate_3d_slice_sweep_values
+                            or [surrogate_3d_slice_value]
+                        )
+                        slice_button_label = (
+                            "Generate 2D plots for highlighted slices"
+                            if len(requested_slice_values) > 1
+                            else "Generate 2D plot for highlighted slice"
+                        )
+                        if st.button(
+                            slice_button_label,
+                            key=f"{slice_plot_key}_button",
+                        ):
+                            slice_axes = [
+                                axis for axis in (x_name, y_name, z_name)
+                                if axis != surrogate_3d_slice_axis
+                            ]
+                            slice_plots = []
+                            if len(slice_axes) == 2:
+                                for slice_color_index, requested_slice_value in enumerate(
+                                    requested_slice_values
+                                ):
+                                    slice_predictions = _apply_numeric_slice(
+                                        plot_predictions,
+                                        surrogate_3d_slice_axis,
+                                        requested_slice_value,
+                                    ).reset_index(drop=True)
+                                    if slice_predictions.empty:
+                                        continue
+                                    slice_figure = _plot_surrogate(
+                                        surrogate_session,
+                                        slice_predictions,
+                                        artifact_iteration,
+                                        value,
+                                        "2D map",
+                                        slice_axes[0],
+                                        slice_axes[1],
+                                        None,
+                                        tensor_height=plot_3d_height,
+                                        dot_size=plot_dot_size,
+                                        dot_opacity=plot_dot_opacity,
+                                        log_frequency=surrogate_log_frequency,
+                                        show_iteration_path=surrogate_show_iteration_path,
+                                        show_observed_points=surrogate_show_observed_points,
+                                        show_local_pool=surrogate_show_local_pool,
+                                        axis_ranges=surrogate_crop_ranges,
+                                        observed_slice_axis=surrogate_3d_slice_axis,
+                                        observed_slice_value=requested_slice_value,
+                                        title_note=_numeric_slice_title_note(
+                                            surrogate_3d_slice_axis,
+                                            requested_slice_value,
+                                        ),
+                                    )
+                                    slice_color, _plotly_color = _slice_highlight_color(
+                                        slice_color_index,
+                                        len(requested_slice_values),
+                                    )
+                                    _apply_slice_perimeter_style(
+                                        slice_figure,
+                                        slice_color,
+                                    )
+                                    slice_plots.append({
+                                        "figure": slice_figure,
+                                        "axes": slice_axes,
+                                        "frame": slice_predictions,
+                                        "slice_value": float(requested_slice_value),
+                                        "slice_color": slice_color,
+                                    })
+                            if slice_plots:
+                                st.session_state[slice_plot_key] = {
+                                    "plots": slice_plots,
+                                    "axes": slice_axes,
+                                }
+                            else:
+                                st.session_state.pop(slice_plot_key, None)
+                                st.warning(
+                                    "No surrogate candidates match the "
+                                    "highlighted 3D slice sweep."
+                                )
+                        highlighted_slice_plot = st.session_state.get(
+                            slice_plot_key
+                        )
+                        if highlighted_slice_plot is not None:
+                            slice_axes = highlighted_slice_plot.get("axes", [])
+                            slice_plots = highlighted_slice_plot.get("plots")
+                            if slice_plots is None:
+                                slice_plots = [highlighted_slice_plot]
+                            st.markdown(
+                                "##### Highlighted slice 2D maps"
+                                if len(slice_plots) > 1
+                                else "##### Highlighted slice 2D map"
+                            )
+                            for slice_plot_index, slice_plot in enumerate(
+                                slice_plots,
+                                start=1,
+                            ):
+                                slice_value_label = float(
+                                    slice_plot.get(
+                                        "slice_value",
+                                        surrogate_3d_slice_value,
+                                    )
+                                )
+                                if len(slice_plots) > 1:
+                                    st.markdown(
+                                        f"#### {_metric_label(surrogate_3d_slice_axis)} = "
+                                        f"{slice_value_label:g}"
+                                    )
+                                _render_downloadable_pyplot(
+                                    st,
+                                    slice_plot["figure"],
+                                    key=(
+                                        f"{slice_plot_key}_plot_"
+                                        f"{slice_plot_index}_{slice_value_label:g}"
+                                    ),
+                                    file_stem=(
+                                        f"surrogate_{group_name}_{artifact_iteration}_"
+                                        f"{value}_highlighted_slice_"
+                                        f"{slice_axes[0]}_{slice_axes[1]}_"
+                                        f"{surrogate_3d_slice_axis}_"
+                                        f"{slice_value_label:g}"
+                                    ),
+                                    width_percent=plot_width_percent,
+                                )
+                                with st.expander(
+                                    "Highlighted slice candidates"
+                                    if len(slice_plots) == 1
+                                    else (
+                                        "Highlighted slice candidates | "
+                                        f"{_metric_label(surrogate_3d_slice_axis)} = "
+                                        f"{slice_value_label:g}"
+                                    )
+                                ):
+                                    st.dataframe(
+                                        slice_plot["frame"].sort_values(slice_axes),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
                 else:
+                    st.session_state[surrogate_static_preview_key] = (
+                        _matplotlib_png_bytes(surrogate_figure)
+                    )
                     _render_downloadable_pyplot(
                         st,
                         surrogate_figure,
                         key=(
                             f"bo_surrogate_plot_{surrogate_group_id}_"
                             f"{artifact_iteration}_{value}_{view}_"
-                            f"{x_name}_{y_name}_{z_name}"
+                            f"{x_name}_{y_name}_{z_name}_{surrogate_crop_token}_"
+                            f"{surrogate_2d_slice_token}_"
+                            f"obs{int(bool(surrogate_show_observed_points))}"
                         ),
                         file_stem=(
                             f"surrogate_{group_name}_{artifact_iteration}_"
@@ -8395,6 +18624,82 @@ def render_bo_session_app() -> None:
                         ),
                         width_percent=plot_width_percent,
                     )
+                    if (
+                        view == "2D map"
+                        and surrogate_2d_slice_column is not None
+                        and len(surrogate_2d_sweep_values) > 1
+                    ):
+                        with st.expander(
+                            f"{group_name} 2D slice sweep",
+                            expanded=True,
+                        ):
+                            for sweep_value in surrogate_2d_sweep_values:
+                                sweep_token = _numeric_slice_token(
+                                    surrogate_2d_slice_column,
+                                    sweep_value,
+                                )
+                                sweep_predictions = _apply_numeric_slice(
+                                    predictions,
+                                    surrogate_2d_slice_column,
+                                    sweep_value,
+                                )
+                                sweep_predictions = _apply_parameter_crop(
+                                    sweep_predictions,
+                                    surrogate_crop_ranges,
+                                ).reset_index(drop=True)
+                                st.markdown(
+                                    f"#### {_metric_label(surrogate_2d_slice_column)} = "
+                                    f"{float(sweep_value):g}"
+                                )
+                                if sweep_predictions.empty:
+                                    st.info(
+                                        "No surrogate candidates are available "
+                                        "for this slice."
+                                    )
+                                    continue
+                                sweep_figure = _plot_surrogate(
+                                    surrogate_session,
+                                    sweep_predictions,
+                                    artifact_iteration,
+                                    value,
+                                    view,
+                                    x_name,
+                                    y_name,
+                                    z_name,
+                                    tensor_height=plot_3d_height,
+                                    dot_size=plot_dot_size,
+                                    dot_opacity=plot_dot_opacity,
+                                    log_frequency=surrogate_log_frequency,
+                                    show_iteration_path=(
+                                        surrogate_show_iteration_path
+                                    ),
+                                    show_observed_points=surrogate_show_observed_points,
+                                    show_local_pool=surrogate_show_local_pool,
+                                    axis_ranges=surrogate_crop_ranges,
+                                    observed_slice_axis=surrogate_2d_slice_column,
+                                    observed_slice_value=sweep_value,
+                                    title_note=_numeric_slice_title_note(
+                                        surrogate_2d_slice_column,
+                                        sweep_value,
+                                    ),
+                                )
+                                _render_downloadable_pyplot(
+                                    st,
+                                    sweep_figure,
+                                    key=(
+                                        f"bo_surrogate_slice_sweep_"
+                                        f"{surrogate_group_id}_{artifact_iteration}_"
+                                        f"{value}_{x_name}_{y_name}_"
+                                        f"{surrogate_crop_token}_{sweep_token}_"
+                                        f"{surrogate_2d_sweep_token}_"
+                                        f"obs{int(bool(surrogate_show_observed_points))}"
+                                    ),
+                                    file_stem=(
+                                        f"surrogate_{group_name}_{artifact_iteration}_"
+                                        f"{value}_{x_name}_{y_name}_{sweep_token}"
+                                    ),
+                                    width_percent=plot_width_percent,
+                                )
                     if view == "2D map":
                         with st.expander(
                             f"{group_name} chronological 2D map stack",
@@ -8448,6 +18753,10 @@ def render_bo_session_app() -> None:
                                 help="Older maps fade below this value.",
                             )
                             if show_map_stack:
+                                stack_progress = st.progress(
+                                    0.0,
+                                    text=f"Preparing {group_name} map stack...",
+                                )
                                 stack_figure, stack_errors = (
                                     _plot_chronological_surrogate_2d_stack(
                                         surrogate_session,
@@ -8460,14 +18769,40 @@ def render_bo_session_app() -> None:
                                         y_offset_fraction=map_stack_y_offset,
                                         map_alpha=map_stack_alpha,
                                         log_frequency=surrogate_log_frequency,
+                                        crop_ranges=surrogate_crop_ranges,
+                                        slice_column=surrogate_2d_slice_column,
+                                        slice_value=surrogate_2d_slice_value,
+                                        progress_callback=(
+                                            lambda current, total, iteration:
+                                            stack_progress.progress(
+                                                _progress_fraction(
+                                                    current,
+                                                    total,
+                                                    start=0.02,
+                                                    end=0.95,
+                                                ),
+                                                text=(
+                                                    f"Rendering {group_name} "
+                                                    f"2D map stack: artifact "
+                                                    f"{iteration} "
+                                                    f"({current}/{total})"
+                                                ),
+                                            )
+                                        ),
                                     )
+                                )
+                                stack_progress.progress(
+                                    1.0,
+                                    text=f"{group_name} 2D map stack ready.",
                                 )
                                 _render_downloadable_pyplot(
                                     st,
                                     stack_figure,
                                     key=(
                                         f"bo_surrogate_2d_stack_{surrogate_group_id}_"
-                                        f"{artifact_iteration}_{value}_{x_name}_{y_name}"
+                                        f"{artifact_iteration}_{value}_{x_name}_"
+                                        f"{y_name}_{surrogate_crop_token}_"
+                                        f"{surrogate_2d_slice_token}"
                                     ),
                                     file_stem=(
                                         f"surrogate_{group_name}_{artifact_iteration}_"
@@ -8515,103 +18850,6 @@ def render_bo_session_app() -> None:
                     f"{group['name'] if group is not None else 'session'}"
                 ):
                     st.dataframe(predictions, use_container_width=True, hide_index=True)
-                st.markdown(f"##### {group_name} animation")
-                surrogate_gif_key = (
-                    f"{surrogate_state_prefix}_gif_{surrogate_group_id}_"
-                    f"{view}_{value}_{x_name}_{y_name}_{z_name}"
-                )
-                if st.button(
-                    f"Generate {group_name} GIF",
-                    key=f"{surrogate_gif_key}_button",
-                ):
-                    with st.spinner(
-                        f"Rendering {group_name} surrogate frames..."
-                    ):
-                        try:
-                            surrogate_progress = st.progress(
-                                0.0,
-                                text=f"Preparing {group_name} frames...",
-                            )
-
-                            def surrogate_frames():
-                                for frame_iteration in sorted(group_files):
-                                    frame_predictions = pd.read_csv(
-                                        group_files[frame_iteration]
-                                    )
-                                    frame_predictions = (
-                                        _recompute_group_surrogate(
-                                            surrogate_session,
-                                            frame_predictions,
-                                            frame_iteration,
-                                        )
-                                    )
-                                    required_columns = [
-                                        name for name in (
-                                            x_name,
-                                            y_name,
-                                            z_name,
-                                            value,
-                                        )
-                                        if name is not None
-                                    ]
-                                    if not all(
-                                        name in frame_predictions.columns
-                                        for name in required_columns
-                                    ):
-                                        continue
-                                    yield _plot_surrogate(
-                                        surrogate_session,
-                                        frame_predictions,
-                                        frame_iteration,
-                                        value,
-                                        view,
-                                        x_name,
-                                        y_name,
-                                        z_name,
-                                        tensor_height=plot_3d_height,
-                                        dot_size=plot_dot_size,
-                                        log_frequency=surrogate_log_frequency,
-                                        show_iteration_path=(
-                                            surrogate_show_iteration_path
-                                        ),
-                                    )
-
-                            gif_bytes = _figures_to_gif(
-                                surrogate_frames(),
-                                surrogate_gif_duration,
-                                plotly_width=max(
-                                    500,
-                                    int(1200 * plot_width_percent / 100),
-                                ),
-                                plotly_height=plot_3d_height,
-                                total_frames=len(group_files),
-                                progress_callback=(
-                                    lambda current, _total:
-                                    surrogate_progress.progress(
-                                        min(
-                                            0.95,
-                                            0.95 * current / len(group_files),
-                                        ),
-                                        text=(
-                                            f"Rendering {group_name}: frame "
-                                            f"{current}/{len(group_files)}"
-                                        ),
-                                    )
-                                ),
-                            )
-                            surrogate_progress.progress(
-                                1.0,
-                                text=(
-                                    f"{group_name} GIF complete "
-                                    f"({len(group_files)} frames)"
-                                ),
-                            )
-                            st.session_state[surrogate_gif_key] = gif_bytes
-                        except Exception as exc:
-                            st.session_state.pop(surrogate_gif_key, None)
-                            st.error(
-                                f"{group_name} GIF generation failed: {exc}"
-                            )
                 gif_bytes = st.session_state.get(surrogate_gif_key)
                 if gif_bytes:
                     st.image(gif_bytes)
@@ -8638,6 +18876,2164 @@ def render_bo_session_app() -> None:
                 "paired" if paired_objective else "classic",
             )
 
+    with simulation:
+        st.caption(
+            "Backtest BO hyperparameters against a discrete 3D ground-truth "
+            "fitness tensor. The simulated optimizer uses the same normalized "
+            "Matérn-5/2 GP, expected-improvement term, and exploration blend "
+            "shown in the optimization metadata tab."
+        )
+        sim_source_options = [
+            "Interpolate loaded real observations",
+            "Upload ground-truth CSV",
+        ]
+        _preserve_valid_widget_value(
+            "bo_sim_source",
+            sim_source_options,
+            sim_source_options[0],
+        )
+        sim_source = st.radio(
+            "Ground truth source",
+            sim_source_options,
+            horizontal=True,
+            key="bo_sim_source",
+        )
+        sim_ground_truth = pd.DataFrame()
+        sim_source_points = pd.DataFrame()
+        raw_sim_points = pd.DataFrame()
+        sim_fidelity = "Tensor fitness only"
+        sim_trace_channels: list[str] = []
+        sim_trace_nearest = 4
+        sim_x = sim_y = sim_z = None
+        sim_value_column = "ground_truth_value"
+        sim_value_label = "Fitness"
+        if sim_source == "Upload ground-truth CSV":
+            uploaded_landscape = st.file_uploader(
+                "Ground-truth tensor CSV",
+                type=["csv"],
+                key="bo_sim_ground_truth_upload",
+                help=(
+                    "CSV must contain three parameter columns and one numeric "
+                    "fitness column. A grid exported from Real data landscapes "
+                    "works directly."
+                ),
+            )
+            if uploaded_landscape is None:
+                st.info("Upload a ground-truth tensor CSV to run a simulation.")
+            else:
+                try:
+                    uploaded_key = (
+                        getattr(uploaded_landscape, "name", ""),
+                        getattr(uploaded_landscape, "size", None),
+                    )
+                    uploaded_cache = st.session_state.setdefault(
+                        "bo_sim_uploaded_ground_truth_cache",
+                        {},
+                    )
+                    if uploaded_key in uploaded_cache:
+                        uploaded_frame = uploaded_cache[uploaded_key].copy()
+                    else:
+                        uploaded_frame = pd.read_csv(uploaded_landscape)
+                        uploaded_cache[uploaded_key] = uploaded_frame.copy()
+                except Exception as exc:
+                    uploaded_frame = pd.DataFrame()
+                    st.error(f"Could not read CSV: {exc}")
+                numeric_columns = _numeric_columns(uploaded_frame)
+                parameter_candidates = [
+                    column for column in PARAMETERS
+                    if column in numeric_columns
+                ] + [
+                    column for column in numeric_columns
+                    if column not in PARAMETERS
+                ]
+                if len(parameter_candidates) < 3 or not numeric_columns:
+                    st.warning(
+                        "The uploaded CSV needs at least three numeric "
+                        "parameter columns and one numeric fitness column."
+                    )
+                else:
+                    upload_columns = st.columns(4)
+                    _preserve_valid_widget_value(
+                        "bo_sim_upload_x",
+                        parameter_candidates,
+                        parameter_candidates[0],
+                    )
+                    sim_x = upload_columns[0].selectbox(
+                        "Simulation X",
+                        parameter_candidates,
+                        key="bo_sim_upload_x",
+                    )
+                    y_options = [
+                        column for column in parameter_candidates
+                        if column != sim_x
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_sim_upload_y",
+                        y_options,
+                        y_options[0],
+                    )
+                    sim_y = upload_columns[1].selectbox(
+                        "Simulation Y",
+                        y_options,
+                        key="bo_sim_upload_y",
+                    )
+                    z_options = [
+                        column for column in parameter_candidates
+                        if column not in (sim_x, sim_y)
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_sim_upload_z",
+                        z_options,
+                        z_options[0],
+                    )
+                    sim_z = upload_columns[2].selectbox(
+                        "Simulation Z",
+                        z_options,
+                        key="bo_sim_upload_z",
+                    )
+                    value_options = [
+                        column for column in numeric_columns
+                        if column not in (sim_x, sim_y, sim_z)
+                    ] or numeric_columns
+                    preferred_value = (
+                        "interpolated_value"
+                        if "interpolated_value" in value_options
+                        else value_options[0]
+                    )
+                    _preserve_valid_widget_value(
+                        "bo_sim_upload_value",
+                        value_options,
+                        preferred_value,
+                    )
+                    uploaded_value = upload_columns[3].selectbox(
+                        "Fitness column",
+                        value_options,
+                        key="bo_sim_upload_value",
+                    )
+                    sim_value_label = uploaded_value
+                    sim_ground_truth = uploaded_frame[
+                        [sim_x, sim_y, sim_z, uploaded_value]
+                    ].rename(columns={uploaded_value: sim_value_column})
+                    sim_source_points = sim_ground_truth.rename(
+                        columns={sim_value_column: "value"}
+                    )
+                    st.caption(
+                        "Uploaded tensors run in tensor-only mode because "
+                        "no source SWV traces are available."
+                    )
+        else:
+            sim_metric_options = [
+                metric for metric in _q_relevant_metrics(
+                    REAL_DATA_METRICS,
+                    full_session["config"],
+                    paired_objective,
+                    phase=None,
+                )
+                if paired_objective or metric != "Paired Q"
+            ]
+            if not sim_metric_options:
+                st.info("No real-data metrics are available for simulation.")
+            else:
+                sim_controls = st.columns(4)
+                _preserve_valid_widget_value(
+                    "bo_sim_real_metric",
+                    sim_metric_options,
+                    "Classic Q" if "Classic Q" in sim_metric_options else sim_metric_options[0],
+                )
+                sim_metric = sim_controls[0].selectbox(
+                    "Fitness metric",
+                    sim_metric_options,
+                    key="bo_sim_real_metric",
+                )
+                sim_value_label = sim_metric
+                sim_phase_options = (
+                    ["measurement"]
+                    if sim_metric == "Paired Q"
+                    else ["buffer", "target", "measurement"]
+                    if paired_objective
+                    else ["measurement"]
+                )
+                _preserve_valid_widget_value(
+                    "bo_sim_real_phase",
+                    sim_phase_options,
+                    "measurement" if "measurement" in sim_phase_options else sim_phase_options[0],
+                )
+                sim_phase = sim_controls[1].selectbox(
+                    "Metric phase",
+                    sim_phase_options,
+                    format_func=str.title,
+                    key="bo_sim_real_phase",
+                )
+                sim_channel_options = _real_data_channels(group_scoped_observations)
+                sim_channels_key = "bo_sim_real_channels"
+                if sim_channel_options:
+                    sim_valid_channels, sim_display_channels = (
+                        _prepare_preferred_multiselect_value(
+                            sim_channels_key,
+                            f"{sim_channels_key}__preferred",
+                            sim_channel_options,
+                            sim_channel_options,
+                        )
+                    )
+                    sim_selected_channels = sim_controls[2].multiselect(
+                        "Channels",
+                        sim_channel_options,
+                        default=sim_display_channels,
+                        format_func=lambda channel: f"Ch {channel}",
+                        key=sim_channels_key,
+                    )
+                    _sync_preferred_widget_value(
+                        sim_channels_key,
+                        f"{sim_channels_key}__preferred",
+                        sim_valid_channels,
+                        sim_display_channels,
+                    )
+                else:
+                    sim_selected_channels = []
+                    sim_controls[2].caption("No channel metrics found.")
+                sim_average_channels = sim_controls[3].checkbox(
+                    "Average selected channels",
+                    value=True,
+                    key="bo_sim_average_channels",
+                )
+                raw_cache_key = (
+                    str(selected_session_folder),
+                    str(selected_observation_group_scope),
+                    sim_metric,
+                    sim_phase,
+                    tuple(map(str, sim_selected_channels)),
+                    bool(sim_average_channels),
+                    len(group_scoped_observations),
+                    len(full_session.get("observations") or []),
+                )
+                raw_points_cache = st.session_state.setdefault(
+                    "bo_sim_raw_points_cache",
+                    {},
+                )
+                if raw_cache_key in raw_points_cache:
+                    raw_sim_points = raw_points_cache[raw_cache_key].copy()
+                elif sim_selected_channels:
+                    raw_sim_points = _real_metric_points(
+                        group_scoped_observations,
+                        sim_metric,
+                        sim_phase,
+                        sim_selected_channels,
+                        average_channels=sim_average_channels,
+                    )
+                    raw_points_cache[raw_cache_key] = raw_sim_points.copy()
+                else:
+                    raw_sim_points = pd.DataFrame()
+                sim_dimensions = [
+                    parameter for parameter in PARAMETERS
+                    if parameter in raw_sim_points.columns
+                    and raw_sim_points[parameter].nunique(dropna=True) > 1
+                ]
+                if len(sim_dimensions) < 3:
+                    st.info(
+                        "Simulation needs real observations that vary on at "
+                        "least three parameters."
+                    )
+                else:
+                    axis_columns = st.columns(3)
+                    _preserve_valid_widget_value(
+                        "bo_sim_real_x",
+                        sim_dimensions,
+                        "step_potential" if "step_potential" in sim_dimensions else sim_dimensions[0],
+                    )
+                    sim_x = axis_columns[0].selectbox(
+                        "Ground-truth X",
+                        sim_dimensions,
+                        key="bo_sim_real_x",
+                    )
+                    sim_y_options = [
+                        parameter for parameter in sim_dimensions
+                        if parameter != sim_x
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_sim_real_y",
+                        sim_y_options,
+                        "amplitude" if "amplitude" in sim_y_options else sim_y_options[0],
+                    )
+                    sim_y = axis_columns[1].selectbox(
+                        "Ground-truth Y",
+                        sim_y_options,
+                        key="bo_sim_real_y",
+                    )
+                    sim_z_options = [
+                        parameter for parameter in sim_dimensions
+                        if parameter not in (sim_x, sim_y)
+                    ]
+                    _preserve_valid_widget_value(
+                        "bo_sim_real_z",
+                        sim_z_options,
+                        "frequency" if "frequency" in sim_z_options else sim_z_options[0],
+                    )
+                    sim_z = axis_columns[2].selectbox(
+                        "Ground-truth Z",
+                        sim_z_options,
+                        key="bo_sim_real_z",
+                    )
+                    interp_columns = st.columns(4)
+                    sim_resolution = int(interp_columns[0].slider(
+                        "Ground-truth grid resolution",
+                        min_value=8,
+                        max_value=45,
+                        value=25,
+                        step=1,
+                        key="bo_sim_grid_resolution",
+                    ))
+                    sim_interpolation_options = [
+                        "gp_smooth",
+                        "rbf",
+                        "linear",
+                        "nearest",
+                    ]
+                    sim_interpolation_labels = {
+                        "gp_smooth": "GP smooth",
+                        "rbf": "RBF smooth",
+                        "linear": "Linear griddata",
+                        "nearest": "Nearest neighbor",
+                    }
+                    _preserve_valid_widget_value(
+                        "bo_sim_interpolation_method",
+                        sim_interpolation_options,
+                        "gp_smooth",
+                    )
+                    sim_interpolation = interp_columns[1].selectbox(
+                        "Ground-truth model",
+                        sim_interpolation_options,
+                        format_func=lambda option: sim_interpolation_labels.get(
+                            option,
+                            option,
+                        ),
+                        key="bo_sim_interpolation_method",
+                    )
+                    sim_fill_nearest = interp_columns[2].checkbox(
+                        "Fill gaps with nearest",
+                        value=True,
+                        key="bo_sim_fill_nearest",
+                        disabled=sim_interpolation != "linear",
+                        help=(
+                            "Only applies to linear griddata. Smooth ground-truth "
+                            "models evaluate the whole grid directly."
+                        ),
+                    )
+                    sim_log_frequency = interp_columns[3].checkbox(
+                        "Log-scale frequency grid",
+                        value=True,
+                        key="bo_sim_log_frequency",
+                    )
+                    fidelity_columns = st.columns([1, 2, 1])
+                    sim_fidelity = fidelity_columns[0].selectbox(
+                        "Simulation fidelity",
+                        ["Tensor fitness only", "Trace-realistic measurement"],
+                        key="bo_sim_fidelity",
+                        help=(
+                            "Tensor fitness only uses the interpolated Q/fitness "
+                            "tensor as the measured value. Trace-realistic "
+                            "measurement interpolates nearby real raw SWV traces "
+                            "for each selected point and scores the generated "
+                            "trace with the SWV analyzer."
+                        ),
+                    )
+                    available_trace_channels = _real_data_channels(
+                        group_scoped_observations
+                    )
+                    if sim_fidelity == "Trace-realistic measurement":
+                        trace_channels_key = "bo_sim_trace_realistic_channels"
+                        if available_trace_channels:
+                            trace_valid, trace_display = (
+                                _prepare_preferred_multiselect_value(
+                                    trace_channels_key,
+                                    f"{trace_channels_key}__preferred",
+                                    available_trace_channels,
+                                    (
+                                        sim_selected_channels
+                                        if sim_selected_channels
+                                        else available_trace_channels[:1]
+                                    ),
+                                )
+                            )
+                            sim_trace_channels = fidelity_columns[1].multiselect(
+                                "Trace channels",
+                                available_trace_channels,
+                                default=trace_display,
+                                format_func=lambda channel: f"Ch {channel}",
+                                key=trace_channels_key,
+                            )
+                            _sync_preferred_widget_value(
+                                trace_channels_key,
+                                f"{trace_channels_key}__preferred",
+                                trace_valid,
+                                trace_display,
+                            )
+                        else:
+                            sim_trace_channels = []
+                            fidelity_columns[1].caption(
+                                "No SWV trace channels are available."
+                            )
+                        sim_trace_nearest = int(fidelity_columns[2].number_input(
+                            "Nearest traces",
+                            min_value=1,
+                            max_value=12,
+                            value=4,
+                            step=1,
+                            key="bo_sim_trace_nearest",
+                        ))
+                    else:
+                        fidelity_columns[1].caption(
+                            "Fast mode: BO measurements come directly from "
+                            "the interpolated tensor."
+                        )
+                    sim_tensor_cache_key = "bo_sim_interpolated_tensor_cache"
+                    sim_source_fingerprint = raw_cache_key
+                    sim_tensor_settings_key = (
+                        INTERPOLATION_CACHE_VERSION,
+                        str(selected_session_folder),
+                        str(selected_observation_group_scope),
+                        sim_metric,
+                        sim_phase,
+                        tuple(map(str, sim_selected_channels)),
+                        bool(sim_average_channels),
+                        sim_x,
+                        sim_y,
+                        sim_z,
+                        int(sim_resolution),
+                        sim_interpolation,
+                        bool(sim_fill_nearest),
+                        bool(sim_log_frequency),
+                        sim_source_fingerprint,
+                    )
+                    cached_tensor = st.session_state.get(sim_tensor_cache_key)
+                    cache_matches = (
+                        isinstance(cached_tensor, dict)
+                        and cached_tensor.get("settings_key") == sim_tensor_settings_key
+                    )
+                    if cache_matches:
+                        valid_points = cached_tensor["valid_points"]
+                        grid_frame = cached_tensor["grid_frame"]
+                        grid_error = cached_tensor["grid_error"]
+                    else:
+                        valid_points = pd.DataFrame()
+                        grid_frame = pd.DataFrame()
+                        grid_error = None
+                    if cache_matches:
+                        if grid_error:
+                            st.warning(grid_error)
+                        elif grid_frame.empty:
+                            st.warning("No ground-truth grid rows were generated.")
+                        else:
+                            sim_value_label = sim_metric
+                            sim_source_points = valid_points
+                            sim_ground_truth = grid_frame.rename(
+                                columns={"interpolated_value": sim_value_column}
+                            )
+                            st.caption(
+                                f"Ground truth contains {len(sim_ground_truth):,} "
+                                f"tensor points interpolated from "
+                                f"{len(valid_points):,} real observations."
+                            )
+                    else:
+                        st.info(
+                            "The ground-truth tensor will be built when you "
+                            "click Run simulated BO or Run exploration sweep."
+                        )
+
+        can_configure_simulation = all(
+            name is not None for name in (sim_x, sim_y, sim_z)
+        ) and (
+            not sim_ground_truth.empty
+            or (
+                sim_source == "Interpolate loaded real observations"
+                and not raw_sim_points.empty
+            )
+        )
+        if can_configure_simulation:
+            st.divider()
+            st.markdown("#### BO backtest")
+            sim_metadata = _channel_group_optimization_metadata(
+                full_session,
+                groups,
+            )
+            selected_metadata = None
+            if selected_observation_group_scope != "all":
+                selected_metadata = next(
+                    (
+                        item for item in sim_metadata
+                        if int(item["id"]) == int(selected_observation_group_scope)
+                    ),
+                    None,
+                )
+            selected_metadata = selected_metadata or (
+                sim_metadata[0] if sim_metadata else {}
+            )
+            saved_falloffs = (
+                (selected_metadata or {}).get("gp_falloff_fractions") or {}
+            )
+            try:
+                saved_exploration = float(
+                    (selected_metadata or {}).get("exploration")
+                )
+                if not np.isfinite(saved_exploration):
+                    saved_exploration = 0.2
+            except (TypeError, ValueError):
+                saved_exploration = 0.2
+            acquisition_config = (full_session.get("config") or {}).get(
+                "acquisition",
+                {},
+            )
+            sim_parameter_names = [sim_x, sim_y, sim_z]
+            mode_columns = st.columns([1, 3])
+            sim_run_mode = mode_columns[0].radio(
+                "Simulation mode",
+                [
+                    "Single run",
+                    "Exploration sweep",
+                    "Initial maximin sweep",
+                    "GP falloff sweep",
+                    "Multi-parameter sweep",
+                    "Per-channel ground truths",
+                ],
+                horizontal=False,
+                key="bo_sim_run_mode",
+            )
+            sim_falloff_sweep_parameter = (
+                mode_columns[1].selectbox(
+                    "Falloff parameter",
+                    sim_parameter_names,
+                    key="bo_sim_falloff_sweep_parameter",
+                )
+                if sim_run_mode in {"GP falloff sweep", "Multi-parameter sweep"}
+                else None
+            )
+            sweeping_initial_points = sim_run_mode in {
+                "Initial maximin sweep",
+                "Multi-parameter sweep",
+            }
+            sweeping_exploration = sim_run_mode in {
+                "Exploration sweep",
+                "Multi-parameter sweep",
+            }
+            sweeping_falloff = sim_run_mode in {
+                "GP falloff sweep",
+                "Multi-parameter sweep",
+            }
+            swept_labels = []
+            if sweeping_exploration:
+                swept_labels.append("Explore weight")
+            if sweeping_initial_points:
+                swept_labels.append("Initial maximin points")
+            if sweeping_falloff:
+                swept_labels.append(
+                    f"{sim_falloff_sweep_parameter} GP falloff"
+                    if sim_falloff_sweep_parameter
+                    and sim_run_mode == "GP falloff sweep"
+                    else "GP falloffs"
+                )
+            if swept_labels:
+                st.caption(
+                    "Swept controls are disabled below: "
+                    + ", ".join(swept_labels)
+                    + "."
+                )
+            backtest_columns = st.columns(6)
+            estimated_ground_truth_rows = (
+                len(sim_ground_truth)
+                if not sim_ground_truth.empty
+                else int(locals().get("sim_resolution", 25)) ** 3
+            )
+            max_sim_iterations = int(min(500, max(1, estimated_ground_truth_rows)))
+            st.session_state["bo_sim_iterations"] = min(
+                max_sim_iterations,
+                max(1, int(st.session_state.get("bo_sim_iterations", 100))),
+            )
+            sim_iterations = int(backtest_columns[0].number_input(
+                "Simulation iterations",
+                min_value=1,
+                max_value=max_sim_iterations,
+                value=int(min(100, estimated_ground_truth_rows)),
+                step=1,
+                key="bo_sim_iterations",
+            ))
+            st.session_state["bo_sim_initial_points"] = min(
+                max(0, sim_iterations),
+                max(0, int(st.session_state.get("bo_sim_initial_points", 5))),
+            )
+            sim_initial = int(backtest_columns[1].number_input(
+                "Initial maximin points",
+                min_value=0,
+                max_value=max(0, sim_iterations),
+                value=int(min(5, sim_iterations)),
+                step=1,
+                key="bo_sim_initial_points",
+                disabled=sweeping_initial_points,
+                help=(
+                    "Controlled by the selected sweep mode."
+                    if sweeping_initial_points else None
+                ),
+            ))
+            sim_exploration = float(backtest_columns[2].slider(
+                "Explore weight",
+                min_value=0.0,
+                max_value=1.0,
+                value=min(1.0, max(0.0, saved_exploration)),
+                step=0.01,
+                key="bo_sim_exploration",
+                disabled=sweeping_exploration,
+                help=(
+                    "Controlled by the selected sweep mode."
+                    if sweeping_exploration else None
+                ),
+            ))
+            raw_pool_default = acquisition_config.get(
+                "candidate_pool_size",
+                full_session["config"].get("candidate_pool_size", 1000),
+            )
+            raw_local_pool_default = acquisition_config.get(
+                "local_candidate_pool_size",
+                full_session["config"].get("local_candidate_pool_size", 120),
+            )
+            try:
+                pool_default = int(raw_pool_default)
+            except (TypeError, ValueError):
+                pool_default = 1000
+            try:
+                local_pool_default = int(raw_local_pool_default)
+            except (TypeError, ValueError):
+                local_pool_default = 120
+            st.session_state["bo_sim_candidate_pool"] = min(
+                int(estimated_ground_truth_rows),
+                max(1, int(st.session_state.get(
+                    "bo_sim_candidate_pool",
+                    min(estimated_ground_truth_rows, pool_default),
+                ))),
+            )
+            sim_pool = int(backtest_columns[3].number_input(
+                "Candidate pool",
+                min_value=1,
+                max_value=int(estimated_ground_truth_rows),
+                value=int(min(estimated_ground_truth_rows, pool_default)),
+                step=1,
+                key="bo_sim_candidate_pool",
+            ))
+            st.session_state["bo_sim_local_candidate_pool"] = max(
+                0,
+                int(st.session_state.get(
+                    "bo_sim_local_candidate_pool",
+                    max(0, local_pool_default),
+                )),
+            )
+            sim_local_pool = int(backtest_columns[4].number_input(
+                "Local candidate pool",
+                min_value=0,
+                value=max(0, local_pool_default),
+                step=1,
+                key="bo_sim_local_candidate_pool",
+                help=(
+                    "Number of local continuous candidates sampled around "
+                    "the current best observation each iteration."
+                ),
+            ))
+            sim_seed = int(backtest_columns[5].number_input(
+                "Random seed",
+                min_value=0,
+                value=1,
+                step=1,
+                key="bo_sim_seed",
+            ))
+            falloff_columns = st.columns(3)
+            sim_falloffs = {}
+            for index, parameter in enumerate(sim_parameter_names):
+                falloff_default = min(
+                    2.0,
+                    max(0.01, float(saved_falloffs.get(parameter, 1.0))),
+                )
+                sim_falloffs[parameter] = float(falloff_columns[index].slider(
+                    f"{parameter} GP falloff",
+                    min_value=0.01,
+                    max_value=2.0,
+                    value=falloff_default,
+                    step=0.01,
+                    key=f"bo_sim_falloff_{parameter}",
+                    disabled=(
+                        sweeping_falloff
+                        and (
+                            sim_run_mode == "Multi-parameter sweep"
+                            or parameter == sim_falloff_sweep_parameter
+                        )
+                    ),
+                    help=(
+                        "Controlled by the selected sweep mode."
+                        if (
+                            sweeping_falloff
+                            and (
+                                sim_run_mode == "Multi-parameter sweep"
+                                or parameter == sim_falloff_sweep_parameter
+                            )
+                        )
+                        else None
+                    ),
+                ))
+            sim_noise = float(st.number_input(
+                "GP noise level",
+                min_value=1e-12,
+                value=float(acquisition_config.get("gp_noise_level", 1e-4) or 1e-4),
+                format="%.3g",
+                key="bo_sim_gp_noise",
+                help="Same covariance jitter/noise term used by surrogate reconstruction.",
+            ))
+            setup_columns = st.columns([1, 3])
+            sim_initial_mode = setup_columns[0].radio(
+                "Initial point",
+                ["Random from seed", "Configured point"],
+                horizontal=False,
+                key="bo_sim_initial_mode",
+                help=(
+                    "Configured point starts every simulation at the starting "
+                    "parameters entered below. Random from seed lets the selected "
+                    "seed determine the first point."
+                ),
+            )
+            sim_per_channel_repeats = 1
+            if sim_run_mode == "Per-channel ground truths":
+                per_channel_columns = setup_columns[1].columns([1, 3])
+                sim_per_channel_repeats = int(per_channel_columns[0].number_input(
+                    "Runs per channel",
+                    min_value=1,
+                    max_value=1000,
+                    value=3,
+                    step=1,
+                    key="bo_sim_per_channel_repeats",
+                ))
+                per_channel_columns[1].caption(
+                    "Builds one ground-truth tensor for each selected channel, "
+                    "then runs the same BO settings repeatedly on each tensor."
+                )
+                per_channel_total = (
+                    len(locals().get("sim_selected_channels", []) or [])
+                    * sim_per_channel_repeats
+                )
+                st.caption(
+                    f"Selected channels: {len(locals().get('sim_selected_channels', []) or [])}. "
+                    f"Planned simulations: {per_channel_total}."
+                )
+                exploration_sweep_text = ""
+            elif sim_run_mode == "Multi-parameter sweep":
+                multi_columns = setup_columns[1].columns(4)
+                multi_exploration_text = multi_columns[0].text_input(
+                    "Explore weights",
+                    value="0.4, 0.6",
+                    key="bo_sim_multi_exploration_values",
+                    help="Comma-separated values or ranges like 0.2:0.8:0.2.",
+                )
+                multi_initial_text = multi_columns[1].text_input(
+                    "Initial maximin points",
+                    value="5, 8",
+                    key="bo_sim_multi_initial_values",
+                    help="Comma-separated whole numbers or ranges like 0:20:5.",
+                )
+                multi_falloff_text = multi_columns[2].text_input(
+                    "GP falloffs",
+                    value="0.3, 0.5",
+                    key="bo_sim_multi_falloff_values",
+                    help="Comma-separated values or ranges like 0.1:1:0.1.",
+                )
+                multi_repeat_count = int(multi_columns[3].number_input(
+                    "Repeats per point",
+                    min_value=1,
+                    max_value=1000,
+                    value=5,
+                    step=1,
+                    key="bo_sim_multi_repeat_count",
+                ))
+                try:
+                    multi_exploration_values = _parse_float_sweep_values(
+                        multi_exploration_text,
+                        minimum=0.0,
+                        maximum=1.0,
+                        label="explore weight",
+                    )
+                    multi_initial_values = _parse_int_sweep_values(
+                        multi_initial_text,
+                        minimum=0,
+                        maximum=sim_iterations,
+                        label="initial maximin",
+                    )
+                    multi_falloff_values = _parse_float_sweep_values(
+                        multi_falloff_text,
+                        minimum=0.01,
+                        maximum=2.0,
+                        label="GP falloff",
+                    )
+                    multi_sweep_rows = pd.DataFrame([
+                        {
+                            "exploration": exploration_value,
+                            "initial_random_points": initial_points,
+                            "gp_falloff": falloff_value,
+                            "repeat": multi_repeat_count,
+                        }
+                        for exploration_value, initial_points, falloff_value
+                        in itertools.product(
+                            multi_exploration_values,
+                            multi_initial_values,
+                            multi_falloff_values,
+                        )
+                    ])
+                    exploration_sweep_text = multi_sweep_rows.to_csv(index=False)
+                    st.caption(
+                        f"Generated {len(multi_sweep_rows):,} hyperparameter "
+                        f"point(s), {len(multi_sweep_rows) * multi_repeat_count:,} "
+                        "simulation run(s) total."
+                    )
+                    preview_limit = 250
+                    preview_rows = multi_sweep_rows.head(preview_limit)
+                    st.dataframe(
+                        preview_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if len(multi_sweep_rows) > preview_limit:
+                        st.caption(
+                            f"Showing first {preview_limit:,} generated point(s); "
+                            f"{len(multi_sweep_rows) - preview_limit:,} more will run."
+                        )
+                except Exception as exc:
+                    exploration_sweep_text = ""
+                    st.warning(f"Could not generate multi-parameter sweep rows: {exc}")
+                st.caption(
+                    f"GP falloff values apply to {sim_falloff_sweep_parameter}."
+                )
+            else:
+                sweep_text_label = (
+                    "Initial maximin counts to compare"
+                    if sim_run_mode == "Initial maximin sweep"
+                    else "GP falloff values to compare"
+                    if sim_run_mode == "GP falloff sweep"
+                    else "Explore weights to compare"
+                )
+                sweep_text_default = (
+                    "0, 1, 2, 3, 5, 8, 10, 15, 20"
+                    if sim_run_mode == "Initial maximin sweep"
+                    else "0.05, 0.1, 0.2, 0.4, 0.8, 1.2"
+                    if sim_run_mode == "GP falloff sweep"
+                    else "0, 0.1, 0.2, 0.3, 0.4, 0.5"
+                )
+                sweep_text_key = (
+                    "bo_sim_initial_maximin_sweep"
+                    if sim_run_mode == "Initial maximin sweep"
+                    else "bo_sim_gp_falloff_sweep"
+                    if sim_run_mode == "GP falloff sweep"
+                    else "bo_sim_exploration_sweep"
+                )
+                exploration_sweep_text = setup_columns[1].text_input(
+                    sweep_text_label,
+                    value=sweep_text_default,
+                    key=sweep_text_key,
+                    disabled=sim_run_mode == "Single run",
+                    help=(
+                        "Comma-separated values. Ranges like 0:20:2 are accepted."
+                        if sim_run_mode == "Initial maximin sweep"
+                        else "Comma-separated GP falloff values. Ranges like "
+                        "0.05:1:0.05 are accepted."
+                        if sim_run_mode == "GP falloff sweep"
+                        else "Comma-separated exploration weights. Ranges like "
+                        "0:1:0.1 are also accepted."
+                    ),
+                )
+            sim_parameter_config = (
+                (full_session.get("config") or {}).get("parameters") or {}
+            )
+            base_initial_parameters = dict(DEFAULT_INITIAL_METHOD)
+            base_initial_parameters.update(
+                (full_session.get("config") or {}).get("initial_parameters") or {}
+            )
+            base_initial_parameters.update(
+                (selected_metadata or {}).get("initial_parameters") or {}
+            )
+            start_scope = hashlib.sha1(
+                repr((
+                    str(selected_session_folder),
+                    str(selected_observation_group_scope),
+                    sim_source,
+                    sim_x,
+                    sim_y,
+                    sim_z,
+                )).encode("utf-8", errors="replace")
+            ).hexdigest()[:12]
+            sim_start_parameters = {
+                name: float(base_initial_parameters.get(name, default_value))
+                for name, default_value in DEFAULT_INITIAL_METHOD.items()
+            }
+            st.markdown("##### Configured starting point")
+            start_columns = st.columns(len(sim_parameter_names))
+            for index, parameter in enumerate(sim_parameter_names):
+                definition = sim_parameter_config.get(parameter) or {}
+                label = definition.get("label") or _metric_label(parameter)
+                unit = definition.get("unit")
+                if unit:
+                    label = f"{label} ({unit})"
+                data_min = data_max = None
+                if (
+                    not sim_ground_truth.empty
+                    and parameter in sim_ground_truth.columns
+                ):
+                    parameter_values = pd.to_numeric(
+                        sim_ground_truth[parameter],
+                        errors="coerce",
+                    )
+                    parameter_values = parameter_values[
+                        np.isfinite(parameter_values)
+                    ]
+                    if not parameter_values.empty:
+                        data_min = float(parameter_values.min())
+                        data_max = float(parameter_values.max())
+                lower = _finite_float(definition.get("min"))
+                upper = _finite_float(definition.get("max"))
+                if data_min is not None:
+                    lower = data_min if lower is None else max(lower, data_min)
+                if data_max is not None:
+                    upper = data_max if upper is None else min(upper, data_max)
+                default_value = _finite_float(base_initial_parameters.get(parameter))
+                if default_value is None:
+                    default_value = _finite_float(definition.get("value"))
+                if default_value is None:
+                    default_value = DEFAULT_INITIAL_METHOD.get(parameter, 0.0)
+                if lower is not None:
+                    default_value = max(lower, default_value)
+                if upper is not None:
+                    default_value = min(upper, default_value)
+                step_value = _finite_float(definition.get("step"))
+                if step_value is None or step_value <= 0:
+                    step_value = 1.0 if parameter == "frequency" else 0.001
+                start_key = f"bo_sim_start_{start_scope}_{parameter}"
+                if start_key not in st.session_state:
+                    st.session_state[start_key] = float(default_value)
+                number_kwargs = {
+                    "label": label,
+                    "value": float(default_value),
+                    "step": float(step_value),
+                    "format": "%.6g",
+                    "key": start_key,
+                    "disabled": sim_initial_mode != "Configured point",
+                }
+                if lower is not None:
+                    number_kwargs["min_value"] = float(lower)
+                if upper is not None:
+                    number_kwargs["max_value"] = float(upper)
+                sim_start_parameters[parameter] = float(
+                    start_columns[index].number_input(**number_kwargs)
+                )
+            sim_config = _simulation_config_with_initial_parameters(
+                full_session.get("config") or {},
+                sim_start_parameters,
+            )
+            sim_identity = hashlib.sha1(
+                repr((
+                    str(selected_session_folder),
+                    str(selected_observation_group_scope),
+                    sim_source,
+                    sim_value_label,
+                    locals().get("sim_phase", ""),
+                    tuple(map(str, locals().get("sim_selected_channels", []) or [])),
+                    bool(locals().get("sim_average_channels", False)),
+                    sim_x,
+                    sim_y,
+                    sim_z,
+                    int(locals().get("sim_resolution", 0) or 0),
+                    locals().get("sim_interpolation", ""),
+                    bool(locals().get("sim_fill_nearest", False)),
+                    bool(locals().get("sim_log_frequency", False)),
+                    sim_fidelity,
+                    tuple(map(str, sim_trace_channels)),
+                    int(sim_trace_nearest),
+                    sim_initial_mode,
+                    sim_run_mode,
+                    int(locals().get("sim_per_channel_repeats", 1)),
+                    sim_falloff_sweep_parameter,
+                    exploration_sweep_text,
+                    int(sim_initial),
+                    float(sim_exploration),
+                    tuple(
+                        (name, round(float(sim_falloffs[name]), 12))
+                        for name in sim_parameter_names
+                    ),
+                    tuple(
+                        (name, round(float(sim_start_parameters[name]), 12))
+                        for name in sim_parameter_names
+                    ),
+                    locals().get("sim_source_fingerprint", ""),
+                )).encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
+            run_key = f"bo_sim_result_{sim_identity}"
+            write_status_key = f"{run_key}_write_status"
+            write_status = st.session_state.get(write_status_key)
+            if isinstance(write_status, dict):
+                if write_status.get("ok"):
+                    st.success(write_status.get(
+                        "message",
+                        "Wrote simulated BO session.",
+                    ))
+                    if write_status.get("path"):
+                        st.code(str(write_status["path"]))
+                else:
+                    st.error(write_status.get(
+                        "message",
+                        "Could not write simulated BO session.",
+                    ))
+            def parse_exploration_sweep(text: str) -> list[float]:
+                return _parse_float_sweep_values(
+                    text,
+                    minimum=0.0,
+                    maximum=1.0,
+                    label="explore weight",
+                )
+
+            def parse_initial_sweep(text: str) -> list[int]:
+                return _parse_int_sweep_values(
+                    text,
+                    minimum=0,
+                    maximum=sim_iterations,
+                    label="initial maximin",
+                )
+
+            def parse_falloff_sweep(text: str) -> list[float]:
+                return _parse_float_sweep_values(
+                    text,
+                    minimum=0.01,
+                    maximum=2.0,
+                    label="GP falloff",
+                )
+
+            def parse_multi_sweep(text: str) -> list[dict]:
+                try:
+                    frame = pd.read_csv(StringIO(str(text).strip()))
+                except Exception as exc:
+                    raise ValueError(f"Could not parse multi-parameter sweep CSV: {exc}") from exc
+                frame.columns = [
+                    str(column).strip().lower().replace(" ", "_")
+                    for column in frame.columns
+                ]
+                required = {"exploration", "initial_random_points", "repeat"}
+                missing = sorted(required - set(frame.columns))
+                if missing:
+                    raise ValueError(
+                        "Multi-parameter sweep is missing required column(s): "
+                        + ", ".join(missing)
+                    )
+                specs = []
+                for row_index, row in frame.iterrows():
+                    exploration_value = float(row["exploration"])
+                    if not 0.0 <= exploration_value <= 1.0:
+                        raise ValueError(
+                            f"Row {row_index + 2}: exploration must be between 0 and 1."
+                        )
+                    initial_points_value = float(row["initial_random_points"])
+                    if not initial_points_value.is_integer():
+                        raise ValueError(
+                            f"Row {row_index + 2}: initial_random_points must be whole."
+                        )
+                    initial_points = int(initial_points_value)
+                    if not 0 <= initial_points <= sim_iterations:
+                        raise ValueError(
+                            f"Row {row_index + 2}: initial_random_points must be "
+                            f"between 0 and {sim_iterations}."
+                        )
+                    repeat_value = float(row["repeat"])
+                    if not repeat_value.is_integer() or repeat_value < 1:
+                        raise ValueError(
+                            f"Row {row_index + 2}: repeat must be a positive whole number."
+                        )
+                    repeat_count = int(repeat_value)
+                    run_falloffs = dict(sim_falloffs)
+                    raw_falloff_parameter = row.get("gp_falloff_parameter")
+                    falloff_parameter = (
+                        str(raw_falloff_parameter).strip()
+                        if pd.notna(raw_falloff_parameter)
+                        else ""
+                    ) or sim_falloff_sweep_parameter
+                    falloff_value = None
+                    if "gp_falloff" in frame.columns and pd.notna(row.get("gp_falloff")):
+                        if not falloff_parameter:
+                            raise ValueError(
+                                f"Row {row_index + 2}: select or provide gp_falloff_parameter."
+                            )
+                        if falloff_parameter not in run_falloffs:
+                            raise ValueError(
+                                f"Row {row_index + 2}: unknown GP falloff parameter "
+                                f"'{falloff_parameter}'."
+                            )
+                        falloff_value = float(row["gp_falloff"])
+                        if not 0.01 <= falloff_value <= 2.0:
+                            raise ValueError(
+                                f"Row {row_index + 2}: gp_falloff must be between 0.01 and 2.0."
+                            )
+                        run_falloffs[falloff_parameter] = falloff_value
+                    for parameter in sim_parameter_names:
+                        column = f"falloff_{parameter}".lower()
+                        if column in frame.columns and pd.notna(row.get(column)):
+                            value = float(row[column])
+                            if not 0.01 <= value <= 2.0:
+                                raise ValueError(
+                                    f"Row {row_index + 2}: {column} must be between 0.01 and 2.0."
+                                )
+                            run_falloffs[parameter] = value
+                            if falloff_value is None:
+                                falloff_parameter = parameter
+                                falloff_value = value
+                    base_seed = (
+                        int(float(row["seed"]))
+                        if "seed" in frame.columns and pd.notna(row.get("seed"))
+                        else None
+                    )
+                    for repeat_index in range(1, repeat_count + 1):
+                        specs.append({
+                            "exploration": exploration_value,
+                            "initial_random_points": initial_points,
+                            "falloff_fractions": dict(run_falloffs),
+                            "gp_falloff_parameter": falloff_parameter,
+                            "gp_falloff_value": falloff_value,
+                            "repeat_index": repeat_index,
+                            "repeat_count": repeat_count,
+                            "seed": (
+                                base_seed + repeat_index - 1
+                                if base_seed is not None else None
+                            ),
+                            "sweep_value": row_index + 1,
+                        })
+                if not specs:
+                    raise ValueError("Enter at least one multi-parameter sweep row.")
+                return specs
+
+            if st.button(
+                (
+                    "Run exploration sweep" if sim_run_mode == "Exploration sweep"
+                    else "Run initial maximin sweep"
+                    if sim_run_mode == "Initial maximin sweep"
+                    else "Run GP falloff sweep"
+                    if sim_run_mode == "GP falloff sweep"
+                    else "Run multi-parameter sweep"
+                    if sim_run_mode == "Multi-parameter sweep"
+                    else "Run per-channel simulations"
+                    if sim_run_mode == "Per-channel ground truths"
+                    else "Run simulated BO"
+                ),
+                key=f"{run_key}_button",
+            ):
+                progress = st.progress(0.05, text="Preparing simulation candidates...")
+                try:
+                    st.session_state.pop(write_status_key, None)
+                    if (
+                        sim_ground_truth.empty
+                        and sim_run_mode != "Per-channel ground truths"
+                    ):
+                        progress.progress(
+                            0.03,
+                            text="Interpolating ground-truth tensor...",
+                        )
+                        valid_points, grid_frame, grid_error = _interpolated_3d_grid(
+                            raw_sim_points,
+                            sim_x,
+                            sim_y,
+                            sim_z,
+                            resolution=sim_resolution,
+                            method=sim_interpolation,
+                            fill_nearest=sim_fill_nearest,
+                            log_frequency=sim_log_frequency,
+                        )
+                        st.session_state[sim_tensor_cache_key] = {
+                            "settings_key": sim_tensor_settings_key,
+                            "valid_points": valid_points,
+                            "grid_frame": grid_frame,
+                            "grid_error": grid_error,
+                        }
+                        if grid_error:
+                            raise ValueError(grid_error)
+                        if grid_frame.empty:
+                            raise ValueError(
+                                "No ground-truth grid rows were generated."
+                            )
+                        sim_source_points = valid_points
+                        if sim_source == "Interpolate loaded real observations":
+                            sim_value_label = sim_metric
+                        sim_ground_truth = grid_frame.rename(
+                            columns={"interpolated_value": sim_value_column}
+                        )
+                    if sim_run_mode == "Exploration sweep":
+                        run_specs = [
+                            {
+                                "exploration": value,
+                                "initial_random_points": sim_initial,
+                                "falloff_fractions": dict(sim_falloffs),
+                                "sweep_value": value,
+                            }
+                            for value in parse_exploration_sweep(
+                                exploration_sweep_text
+                            )
+                        ]
+                    elif sim_run_mode == "Initial maximin sweep":
+                        run_specs = [
+                            {
+                                "exploration": sim_exploration,
+                                "initial_random_points": value,
+                                "falloff_fractions": dict(sim_falloffs),
+                                "sweep_value": value,
+                            }
+                            for value in parse_initial_sweep(
+                                exploration_sweep_text
+                            )
+                        ]
+                    elif sim_run_mode == "GP falloff sweep":
+                        if not sim_falloff_sweep_parameter:
+                            raise ValueError("Select a GP falloff parameter to sweep.")
+                        run_specs = []
+                        for value in parse_falloff_sweep(exploration_sweep_text):
+                            run_falloffs = dict(sim_falloffs)
+                            run_falloffs[sim_falloff_sweep_parameter] = value
+                            run_specs.append({
+                                "exploration": sim_exploration,
+                                "initial_random_points": sim_initial,
+                                "falloff_fractions": run_falloffs,
+                                "gp_falloff_parameter": sim_falloff_sweep_parameter,
+                                "gp_falloff_value": value,
+                                "sweep_value": value,
+                            })
+                    elif sim_run_mode == "Multi-parameter sweep":
+                        run_specs = parse_multi_sweep(exploration_sweep_text)
+                    elif sim_run_mode == "Per-channel ground truths":
+                        if sim_source != "Interpolate loaded real observations":
+                            raise ValueError(
+                                "Per-channel ground truths require loaded real observations."
+                            )
+                        if not sim_selected_channels:
+                            raise ValueError(
+                                "Select at least one channel for per-channel ground truths."
+                            )
+                        run_specs = []
+                        channel_ground_truth_frames = []
+                        channel_source_frames = []
+                        total_channel_models = max(1, len(sim_selected_channels))
+                        for channel_index, channel in enumerate(
+                            map(str, sim_selected_channels),
+                            start=1,
+                        ):
+                            progress.progress(
+                                _progress_fraction(
+                                    channel_index - 1,
+                                    total_channel_models,
+                                    start=0.03,
+                                    end=0.08,
+                                ),
+                                text=(
+                                    "Building ground-truth tensor for "
+                                    f"channel {channel}..."
+                                ),
+                            )
+                            channel_points = _real_metric_points(
+                                group_scoped_observations,
+                                sim_metric,
+                                sim_phase,
+                                [channel],
+                                average_channels=False,
+                            )
+                            valid_points, grid_frame, grid_error = _interpolated_3d_grid(
+                                channel_points,
+                                sim_x,
+                                sim_y,
+                                sim_z,
+                                resolution=sim_resolution,
+                                method=sim_interpolation,
+                                fill_nearest=sim_fill_nearest,
+                                log_frequency=sim_log_frequency,
+                            )
+                            if grid_error:
+                                raise ValueError(
+                                    f"Channel {channel} ground-truth model failed: "
+                                    f"{grid_error}"
+                                )
+                            if grid_frame.empty:
+                                raise ValueError(
+                                    f"Channel {channel} produced no ground-truth grid rows."
+                                )
+                            channel_ground_truth = grid_frame.rename(
+                                columns={"interpolated_value": sim_value_column}
+                            )
+                            channel_ground_truth["ground_truth_channel"] = channel
+                            valid_points = valid_points.copy()
+                            valid_points["ground_truth_channel"] = channel
+                            channel_ground_truth_frames.append(channel_ground_truth)
+                            channel_source_frames.append(valid_points)
+                            for repeat_index in range(1, sim_per_channel_repeats + 1):
+                                run_specs.append({
+                                    "exploration": sim_exploration,
+                                    "initial_random_points": sim_initial,
+                                    "falloff_fractions": dict(sim_falloffs),
+                                    "repeat_index": repeat_index,
+                                    "repeat_count": sim_per_channel_repeats,
+                                    "seed": (
+                                        sim_seed
+                                        + (channel_index - 1) * sim_per_channel_repeats
+                                        + repeat_index
+                                        - 1
+                                    ),
+                                    "sweep_value": channel,
+                                    "ground_truth_channel": channel,
+                                    "ground_truth": channel_ground_truth,
+                                })
+                        sim_ground_truth = pd.concat(
+                            channel_ground_truth_frames,
+                            ignore_index=True,
+                        )
+                        sim_source_points = pd.concat(
+                            channel_source_frames,
+                            ignore_index=True,
+                        )
+                        sim_value_label = sim_metric
+                    else:
+                        run_specs = [{
+                            "exploration": sim_exploration,
+                            "initial_random_points": sim_initial,
+                            "falloff_fractions": dict(sim_falloffs),
+                            "sweep_value": None,
+                        }]
+                    simulation_settings = {
+                        "iterations": sim_iterations,
+                        "initial_random_points": sim_initial,
+                        "candidate_pool_size": sim_pool,
+                        "local_candidate_pool_size": sim_local_pool,
+                        "falloff_fractions": dict(sim_falloffs),
+                        "noise": sim_noise,
+                        "ground_truth_model": locals().get("sim_interpolation"),
+                        "ground_truth_fill_nearest": bool(
+                            locals().get("sim_fill_nearest", False)
+                        ),
+                        "ground_truth_log_frequency": bool(
+                            locals().get("sim_log_frequency", False)
+                        ),
+                        "ground_truth_metric": sim_value_label,
+                        "ground_truth_phase": locals().get("sim_phase"),
+                        "ground_truth_channels": list(map(
+                            str,
+                            locals().get("sim_selected_channels", []) or [],
+                        )),
+                        "ground_truth_average_channels": bool(
+                            locals().get("sim_average_channels", False)
+                        ),
+                        "per_channel_ground_truth_repeats": int(
+                            locals().get("sim_per_channel_repeats", 1)
+                        ),
+                        "fidelity": sim_fidelity,
+                        "initial_point_mode": sim_initial_mode,
+                        "trace_channels": list(map(str, sim_trace_channels)),
+                        "trace_nearest": sim_trace_nearest,
+                        "use_gp": bool(acquisition_config.get("use_gp", True)),
+                        "gp_optimizer_restarts": acquisition_config.get(
+                            "gp_optimizer_restarts"
+                        ),
+                        "configured_initial_parameters": dict(sim_start_parameters),
+                    }
+                    if sim_initial_mode == "Configured point":
+                        configured_start = _simulation_resolve_candidate(
+                            sim_start_parameters,
+                            sim_config,
+                        )
+                        configured_start_errors = _simulation_validate_candidate(
+                            configured_start,
+                            sim_config,
+                        )
+                        if configured_start_errors:
+                            raise ValueError(
+                                "Configured starting point is invalid: "
+                                + "; ".join(configured_start_errors)
+                            )
+                    runs = []
+                    candidate_frames = []
+                    total_runs = max(1, len(run_specs))
+                    def simulation_spec_key(spec: dict) -> tuple:
+                        return (
+                            float(spec["exploration"]),
+                            int(spec["initial_random_points"]),
+                            tuple(
+                                sorted(
+                                    (spec.get("falloff_fractions") or {}).items()
+                                )
+                            ),
+                            str(spec.get("ground_truth_channel") or ""),
+                        )
+
+                    spec_keys = [
+                        simulation_spec_key(spec)
+                        for spec in run_specs
+                    ]
+                    spec_totals = {
+                        value: spec_keys.count(value)
+                        for value in spec_keys
+                    }
+                    spec_seen = {}
+                    for run_index, run_spec in enumerate(
+                        run_specs,
+                        start=1,
+                    ):
+                        exploration_value = float(run_spec["exploration"])
+                        run_initial_points = int(run_spec["initial_random_points"])
+                        run_falloffs = dict(
+                            run_spec.get("falloff_fractions") or sim_falloffs
+                        )
+                        run_falloff_parameter = run_spec.get("gp_falloff_parameter")
+                        run_falloff_value = run_spec.get("gp_falloff_value")
+                        run_repeat_index = run_spec.get("repeat_index")
+                        run_repeat_count = run_spec.get("repeat_count")
+                        run_ground_truth_channel = run_spec.get("ground_truth_channel")
+                        run_ground_truth = run_spec.get("ground_truth")
+                        if run_ground_truth is None or run_ground_truth.empty:
+                            run_ground_truth = sim_ground_truth
+                        spec_key = simulation_spec_key(run_spec)
+                        replicate_index = spec_seen.get(spec_key, 0) + 1
+                        spec_seen[spec_key] = replicate_index
+                        replicate_total = spec_totals[spec_key]
+                        run_seed = int(run_spec.get("seed")) if run_spec.get("seed") is not None else sim_seed + replicate_index - 1
+                        if sim_run_mode == "Initial maximin sweep":
+                            run_label = f"initial={run_initial_points:g}"
+                        elif sim_run_mode == "GP falloff sweep":
+                            run_label = (
+                                f"{run_falloff_parameter} falloff="
+                                f"{float(run_falloff_value):g}"
+                            )
+                        elif sim_run_mode == "Multi-parameter sweep":
+                            falloff_part = (
+                                f", {run_falloff_parameter}={float(run_falloff_value):g}"
+                                if run_falloff_parameter and run_falloff_value is not None
+                                else ""
+                            )
+                            repeat_part = (
+                                f" rep {int(run_repeat_index)}/{int(run_repeat_count)}"
+                                if run_repeat_index and run_repeat_count
+                                else f" rep {replicate_index}"
+                            )
+                            run_label = (
+                                f"explore={exploration_value:g}, "
+                                f"initial={run_initial_points:g}"
+                                f"{falloff_part}{repeat_part}"
+                            )
+                        elif sim_run_mode == "Per-channel ground truths":
+                            repeat_part = (
+                                f" rep {int(run_repeat_index)}/{int(run_repeat_count)}"
+                                if run_repeat_index and run_repeat_count
+                                else f" rep {replicate_index}"
+                            )
+                            run_label = f"Ch {run_ground_truth_channel}{repeat_part}"
+                        else:
+                            run_label = f"explore={exploration_value:g}"
+                        if replicate_total > 1 and sim_run_mode != "Multi-parameter sweep":
+                            run_label = f"{run_label} rep {replicate_index}"
+                        progress.progress(
+                            _progress_fraction(
+                                run_index - 1,
+                                total_runs,
+                                start=0.08,
+                                end=0.75,
+                            ),
+                            text=(
+                                f"Running simulated BO {run_index}/{total_runs} "
+                                f"({run_label})..."
+                            ),
+                        )
+                        measurement_callback = None
+                        if sim_fidelity == "Trace-realistic measurement":
+                            if not sim_trace_channels:
+                                raise ValueError(
+                                    "Select at least one trace channel for "
+                                    "trace-realistic simulation."
+                                )
+                            measurement_callback = (
+                                lambda params, iteration, tensor_value: (
+                                    _trace_realistic_measurement_value(
+                                        full_session,
+                                        group_scoped_observations,
+                                        params,
+                                        list(map(str, sim_trace_channels)),
+                                        analysis=trace_analysis,
+                                        nearest_count=sim_trace_nearest,
+                                    )
+                                )
+                            )
+                        run_start_progress = _progress_fraction(
+                            run_index - 1,
+                            total_runs,
+                            start=0.08,
+                            end=0.75,
+                        )
+                        run_end_progress = _progress_fraction(
+                            run_index,
+                            total_runs,
+                            start=0.08,
+                            end=0.75,
+                        )
+
+                        def simulation_iteration_progress(
+                            current_iteration: int,
+                            total_iterations: int,
+                            latest_row: dict,
+                        ) -> None:
+                            best_value = latest_row.get("best_so_far")
+                            best_text = (
+                                f"; best={float(best_value):.4g}"
+                                if best_value is not None
+                                and np.isfinite(float(best_value))
+                                else ""
+                            )
+                            fraction = (
+                                run_start_progress
+                                + (
+                                    run_end_progress - run_start_progress
+                                )
+                                * current_iteration
+                                / max(1, total_iterations)
+                            )
+                            progress.progress(
+                                min(0.75, max(0.0, fraction)),
+                                text=(
+                                    f"Running simulated BO {run_index}/{total_runs} "
+                                    f"({run_label}): iteration "
+                                    f"{current_iteration}/{total_iterations}"
+                                    f"{best_text}"
+                                ),
+                            )
+
+                        history_frame, candidate_frame = _run_landscape_bo_simulation(
+                            run_ground_truth,
+                            sim_x,
+                            sim_y,
+                            sim_z,
+                            sim_value_column,
+                            config=sim_config,
+                            iterations=sim_iterations,
+                            initial_random_points=run_initial_points,
+                            exploration=exploration_value,
+                            candidate_pool_size=sim_pool,
+                            local_candidate_pool_size=sim_local_pool,
+                            seed=run_seed,
+                            falloff_fractions=run_falloffs,
+                            noise=sim_noise,
+                            force_initial_point=(
+                                sim_initial_mode == "Configured point"
+                            ),
+                            measurement_callback=measurement_callback,
+                            progress_callback=simulation_iteration_progress,
+                        )
+                        if not history_frame.empty:
+                            history_frame = history_frame.copy()
+                            history_frame["exploration"] = exploration_value
+                            history_frame["initial_random_points"] = run_initial_points
+                            history_frame["gp_falloff_parameter"] = run_falloff_parameter
+                            history_frame["gp_falloff_value"] = run_falloff_value
+                            history_frame["repeat_index"] = run_repeat_index
+                            history_frame["repeat_count"] = run_repeat_count
+                            history_frame["replicate"] = replicate_index
+                            history_frame["seed"] = run_seed
+                            history_frame["run_label"] = run_label
+                            history_frame["ground_truth_channel"] = run_ground_truth_channel
+                        if candidate_frame is not None and not candidate_frame.empty:
+                            candidate_frame = candidate_frame.copy()
+                            candidate_frame["ground_truth_channel"] = run_ground_truth_channel
+                            candidate_frames.append(candidate_frame)
+                        runs.append({
+                            "label": run_label,
+                            "exploration": exploration_value,
+                            "initial_random_points": run_initial_points,
+                            "falloff_fractions": run_falloffs,
+                            "gp_falloff_parameter": run_falloff_parameter,
+                            "gp_falloff_value": run_falloff_value,
+                            "repeat_index": run_repeat_index,
+                            "repeat_count": run_repeat_count,
+                            "replicate": replicate_index,
+                            "seed": run_seed,
+                            "ground_truth_channel": run_ground_truth_channel,
+                            "ground_truth": run_ground_truth,
+                            "history": history_frame,
+                        })
+                    progress.progress(0.75, text="Rendering simulation outputs...")
+                    st.session_state[run_key] = {
+                        "history": runs[0]["history"] if runs else pd.DataFrame(),
+                        "runs": runs,
+                        "mode": sim_run_mode,
+                        "candidates": (
+                            pd.concat(candidate_frames, ignore_index=True)
+                            if candidate_frames else pd.DataFrame()
+                        ),
+                        "ground_truth": sim_ground_truth,
+                        "optimum_reference": _simulation_optimum_reference_from_frame(
+                            sim_ground_truth
+                        ),
+                        "source_points": sim_source_points,
+                        "value_label": sim_value_label,
+                        "axes": (sim_x, sim_y, sim_z),
+                        "settings": simulation_settings,
+                    }
+                    progress.progress(1.0, text="Simulation complete.")
+                except Exception as exc:
+                    st.session_state.pop(run_key, None)
+                    st.error(f"Simulation failed: {exc}")
+            sim_result = st.session_state.get(run_key)
+            if sim_result is not None:
+                sim_history = sim_result["history"]
+                sim_runs = sim_result.get("runs") or []
+                sim_ground_truth_result = sim_result["ground_truth"]
+                sim_optimum_reference = (
+                    sim_result.get("optimum_reference")
+                    or _simulation_optimum_reference_from_frame(
+                        sim_ground_truth_result
+                    )
+                )
+                nonempty_runs = [
+                    run for run in sim_runs
+                    if run.get("history") is not None
+                    and not run["history"].empty
+                ]
+                if sim_history.empty and nonempty_runs:
+                    sim_history = nonempty_runs[0]["history"]
+                if sim_history.empty:
+                    st.warning("Simulation produced no selected points.")
+                else:
+                    best_summary_rows = []
+                    for run in nonempty_runs:
+                        history = run["history"]
+                        best_row = history.loc[
+                            history["observed_value"].idxmax()
+                        ]
+                        final_best = float(history["best_so_far"].iloc[-1])
+                        threshold = 0.95 * final_best
+                        reached = history[
+                            history["best_so_far"] >= threshold
+                        ]
+                        best_summary_rows.append({
+                            "Run": run["label"],
+                            "Ground truth channel": run.get("ground_truth_channel"),
+                            "Explore weight": float(run.get("exploration", np.nan)),
+                            "Initial maximin points": int(
+                                run.get("initial_random_points", sim_initial)
+                            ),
+                            "GP falloff parameter": run.get("gp_falloff_parameter"),
+                            "GP falloff value": run.get("gp_falloff_value"),
+                            "Repeat": run.get("repeat_index"),
+                            "Repeat count": run.get("repeat_count"),
+                            "Replicate": int(run.get("replicate", 1)),
+                            "Seed": int(run.get("seed", sim_seed)),
+                            "Best fitness": float(best_row["observed_value"]),
+                            "Best iteration": int(best_row["iteration"]),
+                            "Final best": final_best,
+                            "Iteration to 95% final": (
+                                int(reached["iteration"].iloc[0])
+                                if not reached.empty else np.nan
+                            ),
+                        })
+                    summary_frame = pd.DataFrame(best_summary_rows)
+                    best_sim_row = sim_history.loc[
+                        sim_history["observed_value"].idxmax()
+                    ]
+                    metric_columns = st.columns(3)
+                    metric_columns[0].metric(
+                        "Best simulated fitness",
+                        (
+                            f"{float(summary_frame['Best fitness'].max()):.4g}"
+                            if not summary_frame.empty
+                            else f"{float(best_sim_row['observed_value']):.4g}"
+                        ),
+                    )
+                    metric_columns[1].metric(
+                        "Simulation runs",
+                        len(nonempty_runs) if nonempty_runs else 1,
+                    )
+                    metric_columns[2].metric(
+                        "Ground-truth tensor points",
+                        f"{len(sim_ground_truth_result):,}",
+                    )
+                    if sim_optimum_reference:
+                        optimum_bits = []
+                        for parameter, unit in (
+                            ("frequency", "Hz"),
+                            ("amplitude", "V"),
+                            ("step_potential", "V"),
+                        ):
+                            if parameter in sim_optimum_reference:
+                                optimum_bits.append(
+                                    f"{_metric_label(parameter)}="
+                                    f"{sim_optimum_reference[parameter]:.4g} {unit}"
+                                )
+                        st.caption(
+                            "Ground-truth optimum: "
+                            f"Q={sim_optimum_reference['Q_run']:.4g}"
+                            + (f" at {', '.join(optimum_bits)}" if optimum_bits else "")
+                        )
+                    if len(nonempty_runs) > 1:
+                        comparison_columns = st.columns([2, 1])
+                        comparison_metric = comparison_columns[0].radio(
+                            "Comparison metric",
+                            ["Best-so-far fitness", "Observed fitness"],
+                            horizontal=True,
+                            key=f"{run_key}_comparison_metric",
+                        )
+                        comparison_color_options = [
+                            "Default",
+                            "Explore weight",
+                            "Initial maximin points",
+                            "GP falloff",
+                            "Ground-truth channel",
+                        ]
+                        comparison_default_color = (
+                            "GP falloff"
+                            if sim_result.get("mode") in {
+                                "GP falloff sweep",
+                                "Multi-parameter sweep",
+                            }
+                            else "Ground-truth channel"
+                            if sim_result.get("mode") == "Per-channel ground truths"
+                            else "Initial maximin points"
+                            if sim_result.get("mode") == "Initial maximin sweep"
+                            else "Explore weight"
+                            if sim_result.get("mode") == "Exploration sweep"
+                            else "Default"
+                        )
+                        comparison_color_key = f"{run_key}_comparison_color_by"
+                        _preserve_valid_widget_value(
+                            comparison_color_key,
+                            comparison_color_options,
+                            comparison_default_color,
+                        )
+                        comparison_color_by = comparison_columns[1].selectbox(
+                            "Comparison color",
+                            comparison_color_options,
+                            key=comparison_color_key,
+                        )
+                        _plotly_chart_with_colorbars(
+                            _sized_plot_container(
+                                st,
+                                plot_width_percent,
+                            ),
+                            _plot_simulation_comparison(
+                                nonempty_runs,
+                                sim_result["value_label"],
+                                y_column=(
+                                    "observed_value"
+                                    if comparison_metric == "Observed fitness"
+                                    else "best_so_far"
+                                ),
+                                color_by={
+                                    "Explore weight": "exploration",
+                                    "Initial maximin points": (
+                                        "initial_random_points"
+                                    ),
+                                    "GP falloff": "gp_falloff_value",
+                                    "Ground-truth channel": "Ground-truth channel",
+                                }.get(comparison_color_by),
+                                optimum_reference=sim_optimum_reference,
+                            ),
+                            use_container_width=True,
+                            key=f"{run_key}_comparison_plot",
+                        )
+                        if not summary_frame.empty:
+                            st.dataframe(
+                                summary_frame,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    else:
+                        _plotly_chart_with_colorbars(
+                            _sized_plot_container(
+                                st,
+                                plot_width_percent,
+                            ),
+                            _plot_simulation_history(
+                                sim_history,
+                                sim_result["value_label"],
+                                optimum_reference=sim_optimum_reference,
+                            ),
+                            use_container_width=True,
+                            key=f"{run_key}_history_plot",
+                        )
+                    selected_path_run = (
+                        nonempty_runs[0]
+                        if nonempty_runs
+                        else {"label": "Simulation", "history": sim_history}
+                    )
+                    if len(nonempty_runs) > 1:
+                        selected_path_label = st.selectbox(
+                            "3D path run",
+                            [run["label"] for run in nonempty_runs],
+                            key=f"{run_key}_path_run",
+                            help=(
+                                "Choose which sweep run is shown on the "
+                                "3D ground-truth tensor path plot."
+                            ),
+                        )
+                        selected_path_run = next(
+                            run for run in nonempty_runs
+                            if run["label"] == selected_path_label
+                        )
+                    selected_path_history = selected_path_run["history"]
+                    selected_path_label = str(
+                        selected_path_run.get("label") or "Simulation"
+                    )
+                    selected_path_ground_truth = selected_path_run.get("ground_truth")
+                    if (
+                        selected_path_ground_truth is None
+                        or selected_path_ground_truth.empty
+                    ):
+                        selected_path_ground_truth = sim_ground_truth_result
+                    path_figure = _plot_simulation_3d_path(
+                        selected_path_ground_truth,
+                        selected_path_history,
+                        sim_result["value_label"],
+                        sim_x,
+                        sim_y,
+                        sim_z,
+                        tensor_height=plot_3d_height,
+                        dot_size=plot_dot_size,
+                        dot_opacity=plot_dot_opacity,
+                    )
+                    path_figure.update_layout(
+                        title=(
+                            f"Simulated BO path on {sim_result['value_label']} "
+                            f"tensor | {selected_path_label}"
+                        )
+                    )
+                    safe_path_label = re.sub(
+                        r"[^A-Za-z0-9._-]+",
+                        "_",
+                        selected_path_label,
+                    ).strip("_")
+                    _render_downloadable_plotly(
+                        st,
+                        path_figure,
+                        key=f"{run_key}_path_plot_{safe_path_label}",
+                        file_stem=f"simulated_bo_3d_path_{safe_path_label}",
+                        width_percent=plot_width_percent,
+                        export_height=plot_3d_height,
+                        camera_storage_key=(
+                            f"simulation_3d_{sim_x}_{sim_y}_{sim_z}_"
+                            f"{sim_result['value_label']}_{safe_path_label}"
+                        ),
+                        eager_png=False,
+                    )
+                    st.dataframe(
+                        _simulation_history_display_frame(
+                            (
+                                pd.concat(
+                                    [
+                                        run["history"]
+                                        for run in nonempty_runs
+                                        if run.get("history") is not None
+                                        and not run["history"].empty
+                                    ],
+                                    ignore_index=True,
+                                )
+                                if len(nonempty_runs) > 1
+                                else sim_history
+                            )
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    combined_history = (
+                        pd.concat(
+                            [
+                                run["history"]
+                                for run in nonempty_runs
+                                if run.get("history") is not None
+                                and not run["history"].empty
+                            ],
+                            ignore_index=True,
+                        )
+                        if nonempty_runs else sim_history
+                    )
+                    download_columns = st.columns(2)
+                    download_columns[0].download_button(
+                        "Download simulation history CSV",
+                        data=_simulation_history_display_frame(
+                            combined_history
+                        ).to_csv(index=False).encode(),
+                        file_name="simulated_bo_history.csv",
+                        mime="text/csv",
+                        key=f"{run_key}_history_download",
+                    )
+                    download_columns[1].download_button(
+                        "Download ground-truth tensor CSV",
+                        data=sim_ground_truth_result.to_csv(index=False).encode(),
+                        file_name="simulation_ground_truth_tensor.csv",
+                        mime="text/csv",
+                        key=f"{run_key}_ground_truth_download",
+                    )
+                    st.markdown("#### Write simulated BO session")
+                    compact_only_simulation_export = (
+                        sim_result.get("mode") == "Multi-parameter sweep"
+                    )
+                    per_channel_simulation_export = (
+                        sim_result.get("mode") == "Per-channel ground truths"
+                    )
+                    if compact_only_simulation_export:
+                        write_scope_options = ["Compact sweep summary"]
+                        st.caption(
+                            "This simulation mode writes compact results only: "
+                            "metadata, run summary, and history CSV. Raw SWV, "
+                            "analysis records, surrogate artifacts, source points, "
+                            "and ground-truth tensor files are omitted."
+                        )
+                    elif per_channel_simulation_export:
+                        write_scope_options = (
+                            [
+                                "Selected 3D path run",
+                                "All full channel runs in one folder",
+                                "Compact sweep summary",
+                            ]
+                            if len(nonempty_runs) > 1
+                            else ["Current run", "Compact sweep summary"]
+                        )
+                        st.caption(
+                            "Full per-channel writes create one simulated BO "
+                            "sweep folder containing all channel runs, with "
+                            "channel-specific ground-truth tensors preserved."
+                        )
+                    else:
+                        write_scope_options = (
+                            ["Selected 3D path run", "All sweep runs"]
+                            if len(nonempty_runs) > 1
+                            else ["Current run"]
+                        )
+                    write_scope = st.radio(
+                        "Write scope",
+                        write_scope_options,
+                        horizontal=True,
+                        key=f"{run_key}_write_scope",
+                    )
+                    write_parent = _simulated_bo_sessions_parent(
+                        full_session["root"],
+                        search_root,
+                    )
+                    st.caption(
+                        f"Simulated session folders will be written under {write_parent}."
+                    )
+                    if st.button(
+                        "Write simulated BO session folder",
+                        key=f"{run_key}_write_session",
+                    ):
+                        try:
+                            if not nonempty_runs and (
+                                selected_path_run.get("history") is None
+                                or selected_path_run["history"].empty
+                            ):
+                                raise ValueError(
+                                    "No completed simulation run is available to write."
+                                )
+                            if write_scope == "Compact sweep summary":
+                                written_paths = [_write_compact_simulated_sweep_session(
+                                    write_parent,
+                                    full_session,
+                                    nonempty_runs,
+                                    value_label=sim_result["value_label"],
+                                    axes=(sim_x, sim_y, sim_z),
+                                    simulation_settings=sim_result.get("settings"),
+                                )]
+                            elif write_scope == "All full channel runs in one folder":
+                                written_paths = [_write_simulated_bo_session_bundle(
+                                    write_parent,
+                                    full_session,
+                                    nonempty_runs,
+                                    sim_ground_truth_result,
+                                    value_label=sim_result["value_label"],
+                                    axes=(sim_x, sim_y, sim_z),
+                                    source_points=sim_result.get("source_points"),
+                                    candidate_pool=sim_result.get("candidates"),
+                                    simulation_settings=sim_result.get("settings"),
+                                )]
+                            elif write_scope == "All sweep runs":
+                                written_paths = [_write_simulated_bo_session_bundle(
+                                    write_parent,
+                                    full_session,
+                                    nonempty_runs,
+                                    sim_ground_truth_result,
+                                    value_label=sim_result["value_label"],
+                                    axes=(sim_x, sim_y, sim_z),
+                                    source_points=sim_result.get("source_points"),
+                                    candidate_pool=sim_result.get("candidates"),
+                                    simulation_settings=sim_result.get("settings"),
+                                )]
+                            else:
+                                run = selected_path_run
+                                selected_run_settings = dict(
+                                    sim_result.get("settings") or {}
+                                )
+                                if run.get("initial_random_points") is not None:
+                                    selected_run_settings[
+                                        "initial_random_points"
+                                    ] = int(run["initial_random_points"])
+                                if run.get("falloff_fractions"):
+                                    selected_run_settings["falloff_fractions"] = dict(
+                                        run["falloff_fractions"]
+                                    )
+                                if run.get("ground_truth_channel") is not None:
+                                    selected_run_settings["ground_truth_channel"] = str(
+                                        run["ground_truth_channel"]
+                                    )
+                                run_ground_truth = run.get("ground_truth")
+                                if run_ground_truth is None or run_ground_truth.empty:
+                                    run_ground_truth = sim_ground_truth_result
+                                run_channel = run.get("ground_truth_channel")
+                                source_points = sim_result.get("source_points")
+                                if (
+                                    run_channel is not None
+                                    and source_points is not None
+                                    and not source_points.empty
+                                    and "ground_truth_channel" in source_points.columns
+                                ):
+                                    source_points = source_points[
+                                        source_points["ground_truth_channel"].astype(str)
+                                        == str(run_channel)
+                                    ].copy()
+                                candidate_pool = sim_result.get("candidates")
+                                if (
+                                    run_channel is not None
+                                    and candidate_pool is not None
+                                    and not candidate_pool.empty
+                                    and "ground_truth_channel" in candidate_pool.columns
+                                ):
+                                    candidate_pool = candidate_pool[
+                                        candidate_pool["ground_truth_channel"].astype(str)
+                                        == str(run_channel)
+                                    ].copy()
+                                written_paths = [_write_simulated_bo_session(
+                                    write_parent,
+                                    full_session,
+                                    run["history"],
+                                    run_ground_truth,
+                                    run_label=str(run.get("label") or "simulation"),
+                                    value_label=sim_result["value_label"],
+                                    axes=(sim_x, sim_y, sim_z),
+                                    source_points=source_points,
+                                    candidate_pool=candidate_pool,
+                                    simulation_settings=selected_run_settings,
+                                    exploration=run.get("exploration"),
+                                    replicate=run.get("replicate"),
+                                    seed=run.get("seed"),
+                                )]
+                            if written_paths:
+                                first_path = Path(written_paths[0]).resolve()
+                                if not (first_path / "bo_state.json").is_file():
+                                    raise ValueError(
+                                        f"Write finished but bo_state.json was "
+                                        f"not found in {first_path}."
+                                    )
+                                st.session_state[write_status_key] = {
+                                    "ok": True,
+                                    "path": str(first_path),
+                                    "message": (
+                                        f"Wrote {len(written_paths)} simulated "
+                                        "BO session folder(s)."
+                                    ),
+                                }
+                                st.success(st.session_state[write_status_key]["message"])
+                                st.code(str(first_path))
+                        except Exception as exc:
+                            st.session_state[write_status_key] = {
+                                "ok": False,
+                                "message": (
+                                    f"Could not write simulated BO session: {exc}"
+                                ),
+                            }
+                            st.error(st.session_state[write_status_key]["message"])
+                    if sim_source == "Interpolate loaded real observations":
+                        st.markdown(
+                            f"#### Simulated SWV trace | {selected_path_label}"
+                        )
+                        trace_channels = _real_data_channels(group_scoped_observations)
+                        if trace_channels:
+                            trace_columns = st.columns(4)
+                            sim_trace_iteration = int(trace_columns[0].selectbox(
+                                "Simulation iteration",
+                                selected_path_history["iteration"].astype(int).tolist(),
+                                key=f"{run_key}_trace_iteration_{safe_path_label}",
+                            ))
+                            sim_trace_channel_key = f"{run_key}_trace_channels"
+                            trace_valid, trace_display = (
+                                _prepare_preferred_multiselect_value(
+                                    sim_trace_channel_key,
+                                    f"{sim_trace_channel_key}__preferred",
+                                    trace_channels,
+                                    trace_channels[:1],
+                                )
+                            )
+                            sim_trace_channels = trace_columns[1].multiselect(
+                                "Trace channels",
+                                trace_channels,
+                                default=trace_display,
+                                format_func=lambda channel: f"Ch {channel}",
+                                key=sim_trace_channel_key,
+                            )
+                            _sync_preferred_widget_value(
+                                sim_trace_channel_key,
+                                f"{sim_trace_channel_key}__preferred",
+                                trace_valid,
+                                trace_display,
+                            )
+                            sim_trace_type = trace_columns[2].selectbox(
+                                "Trace type",
+                                [
+                                    "Raw",
+                                    "Corrected",
+                                    "Normalized corrected",
+                                    "Normalized raw",
+                                ],
+                                key=f"{run_key}_trace_type",
+                            )
+                            sim_nearest = int(trace_columns[3].number_input(
+                                "Nearest traces",
+                                min_value=1,
+                                max_value=12,
+                                value=4,
+                                step=1,
+                                key=f"{run_key}_trace_nearest",
+                            ))
+                            selected_sim_row = selected_path_history[
+                                selected_path_history["iteration"] == sim_trace_iteration
+                            ].iloc[0]
+                            corrected = sim_trace_type != "Raw"
+                            normalize_to_peak = sim_trace_type in {
+                                "Normalized corrected",
+                                "Normalized raw",
+                            }
+                            corrected_trace_key = (
+                                "corrected_current"
+                                if sim_trace_type == "Normalized raw"
+                                else "smoothed_corrected_current"
+                            )
+                            if sim_trace_channels:
+                                fig, errors = _plot_interpolated_simulated_trace(
+                                    full_session,
+                                    group_scoped_observations,
+                                    {
+                                        sim_x: float(selected_sim_row[sim_x]),
+                                        sim_y: float(selected_sim_row[sim_y]),
+                                        sim_z: float(selected_sim_row[sim_z]),
+                                    },
+                                    sim_trace_channels,
+                                    corrected=corrected,
+                                    analysis=trace_analysis,
+                                    correction_label=correction_label,
+                                    normalize_to_peak=normalize_to_peak,
+                                    corrected_trace_key=corrected_trace_key,
+                                    nearest_count=sim_nearest,
+                                )
+                                st.pyplot(fig)
+                                if errors:
+                                    with st.expander("Trace interpolation warnings"):
+                                        for error in errors[:20]:
+                                            st.write(error)
+                            else:
+                                st.info("Select at least one trace channel.")
+                        else:
+                            st.info(
+                                "No real SWV trace channels are available for "
+                                "synthetic trace interpolation."
+                            )
+
     with gifs:
         st.subheader("Synchronized GIF set")
         if not groups:
@@ -8652,10 +21048,14 @@ def render_bo_session_app() -> None:
                 )
                 else gif_group_options[0]
             )
+            _preserve_valid_widget_value(
+                "bo_gif_observation_group",
+                gif_group_options,
+                default_gif_group,
+            )
             selected_gif_group = st.selectbox(
                 "Observation group",
                 gif_group_options,
-                index=gif_group_options.index(default_gif_group),
                 format_func=lambda group_id: next(
                     (
                         f"{group['name']} (channels {', '.join(map(str, group['channels']))})"
@@ -8707,6 +21107,23 @@ def render_bo_session_app() -> None:
                 )
             else:
                 first_predictions = pd.read_csv(gif_group_files[gif_iterations[-1]])
+                gif_local_pool_available = int(
+                    _surrogate_local_pool_mask(first_predictions).sum()
+                ) > 0
+                gif_show_local_pool = (
+                    st.checkbox(
+                        "Show local-pool candidates",
+                        value=False,
+                        key=f"bo_gifs_show_local_pool_{selected_gif_group}",
+                        help=(
+                            "Includes local-pool candidate rows in generated "
+                            "surrogate GIFs when the artifact identifies them. "
+                            "They use the same marker style as other candidates."
+                        ),
+                    )
+                    if gif_local_pool_available
+                    else False
+                )
                 preferred_dimensions = [
                     name for name in ("step_potential", "amplitude", "frequency")
                     if (
@@ -8787,11 +21204,13 @@ def render_bo_session_app() -> None:
 
                         def update_batch_progress(name: str, current: int, total: int) -> None:
                             nonlocal completed_target_frames
-                            fraction = (
-                                completed_target_frames + current
-                            ) / total_target_frames
                             batch_progress.progress(
-                                min(0.98, fraction),
+                                _progress_fraction(
+                                    completed_target_frames + current,
+                                    total_target_frames,
+                                    start=0.02,
+                                    end=0.98,
+                                ),
                                 text=f"Rendering {name}: frame {current}/{total}",
                             )
 
@@ -8877,10 +21296,13 @@ def render_bo_session_app() -> None:
                                     z_name,
                                     tensor_height=plot_3d_height,
                                     dot_size=plot_dot_size,
+                                    dot_opacity=plot_dot_opacity,
                                     show_iteration_path=True,
+                                    show_local_pool=gif_show_local_pool,
                                 )
 
                         x_name, y_name, z_name = gif_dimensions[:3]
+                        shared_gif_camera = _stored_plotly_camera(None)
                         for name, value_key in (
                             ("Surrogate tensor Q", "predicted_mean_Q"),
                             ("Surrogate tensor acquisition", "acquisition_value"),
@@ -8890,6 +21312,7 @@ def render_bo_session_app() -> None:
                                 gif_duration,
                                 plotly_width=max(500, int(1200 * plot_width_percent / 100)),
                                 plotly_height=plot_3d_height,
+                                plotly_camera=shared_gif_camera,
                                 total_frames=len(gif_iterations),
                                 progress_callback=lambda current, total, target=name: update_batch_progress(
                                     target,
