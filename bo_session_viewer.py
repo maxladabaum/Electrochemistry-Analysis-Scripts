@@ -46,6 +46,7 @@ _plotly_camera_capture = components.declare_component(
     path=str(_PLOTLY_CAMERA_COMPONENT_DIR),
 )
 _SHARED_3D_CAMERA_STORAGE_KEY = "bo_viewer_camera:latest_3d_perspective"
+SURROGATE_2D_FIGURE_ASPECT = 6.4 / 4.0
 INTERPOLATION_CACHE_VERSION = "gp_smooth_fixed_length_scales_v2"
 
 from core.analysis import analyze_swv_arrays
@@ -125,6 +126,8 @@ def _slice_highlight_color(
 def _apply_slice_perimeter_style(
     fig,
     color: tuple[float, float, float],
+    *,
+    thickness: float = 2.5,
 ) -> None:
     """Draw a visible border around a matplotlib slice plot."""
     for axis in fig.axes:
@@ -132,7 +135,76 @@ def _apply_slice_perimeter_style(
             continue
         for spine in axis.spines.values():
             spine.set_edgecolor(color)
-            spine.set_linewidth(2.5)
+            spine.set_linewidth(float(thickness))
+
+
+def _apply_plotly_slice_perimeter_style(
+    fig: go.Figure,
+    color: str,
+    *,
+    thickness: float = 3.0,
+) -> None:
+    """Draw a visible border around a Plotly 2D slice plot."""
+    existing_shapes = [
+        shape for shape in list(fig.layout.shapes or ())
+        if not (
+            getattr(shape, "type", None) == "rect"
+            and getattr(shape, "fillcolor", None) == "rgba(0,0,0,0)"
+            and getattr(shape, "layer", None) == "above"
+            and getattr(getattr(shape, "line", None), "width", None) is not None
+            and getattr(shape, "xref", None) in {"paper", "x domain"}
+            and getattr(shape, "yref", None) in {"paper", "y domain"}
+        )
+    ]
+    existing_shapes.append({
+        "type": "rect",
+        "xref": "x domain",
+        "yref": "y domain",
+        "x0": 0,
+        "x1": 1,
+        "y0": 0,
+        "y1": 1,
+        "line": {"color": color, "width": float(thickness)},
+        "fillcolor": "rgba(0,0,0,0)",
+        "layer": "above",
+    })
+    fig.update_layout(shapes=existing_shapes)
+
+
+def _apply_plotly_2d_slice_aspect(
+    fig: go.Figure,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    """Use a stable outer and inner aspect for Plotly 2D slice heatmaps."""
+    fig.update_layout(
+        width=width,
+        height=height,
+        autosize=False,
+        margin={"l": 72, "r": 116, "t": 64, "b": 68},
+    )
+    fig.update_xaxes(domain=[0.0, 0.84], automargin=False)
+    fig.update_yaxes(domain=[0.0, 1.0], automargin=False)
+    for trace in fig.data:
+        colorbar = getattr(trace, "colorbar", None)
+        if colorbar is not None:
+            trace.update(colorbar={
+                "x": 0.9,
+                "y": 0.5,
+                "len": 0.82,
+                "thickness": 18,
+            })
+        marker = getattr(trace, "marker", None)
+        if marker is not None and getattr(marker, "colorbar", None) is not None:
+            trace.update(marker={
+                "colorbar": {
+                    "x": 0.9,
+                    "y": 0.5,
+                    "len": 0.82,
+                    "thickness": 18,
+                }
+            })
 
 
 def _pick_session_folder() -> str:
@@ -878,6 +950,25 @@ def _finite_float(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return numeric if np.isfinite(numeric) else None
+
+
+def _value_range_from_frame(
+    frame: pd.DataFrame | None,
+    value_column: str = "value",
+) -> tuple[float, float] | None:
+    if frame is None or frame.empty or value_column not in frame.columns:
+        return None
+    values = pd.to_numeric(frame[value_column], errors="coerce")
+    values = values[np.isfinite(values)]
+    if values.empty:
+        return None
+    value_min = float(values.min())
+    value_max = float(values.max())
+    if np.isclose(value_min, value_max):
+        padding = max(abs(value_min) * 0.05, 1e-9)
+        value_min -= padding
+        value_max += padding
+    return value_min, value_max
 
 
 def _parse_float_sweep_values(
@@ -1773,6 +1864,122 @@ def _add_hyperparameter_slice_plane(
             f"Selected slice<br>{slice_axis}: {value:g}<extra></extra>"
         ),
     ))
+
+
+def _add_plotly_slice_plane(
+    fig: go.Figure,
+    points: pd.DataFrame,
+    *,
+    x_axis: str,
+    y_axis: str,
+    z_axis: str,
+    slice_axis: str | None,
+    slice_value: float | None,
+    slice_sweep_values: Sequence[float] | None = None,
+    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
+) -> None:
+    if (
+        points is None
+        or points.empty
+        or slice_axis not in {x_axis, y_axis, z_axis}
+        or (slice_value is None and not slice_sweep_values)
+    ):
+        return
+    valid_slice_values = []
+    if slice_sweep_values:
+        for raw_slice_value in slice_sweep_values:
+            numeric_slice_value = _finite_float(raw_slice_value)
+            if numeric_slice_value is not None:
+                valid_slice_values.append(float(numeric_slice_value))
+    elif slice_value is not None:
+        numeric_slice_value = _finite_float(slice_value)
+        if numeric_slice_value is not None:
+            valid_slice_values = [float(numeric_slice_value)]
+    if not valid_slice_values:
+        return
+    axis_bounds = {}
+    for axis_name in (x_axis, y_axis, z_axis):
+        if axis_name not in points.columns:
+            return
+        bounds = (axis_ranges or {}).get(axis_name)
+        if bounds is not None:
+            lower = float(bounds[0])
+            upper = float(bounds[1])
+        else:
+            axis_values = pd.to_numeric(points[axis_name], errors="coerce")
+            axis_values = axis_values[np.isfinite(axis_values)]
+            if axis_values.empty:
+                return
+            lower = float(axis_values.min())
+            upper = float(axis_values.max())
+        if np.isclose(lower, upper):
+            padding = max(abs(lower) * 0.05, 1e-9)
+            lower -= padding
+            upper += padding
+        axis_bounds[axis_name] = (lower, upper)
+
+    x0, x1 = axis_bounds[x_axis]
+    y0, y1 = axis_bounds[y_axis]
+    z0, z1 = axis_bounds[z_axis]
+    for slice_index, current_slice_value in enumerate(valid_slice_values):
+        value = float(current_slice_value)
+        if slice_axis == x_axis:
+            plane_x = [[value, value], [value, value]]
+            plane_y = [[y0, y1], [y0, y1]]
+            plane_z = [[z0, z0], [z1, z1]]
+            outline_x = [value, value, value, value, value]
+            outline_y = [y0, y1, y1, y0, y0]
+            outline_z = [z0, z0, z1, z1, z0]
+        elif slice_axis == y_axis:
+            plane_x = [[x0, x1], [x0, x1]]
+            plane_y = [[value, value], [value, value]]
+            plane_z = [[z0, z0], [z1, z1]]
+            outline_x = [x0, x1, x1, x0, x0]
+            outline_y = [value, value, value, value, value]
+            outline_z = [z0, z0, z1, z1, z0]
+        else:
+            plane_x = [[x0, x1], [x0, x1]]
+            plane_y = [[y0, y0], [y1, y1]]
+            plane_z = [[value, value], [value, value]]
+            outline_x = [x0, x1, x1, x0, x0]
+            outline_y = [y0, y0, y1, y1, y0]
+            outline_z = [value, value, value, value, value]
+        _mpl_color, color = _slice_highlight_color(
+            slice_index,
+            len(valid_slice_values),
+        )
+        trace_name = (
+            f"Slice {slice_index + 1}: {slice_axis}={value:g}"
+            if len(valid_slice_values) > 1
+            else "Highlighted slice"
+        )
+        fig.add_trace(go.Surface(
+            x=plane_x,
+            y=plane_y,
+            z=plane_z,
+            surfacecolor=[[1, 1], [1, 1]],
+            colorscale=[[0, color], [1, color]],
+            opacity=0.34 if len(valid_slice_values) > 1 else 0.23,
+            showscale=False,
+            showlegend=False,
+            name=trace_name,
+            hovertemplate=(
+                f"{slice_axis}: {value:.4g}<extra>Highlighted slice</extra>"
+            ),
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=outline_x,
+            y=outline_y,
+            z=outline_z,
+            mode="lines",
+            line={"color": color, "width": 7},
+            name=f"{trace_name} outline",
+            showlegend=False,
+            hovertemplate=(
+                f"{slice_axis}: {value:.4g}"
+                "<extra>Highlighted slice outline</extra>"
+            ),
+        ))
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
@@ -3111,6 +3318,11 @@ def _plot_real_data_landscape(
     axis_ranges: dict[str, tuple[float, float]] | None = None,
     value_range: tuple[float, float] | None = None,
     title_note: str | None = None,
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
+    slice_sweep_values: Sequence[float] | None = None,
+    tensor_interpolation_source: pd.DataFrame | None = None,
+    show_measured_points: bool = False,
 ):
     def series_label(value: Any) -> str:
         text = str(value)
@@ -3166,17 +3378,28 @@ def _plot_real_data_landscape(
             return None
         return _finite_float(group_color_values.get(int(numeric_group_id)))
 
+    display_value_range = value_range
+    if (
+        view == "2D map"
+        and display_value_range is None
+        and tensor_interpolation_source is not None
+        and not tensor_interpolation_source.empty
+    ):
+        display_value_range = _value_range_from_frame(
+            tensor_interpolation_source,
+        )
+
     if metric_label == "Count" and view == "3D tensor":
         fig = go.Figure()
         bin_sizes = count_bin_sizes or {}
         value_min = (
-            float(value_range[0])
-            if value_range is not None
+            float(display_value_range[0])
+            if display_value_range is not None
             else float(points["value"].min())
         )
         value_max = (
-            float(value_range[1])
-            if value_range is not None
+            float(display_value_range[1])
+            if display_value_range is not None
             else float(points["value"].max())
         )
         if value_min == value_max:
@@ -3258,6 +3481,17 @@ def _plot_real_data_landscape(
                 path_colorbar_added = (
                     path_colorbar_added or len(ordered_path) >= 2
                 )
+        _add_plotly_slice_plane(
+            fig,
+            points,
+            x_axis=x_name,
+            y_axis=y_name,
+            z_axis=z_name,
+            slice_axis=slice_axis,
+            slice_value=slice_value,
+            slice_sweep_values=slice_sweep_values,
+            axis_ranges=axis_ranges,
+        )
         fig.update_layout(
             scene={
                 "xaxis": {
@@ -3290,8 +3524,14 @@ def _plot_real_data_landscape(
             y=count_grid.index.to_numpy(),
             z=count_grid.to_numpy(),
             colorscale="Viridis",
-            zmin=value_range[0] if value_range is not None else None,
-            zmax=value_range[1] if value_range is not None else None,
+            zmin=(
+                display_value_range[0]
+                if display_value_range is not None else None
+            ),
+            zmax=(
+                display_value_range[1]
+                if display_value_range is not None else None
+            ),
             colorbar={"title": "Count"},
             hovertemplate=(
                 f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}"
@@ -3330,13 +3570,13 @@ def _plot_real_data_landscape(
     elif view == "3D tensor":
         fig = go.Figure()
         value_min = (
-            float(value_range[0])
-            if value_range is not None
+            float(display_value_range[0])
+            if display_value_range is not None
             else float(points["value"].min())
         )
         value_max = (
-            float(value_range[1])
-            if value_range is not None
+            float(display_value_range[1])
+            if display_value_range is not None
             else float(points["value"].max())
         )
         if value_min == value_max:
@@ -3391,6 +3631,17 @@ def _plot_real_data_landscape(
                 )
         if group_color_values:
             _add_metadata_colorbar(fig, group_color_values, group_color_label)
+        _add_plotly_slice_plane(
+            fig,
+            points,
+            x_axis=x_name,
+            y_axis=y_name,
+            z_axis=z_name,
+            slice_axis=slice_axis,
+            slice_value=slice_value,
+            slice_sweep_values=slice_sweep_values,
+            axis_ranges=axis_ranges,
+        )
         fig.update_layout(
             scene={
                 "xaxis": {
@@ -3409,17 +3660,79 @@ def _plot_real_data_landscape(
             height=tensor_height,
         )
     elif view == "2D map":
-        valid, grid = _interpolated_2d_grid(points, x_name, y_name)
+        columns = [x_name, y_name, "value"]
+        metadata = [
+            name for name in ("iteration", "channel")
+            if name in points.columns
+        ]
+        valid = points[columns + metadata].copy()
+        valid[columns] = valid[columns].apply(pd.to_numeric, errors="coerce")
+        valid = valid.dropna(subset=columns)
+        grid = None
+        attempted_tensor_slice = False
+        if (
+            tensor_interpolation_source is not None
+            and not tensor_interpolation_source.empty
+            and slice_axis is not None
+            and slice_value is not None
+        ):
+            attempted_tensor_slice = True
+            _tensor_valid, tensor_grid, _tensor_error = _interpolated_3d_grid(
+                tensor_interpolation_source,
+                x_name,
+                y_name,
+                slice_axis,
+                resolution=50,
+                method="rbf",
+                fill_nearest=True,
+                log_frequency=log_frequency,
+                axis_include_values={slice_axis: [float(slice_value)]},
+            )
+            slice_grid = _apply_numeric_slice(
+                tensor_grid,
+                slice_axis,
+                slice_value,
+            )
+            if not slice_grid.empty:
+                heatmap_grid = (
+                    slice_grid
+                    .pivot_table(
+                        index=y_name,
+                        columns=x_name,
+                        values="interpolated_value",
+                        aggfunc="mean",
+                    )
+                    .sort_index()
+                    .sort_index(axis=1)
+                )
+                grid = (
+                    heatmap_grid.columns.to_numpy(dtype=float),
+                    heatmap_grid.index.to_numpy(dtype=float),
+                    heatmap_grid.to_numpy(dtype=float),
+                )
+        if grid is None and not attempted_tensor_slice:
+            valid, grid = _interpolated_2d_grid(
+                points,
+                x_name,
+                y_name,
+                log_frequency=log_frequency,
+            )
         fig = go.Figure()
-        if grid is not None and color_by == "Measured value":
+        if grid is not None:
             grid_x, grid_y, grid_values = grid
             fig.add_trace(go.Heatmap(
                 x=grid_x,
                 y=grid_y,
                 z=grid_values,
                 colorscale="Viridis",
-                zmin=value_range[0] if value_range is not None else None,
-                zmax=value_range[1] if value_range is not None else None,
+                zmin=(
+                    display_value_range[0]
+                    if display_value_range is not None else None
+                ),
+                zmax=(
+                    display_value_range[1]
+                    if display_value_range is not None else None
+                ),
                 colorbar={"title": metric_label},
                 hovertemplate=(
                     f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
@@ -3427,13 +3740,19 @@ def _plot_real_data_landscape(
                 ),
                 connectgaps=False,
             ))
-        if color_by == "Measured value":
+        if show_measured_points and color_by == "Measured value":
             fig.add_trace(go.Scatter(
                 x=valid[x_name], y=valid[y_name], mode="markers",
                 marker={
                     "size": 8, "color": valid["value"], "colorscale": "Viridis",
-                    "cmin": value_range[0] if value_range is not None else None,
-                    "cmax": value_range[1] if value_range is not None else None,
+                    "cmin": (
+                        display_value_range[0]
+                        if display_value_range is not None else None
+                    ),
+                    "cmax": (
+                        display_value_range[1]
+                        if display_value_range is not None else None
+                    ),
                     "showscale": grid is None, "colorbar": {"title": metric_label},
                     "line": {"color": "white", "width": 1},
                 },
@@ -3445,7 +3764,7 @@ def _plot_real_data_landscape(
                     "Iteration %{customdata[0]}<br>Channel %{customdata[1]}<extra></extra>"
                 ),
             ))
-        else:
+        elif show_measured_points:
             for group_id, group_name, channel, group, series_color in colored_series():
                 marker = {"size": 8}
                 color_value = metadata_color_value(group_id)
@@ -3605,8 +3924,8 @@ def _plot_real_data_landscape(
             fig.update_xaxes(range=display_range(x_name))
             if view in ("2D map", "3D tensor"):
                 fig.update_yaxes(range=display_range(y_name))
-            elif value_range is not None:
-                fig.update_yaxes(range=list(map(float, value_range)))
+            elif display_value_range is not None:
+                fig.update_yaxes(range=list(map(float, display_value_range)))
     return fig
 
 
@@ -3867,6 +4186,7 @@ def _interpolated_2d_grid(
     x_name: str,
     y_name: str,
     resolution: int = 120,
+    log_frequency: bool = False,
 ) -> tuple[pd.DataFrame, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
     """Build an RBF-smoothed measured map on a complete rectangular grid."""
     columns = [x_name, y_name, "value"]
@@ -3877,18 +4197,48 @@ def _interpolated_2d_grid(
 
     unique = valid.groupby([x_name, y_name], as_index=False)["value"].mean()
     if (
-        len(unique) < 3
+        len(unique) < 2
         or unique[x_name].nunique() < 2
         or unique[y_name].nunique() < 2
     ):
         return valid, None
 
-    grid_x = np.linspace(unique[x_name].min(), unique[x_name].max(), resolution)
-    grid_y = np.linspace(unique[y_name].min(), unique[y_name].max(), resolution)
-    mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+    x_axis = _interpolation_axis_values(
+        unique[x_name],
+        x_name,
+        resolution,
+        log_frequency,
+    )
+    y_axis = _interpolation_axis_values(
+        unique[y_name],
+        y_name,
+        resolution,
+        log_frequency,
+    )
+    if x_axis is None or y_axis is None:
+        return valid, None
+    transformed_x, grid_x = x_axis
+    transformed_y, grid_y = y_axis
+    mesh_x, mesh_y = np.meshgrid(transformed_x, transformed_y)
     try:
-        coordinates = unique[[x_name, y_name]].to_numpy()
+        coordinates = np.column_stack([
+            _transform_interpolation_values(
+                unique[x_name],
+                x_name,
+                log_frequency,
+            ).to_numpy(dtype=float),
+            _transform_interpolation_values(
+                unique[y_name],
+                y_name,
+                log_frequency,
+            ).to_numpy(dtype=float),
+        ])
         values = unique["value"].to_numpy()
+        finite = np.isfinite(coordinates).all(axis=1) & np.isfinite(values)
+        coordinates = coordinates[finite]
+        values = values[finite]
+        if len(values) < 2:
+            return valid, None
         query_coordinates = np.column_stack([mesh_x.ravel(), mesh_y.ravel()])
         grid_values = _rbf_interpolation_values(
             coordinates,
@@ -3896,16 +4246,7 @@ def _interpolated_2d_grid(
             query_coordinates,
         ).reshape(mesh_x.shape)
     except Exception:
-        try:
-            grid_values = griddata(
-                unique[[x_name, y_name]].to_numpy(),
-                unique["value"].to_numpy(),
-                (mesh_x, mesh_y),
-                method="nearest",
-                rescale=True,
-            )
-        except Exception:
-            return valid, None
+        return valid, None
     if not np.isfinite(grid_values).any():
         return valid, None
     return valid, (grid_x, grid_y, grid_values)
@@ -3970,28 +4311,35 @@ def _rbf_interpolation_values(
         coordinates,
         query_coordinates,
     )
-    try:
-        rbf = Rbf(
-            *[normalized_coordinates[:, index] for index in range(coordinates.shape[1])],
-            values,
-            function="multiquadric",
-            smooth=max(float(np.nanstd(values)) * 0.02, 1e-9),
-        )
-        return np.asarray(
-            rbf(*[normalized_query[:, index] for index in range(coordinates.shape[1])]),
-            dtype=float,
-        )
-    except Exception:
-        rbf = Rbf(
-            *[normalized_coordinates[:, index] for index in range(coordinates.shape[1])],
-            values,
-            function="linear",
-            smooth=max(float(np.nanstd(values)) * 0.02, 1e-9),
-        )
-        return np.asarray(
-            rbf(*[normalized_query[:, index] for index in range(coordinates.shape[1])]),
-            dtype=float,
-        )
+    source_axes = [
+        normalized_coordinates[:, index]
+        for index in range(coordinates.shape[1])
+    ]
+    query_axes = [
+        normalized_query[:, index]
+        for index in range(coordinates.shape[1])
+    ]
+    value_scale = max(float(np.nanstd(values)), float(np.nanmean(np.abs(values))), 1.0)
+    base_smooth = max(value_scale * 0.02, 1e-8)
+    last_error: Exception | None = None
+    for function_name in ("multiquadric", "linear", "inverse"):
+        for smooth_multiplier in (1.0, 5.0, 25.0, 100.0):
+            try:
+                rbf = Rbf(
+                    *source_axes,
+                    values,
+                    function=function_name,
+                    smooth=base_smooth * smooth_multiplier,
+                )
+                result = np.asarray(rbf(*query_axes), dtype=float)
+                if np.isfinite(result).any():
+                    return result
+            except Exception as exc:
+                last_error = exc
+                continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("RBF interpolation produced no finite values.")
 
 
 def _gp_smoothed_interpolation_values(
@@ -4048,6 +4396,7 @@ def _interpolated_3d_grid(
     method: str = "linear",
     fill_nearest: bool = True,
     log_frequency: bool = False,
+    axis_include_values: Mapping[str, Sequence[float]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     """Interpolate measured 3D points onto a regular grid for export/simulation."""
     columns = [x_name, y_name, z_name, "value"]
@@ -4082,6 +4431,43 @@ def _interpolated_3d_grid(
     }
     if any(spec is None for spec in axis_specs.values()):
         return valid, pd.DataFrame(), "Could not build one or more interpolation axes."
+    if axis_include_values:
+        for name in (x_name, y_name, z_name):
+            include_values = axis_include_values.get(name)
+            if not include_values:
+                continue
+            include_series = pd.Series(include_values, dtype=float)
+            transformed_include = _transform_interpolation_values(
+                include_series,
+                name,
+                log_frequency,
+            )
+            display_include = pd.to_numeric(include_series, errors="coerce")
+            included = pd.DataFrame({
+                "transformed": transformed_include,
+                "display": display_include,
+            }).dropna()
+            included = included[np.isfinite(included["transformed"])]
+            included = included[np.isfinite(included["display"])]
+            if included.empty:
+                continue
+            axis_frame = pd.DataFrame({
+                "transformed": axis_specs[name][0],
+                "display": axis_specs[name][1],
+            })
+            axis_frame = pd.concat(
+                [axis_frame, included],
+                ignore_index=True,
+            )
+            axis_frame = (
+                axis_frame
+                .sort_values("transformed")
+                .drop_duplicates("transformed", keep="first")
+            )
+            axis_specs[name] = (
+                axis_frame["transformed"].to_numpy(dtype=float),
+                axis_frame["display"].to_numpy(dtype=float),
+            )
 
     transformed_axes = [axis_specs[name][0] for name in (x_name, y_name, z_name)]
     display_axes = [axis_specs[name][1] for name in (x_name, y_name, z_name)]
@@ -4366,6 +4752,9 @@ def _plot_interpolated_2d_slice(
     *,
     log_frequency: bool = False,
     value_range: tuple[float, float] | None = None,
+    reverse_x: bool = False,
+    reverse_y: bool = False,
+    show_measured_points: bool = False,
 ) -> go.Figure:
     """Render a 2D map from one fixed slice of an interpolated 3D grid."""
     slice_grid = _apply_numeric_slice(
@@ -4373,6 +4762,10 @@ def _plot_interpolated_2d_slice(
         slice_axis,
         slice_value,
     ).reset_index(drop=True)
+    display_value_range = value_range or _value_range_from_frame(
+        grid_frame,
+        "interpolated_value",
+    )
     fig = go.Figure()
     if not slice_grid.empty:
         heatmap_grid = (
@@ -4391,8 +4784,14 @@ def _plot_interpolated_2d_slice(
             y=heatmap_grid.index.to_numpy(dtype=float),
             z=heatmap_grid.to_numpy(dtype=float),
             colorscale="Viridis",
-            zmin=value_range[0] if value_range is not None else None,
-            zmax=value_range[1] if value_range is not None else None,
+            zmin=(
+                display_value_range[0]
+                if display_value_range is not None else None
+            ),
+            zmax=(
+                display_value_range[1]
+                if display_value_range is not None else None
+            ),
             colorbar={"title": f"Interpolated {metric_label}"},
             hovertemplate=(
                 f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
@@ -4406,7 +4805,7 @@ def _plot_interpolated_2d_slice(
         slice_value,
     )
     observed = observed.dropna(subset=[x_name, y_name, "value"])
-    if not observed.empty:
+    if show_measured_points and not observed.empty:
         fig.add_trace(go.Scatter(
             x=observed[x_name],
             y=observed[y_name],
@@ -4446,6 +4845,8 @@ def _plot_interpolated_2d_slice(
         height=460,
         margin={"l": 65, "r": 90, "t": 65, "b": 65},
     )
+    fig.update_xaxes(autorange="reversed" if reverse_x else True)
+    fig.update_yaxes(autorange="reversed" if reverse_y else True)
     return fig
 
 
@@ -5748,6 +6149,340 @@ def _plot_simulation_3d_path(
         )
     fig.update_layout(title=f"Simulated BO path on {value_label} tensor")
     return fig
+
+
+def _is_loaded_simulated_sweep_session(session: dict) -> bool:
+    state = session.get("state") or {}
+    config = session.get("config") or {}
+    metadata = state.get("simulation_metadata") or {}
+    records = config.get("records") if isinstance(config, dict) else {}
+    history = session.get("history")
+    if not metadata or not records or not records.get("simulated_session"):
+        return False
+    run_count = _finite_float(metadata.get("run_count"))
+    if run_count is not None and int(run_count) > 1:
+        return True
+    if metadata.get("compact_export"):
+        return True
+    if history is not None and not history.empty and "group_id" in history.columns:
+        return pd.to_numeric(
+            history["group_id"],
+            errors="coerce",
+        ).nunique(dropna=True) > 1
+    return False
+
+
+def _simulation_loaded_sweep_runs(
+    session: dict,
+    axes: Sequence[str],
+) -> list[dict]:
+    history = session.get("history")
+    if history is None or history.empty:
+        return []
+    required_columns = {"iteration", *axes}
+    if not required_columns.issubset(history.columns):
+        return []
+    value_column = (
+        "observed_value"
+        if "observed_value" in history.columns
+        else "Q_run" if "Q_run" in history.columns
+        else None
+    )
+    if value_column is None:
+        return []
+    group_column = "group_id" if "group_id" in history.columns else None
+    grouped = (
+        history.groupby(group_column, sort=False, dropna=False)
+        if group_column is not None else [(1, history)]
+    )
+    runs = []
+    for group_id, group in grouped:
+        run_history = group.copy()
+        for column in ("iteration", value_column, *axes):
+            run_history[column] = pd.to_numeric(
+                run_history[column],
+                errors="coerce",
+            )
+        run_history = run_history.dropna(
+            subset=["iteration", value_column, *axes],
+        ).sort_values("iteration", kind="mergesort")
+        if run_history.empty:
+            continue
+        label_candidates = [
+            run_history[column].dropna().astype(str).iloc[0]
+            for column in ("run_label", "group_name", "channels")
+            if column in run_history.columns
+            and not run_history[column].dropna().empty
+        ]
+        label = label_candidates[0] if label_candidates else f"Run {group_id}"
+        channel_candidates = [
+            run_history[column].dropna().astype(str).iloc[0]
+            for column in ("ground_truth_channel", "channels")
+            if column in run_history.columns
+            and not run_history[column].dropna().empty
+        ]
+        channel = channel_candidates[0] if channel_candidates else str(group_id)
+        runs.append({
+            "label": label,
+            "channel": channel,
+            "group_id": group_id,
+            "history": run_history.rename(columns={value_column: "observed_value"}),
+        })
+    return runs
+
+
+def _filter_simulation_runs_for_channels(
+    runs: Sequence[dict],
+    selected_channels: Sequence[Any],
+) -> list[dict]:
+    selected = {str(channel) for channel in selected_channels}
+    if not selected:
+        return list(runs)
+    filtered = []
+    for run in runs:
+        candidates = {
+            str(run.get("channel")),
+            str(run.get("group_id")),
+        }
+        history = run.get("history")
+        if history is not None and not history.empty:
+            if "channels" in history.columns:
+                candidates.update(
+                    str(value)
+                    for value in history["channels"].dropna().astype(str).unique()
+                )
+            if "ground_truth_channel" in history.columns:
+                candidates.update(
+                    str(value)
+                    for value
+                    in history["ground_truth_channel"].dropna().astype(str).unique()
+                )
+        candidates.discard("None")
+        if candidates & selected:
+            filtered.append(run)
+    return filtered
+
+
+def _simulation_ground_truth_grid(
+    ground_truth: pd.DataFrame,
+    axes: Sequence[str],
+    *,
+    value_column: str,
+    background_channel: str | None = None,
+) -> pd.DataFrame:
+    if ground_truth is None or ground_truth.empty:
+        return pd.DataFrame()
+    frame = ground_truth.copy()
+    if background_channel is not None and "ground_truth_channel" in frame.columns:
+        frame = frame.loc[
+            frame["ground_truth_channel"].astype(str) == str(background_channel)
+        ].copy()
+    if frame.empty or value_column not in frame.columns:
+        return pd.DataFrame()
+    columns = [*axes, value_column]
+    frame = frame[columns].copy()
+    frame[columns] = frame[columns].apply(pd.to_numeric, errors="coerce")
+    frame = frame.dropna(subset=columns)
+    if frame.empty:
+        return pd.DataFrame()
+    frame = (
+        frame.groupby(list(axes), as_index=False, dropna=False)[value_column]
+        .mean()
+        .rename(columns={value_column: "interpolated_value"})
+    )
+    return frame
+
+
+def _channel_color_with_opacity(color: str, fraction: float) -> str:
+    if color.startswith("rgba(") or color.startswith("rgb("):
+        numeric_parts = [
+            _finite_float(part.strip())
+            for part in color[color.find("(") + 1:color.rfind(")")].split(",")[:3]
+        ]
+        if any(part is None for part in numeric_parts):
+            return color
+        red, green, blue = [int(part) for part in numeric_parts]
+    else:
+        base = color.lstrip("#")
+        if len(base) != 6:
+            return color
+        try:
+            red = int(base[0:2], 16)
+            green = int(base[2:4], 16)
+            blue = int(base[4:6], 16)
+        except ValueError:
+            return color
+    fraction = min(1.0, max(0.0, float(fraction)))
+    alpha = 0.22 + 0.78 * fraction
+    return f"rgba({red},{green},{blue},{alpha:.3f})"
+
+
+def _strip_simulation_path_colorbars(fig: go.Figure) -> None:
+    for trace in fig.data:
+        if not str(getattr(trace, "legendgroup", "")).startswith(
+            "simulation_path:"
+        ):
+            continue
+        marker = getattr(trace, "marker", None)
+        if marker is not None:
+            marker.showscale = False
+            marker.coloraxis = None
+            marker.colorbar = None
+            marker.colorscale = None
+        if hasattr(trace, "showscale"):
+            trace.showscale = False
+        if hasattr(trace, "coloraxis"):
+            trace.coloraxis = None
+        if hasattr(trace, "colorbar"):
+            trace.colorbar = None
+
+
+def _simulation_path_legend_group(channel: str) -> str:
+    return f"simulation_path:{channel}"
+
+
+def _simulation_path_trace_color(
+    color: str,
+    fraction: float,
+) -> str:
+    return _channel_color_with_opacity(color, fraction)
+
+
+def _add_simulation_sweep_paths(
+    fig: go.Figure,
+    runs: Sequence[dict],
+    x_name: str,
+    y_name: str,
+    z_name: str | None = None,
+    *,
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
+    line_width: int = 4,
+    marker_size: int = 6,
+) -> None:
+    channel_values = sorted({
+        str(run.get("channel") or run.get("label") or index)
+        for index, run in enumerate(runs)
+    }, key=_channel_sort_key)
+    channel_colors = {
+        channel: _slice_highlight_color(index, len(channel_values))[1]
+        for index, channel in enumerate(channel_values)
+    }
+    iteration_values = []
+    for run in runs:
+        history = run.get("history")
+        if history is None or history.empty or "iteration" not in history.columns:
+            continue
+        iteration_values.extend(
+            pd.to_numeric(history["iteration"], errors="coerce").dropna().tolist()
+        )
+    iteration_min = min(iteration_values) if iteration_values else 0.0
+    iteration_max = max(iteration_values) if iteration_values else 1.0
+    if np.isclose(iteration_min, iteration_max):
+        iteration_max = iteration_min + 1.0
+
+    def iteration_fraction(iteration: Any) -> float:
+        numeric = _finite_float(iteration)
+        if numeric is None:
+            return 0.0
+        return (numeric - iteration_min) / (iteration_max - iteration_min)
+
+    is_3d = z_name is not None
+    scatter_type = go.Scatter3d if is_3d else go.Scatter
+    legend_channels_shown: set[str] = set()
+    for run_index, run in enumerate(runs):
+        history = run.get("history")
+        if history is None or history.empty:
+            continue
+        plot_history = history.copy()
+        if slice_axis is not None and slice_value is not None:
+            plot_history = _apply_numeric_slice(
+                plot_history,
+                slice_axis,
+                slice_value,
+            ).reset_index(drop=True)
+        required = [x_name, y_name, "iteration", "observed_value"]
+        if is_3d:
+            required.append(z_name)
+        if not set(required).issubset(plot_history.columns):
+            continue
+        plot_history = plot_history.dropna(subset=required).sort_values(
+            "iteration",
+            kind="mergesort",
+        )
+        if plot_history.empty:
+            continue
+        channel = str(run.get("channel") or run.get("label") or run_index)
+        label = str(run.get("label") or f"Run {run_index + 1}")
+        legend_label = f"Channel {channel}"
+        show_channel_legend = channel not in legend_channels_shown
+        legend_channels_shown.add(channel)
+        base_color = channel_colors.get(
+            channel,
+            _slice_highlight_color(run_index, max(1, len(runs)))[1],
+        )
+        legendgroup = _simulation_path_legend_group(channel)
+        customdata = np.column_stack((
+            plot_history["iteration"].to_numpy(dtype=float),
+            plot_history["observed_value"].to_numpy(dtype=float),
+            np.repeat(channel, len(plot_history)),
+        ))
+        for segment_index in range(1, len(plot_history)):
+            segment_rows = plot_history.iloc[segment_index - 1:segment_index + 1]
+            segment_kwargs = {
+                "x": segment_rows[x_name],
+                "y": segment_rows[y_name],
+                "mode": "lines",
+                "name": label,
+                "legendgroup": legendgroup,
+                "line": {
+                    "color": _simulation_path_trace_color(
+                        base_color,
+                        iteration_fraction(segment_rows["iteration"].iloc[-1]),
+                    ),
+                    "width": int(line_width),
+                },
+                "hoverinfo": "skip",
+                "showlegend": False,
+            }
+            if is_3d:
+                segment_kwargs["z"] = segment_rows[z_name]
+            fig.add_trace(scatter_type(**segment_kwargs))
+        for point_index, (_row_index, point_row) in enumerate(
+            plot_history.iterrows()
+        ):
+            marker_color = _simulation_path_trace_color(
+                base_color,
+                iteration_fraction(point_row["iteration"]),
+            )
+            trace_kwargs = {
+                "x": [point_row[x_name]],
+                "y": [point_row[y_name]],
+                "mode": "markers",
+                "name": legend_label,
+                "legendgroup": legendgroup,
+                "showlegend": point_index == 0 and show_channel_legend,
+                "marker": {
+                    "color": marker_color,
+                    "size": int(marker_size),
+                    "line": {"color": "white", "width": 1},
+                    "showscale": False,
+                },
+                "customdata": [customdata[point_index]],
+                "hovertemplate": (
+                    f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                    + (f"{z_name}: %{{z:.4g}}<br>" if is_3d else "")
+                    + "Iteration: %{customdata[0]:.0f}<br>"
+                    + "Observed value: %{customdata[1]:.4g}<br>"
+                    + "Channel: %{customdata[2]}<extra>"
+                    + label
+                    + "</extra>"
+                ),
+            }
+            if is_3d:
+                trace_kwargs["z"] = [point_row[z_name]]
+            fig.add_trace(scatter_type(**trace_kwargs))
+    _strip_simulation_path_colorbars(fig)
 
 
 def _plot_interpolated_simulated_trace(
@@ -11632,6 +12367,77 @@ def _apply_plotly_camera(fig: go.Figure, camera: dict | None) -> go.Figure:
     return fig
 
 
+def _slice_axis_reverse_flags(
+    camera: dict | None,
+    axes: tuple[str, str, str],
+    x_name: str,
+    y_name: str,
+) -> tuple[bool, bool]:
+    valid_camera = _valid_plotly_camera(camera)
+    if valid_camera is None:
+        valid_camera = {"eye": {"x": 1.25, "y": 1.25, "z": 1.25}}
+    eye = valid_camera.get("eye", {})
+    center = valid_camera.get("center", {})
+    up = valid_camera.get("up", {})
+    eye_vector = np.array(
+        [
+            float(eye.get("x", 1.25)),
+            float(eye.get("y", 1.25)),
+            float(eye.get("z", 1.25)),
+        ],
+        dtype=float,
+    )
+    center_vector = np.array(
+        [
+            float(center.get("x", 0.0)),
+            float(center.get("y", 0.0)),
+            float(center.get("z", 0.0)),
+        ],
+        dtype=float,
+    )
+    up_vector = np.array(
+        [
+            float(up.get("x", 0.0)),
+            float(up.get("y", 0.0)),
+            float(up.get("z", 1.0)),
+        ],
+        dtype=float,
+    )
+    forward = center_vector - eye_vector
+    forward_norm = np.linalg.norm(forward)
+    up_norm = np.linalg.norm(up_vector)
+    if forward_norm <= 0 or up_norm <= 0:
+        return False, False
+    forward = forward / forward_norm
+    up_vector = up_vector / up_norm
+    right = np.cross(forward, up_vector)
+    right_norm = np.linalg.norm(right)
+    if right_norm <= 0:
+        return False, False
+    right = right / right_norm
+    screen_up = np.cross(right, forward)
+    screen_up_norm = np.linalg.norm(screen_up)
+    if screen_up_norm <= 0:
+        return False, False
+    screen_up = screen_up / screen_up_norm
+
+    def axis_vector(axis_name: str) -> np.ndarray | None:
+        if axis_name not in axes:
+            return None
+        vector = np.zeros(3, dtype=float)
+        vector[axes.index(axis_name)] = 1.0
+        return vector
+
+    x_vector = axis_vector(x_name)
+    y_vector = axis_vector(y_name)
+    if x_vector is None or y_vector is None:
+        return False, False
+    return (
+        float(np.dot(x_vector, right)) < 0,
+        float(np.dot(y_vector, screen_up)) < 0,
+    )
+
+
 def _render_camera_persistent_plotly(
     container,
     fig: go.Figure,
@@ -15870,7 +16676,23 @@ def render_bo_session_app() -> None:
                 real_2d_sweep_token = "no_sweep"
                 real_2d_slice_token = "all_unplotted"
                 real_2d_title_note = None
+                real_show_2d_measured_points = False
+                real_3d_slice_axis = None
+                real_3d_slice_value = None
+                real_3d_slice_values: list[float] = []
+                real_3d_slice_sweep_values: list[float] = []
+                real_3d_slice_token = "no_slice"
+                real_3d_slice_sweep_token = "no_sweep"
                 if real_view == "2D map":
+                    real_show_2d_measured_points = st.checkbox(
+                        "Show measured points on 2D map",
+                        value=False,
+                        key=(
+                            f"bo_real_show_2d_points_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                            f"{real_x}_{real_y}"
+                        ),
+                    )
                     real_2d_slice_options = [
                         name for name in real_dimensions
                         if name not in {real_x, real_y}
@@ -15973,6 +16795,119 @@ def render_bo_session_app() -> None:
                             slice_columns[1].caption(
                                 "2D map aggregates over unplotted parameters."
                             )
+                if real_view == "3D tensor":
+                    st.markdown("#### Highlighted slice")
+                    real_3d_slice_axes = [real_x, real_y, real_z]
+                    real_3d_slice_axis_choices = [
+                        NO_HIGHLIGHTED_SLICE_LABEL,
+                        *real_3d_slice_axes,
+                    ]
+                    real_3d_slice_columns = st.columns(2)
+                    real_3d_slice_axis_key = (
+                        f"bo_real_3d_slice_axis_{real_scope_key}_"
+                        f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                        f"{real_x}_{real_y}_{real_z}"
+                    )
+                    _preserve_valid_widget_value(
+                        real_3d_slice_axis_key,
+                        real_3d_slice_axis_choices,
+                        real_z,
+                    )
+                    real_3d_slice_axis_choice = real_3d_slice_columns[0].selectbox(
+                        "Highlighted slice axis",
+                        real_3d_slice_axis_choices,
+                        format_func=lambda value: (
+                            value if value == NO_HIGHLIGHTED_SLICE_LABEL
+                            else _metric_label(value)
+                        ),
+                        key=real_3d_slice_axis_key,
+                    )
+                    real_3d_slice_axis = (
+                        None
+                        if real_3d_slice_axis_choice == NO_HIGHLIGHTED_SLICE_LABEL
+                        else real_3d_slice_axis_choice
+                    )
+                    real_3d_slice_values = (
+                        _numeric_slice_values(
+                            combined_real_points,
+                            real_3d_slice_axis,
+                        )
+                        if real_3d_slice_axis is not None
+                        else []
+                    )
+                    if real_3d_slice_axis is not None and real_3d_slice_values:
+                        real_3d_slice_value_key = (
+                            f"bo_real_3d_slice_value_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                            f"{real_x}_{real_y}_{real_z}_{real_3d_slice_axis}"
+                        )
+                        _preserve_valid_widget_value(
+                            real_3d_slice_value_key,
+                            real_3d_slice_values,
+                            real_3d_slice_values[0],
+                        )
+                        real_3d_slice_value = float(
+                            real_3d_slice_columns[1].selectbox(
+                                f"Slice {_metric_label(real_3d_slice_axis)}",
+                                real_3d_slice_values,
+                                format_func=lambda value: f"{float(value):g}",
+                                key=real_3d_slice_value_key,
+                            )
+                        )
+                        real_3d_slice_token = _numeric_slice_token(
+                            real_3d_slice_axis,
+                            real_3d_slice_value,
+                        )
+                        real_3d_slice_sweep_key = (
+                            f"bo_real_3d_slice_sweep_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                            f"{real_x}_{real_y}_{real_z}_{real_3d_slice_axis}"
+                        )
+                        (
+                            real_3d_sweep_valid,
+                            real_3d_sweep_display,
+                        ) = _prepare_preferred_multiselect_value(
+                            real_3d_slice_sweep_key,
+                            f"{real_3d_slice_sweep_key}__preferred",
+                            real_3d_slice_values,
+                            [real_3d_slice_value],
+                        )
+                        real_3d_sweep_display = real_3d_slice_columns[1].multiselect(
+                            "Highlighted slice sweep values",
+                            real_3d_slice_values,
+                            default=real_3d_sweep_display,
+                            format_func=lambda value: f"{float(value):g}",
+                            key=real_3d_slice_sweep_key,
+                        )
+                        _sync_preferred_widget_value(
+                            real_3d_slice_sweep_key,
+                            f"{real_3d_slice_sweep_key}__preferred",
+                            real_3d_sweep_valid,
+                            real_3d_sweep_display,
+                        )
+                        real_3d_slice_sweep_values = [
+                            float(value)
+                            for value in real_3d_sweep_display
+                        ]
+                        if not any(
+                            np.isclose(
+                                float(value),
+                                float(real_3d_slice_value),
+                                rtol=1e-9,
+                                atol=1e-12,
+                            )
+                            for value in real_3d_slice_sweep_values
+                        ):
+                            real_3d_slice_sweep_values.append(
+                                real_3d_slice_value
+                            )
+                        real_3d_slice_sweep_values = sorted(
+                            real_3d_slice_sweep_values
+                        )
+                        real_3d_slice_sweep_token = _numeric_slice_values_token(
+                            real_3d_slice_axis,
+                            real_3d_slice_sweep_values,
+                        )
                 if real_2d_slice_column is not None and real_2d_slice_value is not None:
                     real_points_by_phase = {
                         phase: _apply_numeric_slice(
@@ -16263,11 +17198,187 @@ def render_bo_session_app() -> None:
                 st.session_state[real_iteration_path_preference_key] = (
                     real_show_iteration_path
                 )
+                def real_2d_tensor_source(
+                    phase: str,
+                    series_name: Any = None,
+                    *,
+                    require_2d_slice: bool = True,
+                ) -> pd.DataFrame | None:
+                    if (
+                        count_mode
+                        or real_view != "2D map"
+                        and require_2d_slice
+                    ):
+                        return None
+                    if (
+                        require_2d_slice
+                        and (
+                            real_2d_slice_column is None
+                            or real_2d_slice_value is None
+                        )
+                    ):
+                        return None
+                    source = unsliced_real_points_by_phase.get(
+                        phase,
+                        pd.DataFrame(),
+                    )
+                    if source.empty:
+                        return None
+                    source = source.copy()
+                    if real_crop_ranges:
+                        source = _apply_parameter_crop(
+                            source,
+                            real_crop_ranges,
+                        ).reset_index(drop=True)
+                    if (
+                        series_name is not None
+                        and "channel" in source.columns
+                        ):
+                        source = source.loc[
+                            source["channel"].astype(str) == str(series_name)
+                        ].reset_index(drop=True)
+                    return source if not source.empty else None
+
+                loaded_real_sweep_runs: list[dict] = []
+                real_show_selected_channel_paths = False
+                real_selected_path_available = (
+                    _is_loaded_simulated_sweep_session(full_session)
+                    and real_channel_mode == "Overlay selected channels"
+                    and len(selected_real_channels) > 1
+                    and real_view in {"2D map", "3D tensor"}
+                    and not count_mode
+                )
+                if real_selected_path_available:
+                    loaded_real_sweep_metadata = (
+                        (full_session.get("state") or {})
+                        .get("simulation_metadata")
+                        or {}
+                    )
+                    loaded_real_sweep_axes = [
+                        str(axis)
+                        for axis in (
+                            loaded_real_sweep_metadata.get("axes")
+                            or (full_session.get("state") or {}).get(
+                                "active_parameters"
+                            )
+                            or []
+                        )
+                        if axis is not None
+                    ][:3]
+                    if len(loaded_real_sweep_axes) == 3:
+                        loaded_real_sweep_runs = (
+                            _filter_simulation_runs_for_channels(
+                                _simulation_loaded_sweep_runs(
+                                    full_session,
+                                    loaded_real_sweep_axes,
+                                ),
+                                selected_real_channels,
+                            )
+                        )
+                if loaded_real_sweep_runs:
+                    real_path_controls = st.columns(3)
+                    real_show_selected_channel_paths = real_path_controls[0].checkbox(
+                        "Show selected channel iteration paths",
+                        value=True,
+                        key=(
+                            f"bo_real_selected_channel_paths_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                        help=(
+                            "Overlays all selected simulated channel paths on the "
+                            "current real-data 2D or 3D landscape using fixed "
+                            "rainbow channel colors with less transparent later "
+                            "iterations."
+                        ),
+                    )
+                    real_selected_path_line_width = int(real_path_controls[1].slider(
+                        "Path line width",
+                        min_value=1,
+                        max_value=10,
+                        value=4,
+                        step=1,
+                        key=(
+                            f"bo_real_selected_channel_path_width_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                    ))
+                    real_selected_path_marker_size = int(real_path_controls[2].slider(
+                        "Path marker size",
+                        min_value=3,
+                        max_value=14,
+                        value=6,
+                        step=1,
+                        key=(
+                            f"bo_real_selected_channel_path_marker_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                    ))
+                else:
+                    real_selected_path_line_width = 4
+                    real_selected_path_marker_size = 6
+
+                real_effective_show_iteration_path = (
+                    real_show_iteration_path
+                    and not real_show_selected_channel_paths
+                )
+
+                def add_real_selected_channel_paths(
+                    fig: go.Figure,
+                    *,
+                    plot_x: str | None = None,
+                    plot_y: str | None = None,
+                    plot_z: str | None = None,
+                    view: str | None = None,
+                    slice_axis: str | None = None,
+                    slice_value: float | None = None,
+                ) -> None:
+                    if not real_show_selected_channel_paths:
+                        return
+                    if not loaded_real_sweep_runs:
+                        return
+                    path_view = view or real_view
+                    path_x = plot_x or real_x
+                    path_y = plot_y or real_y
+                    path_z = plot_z if plot_z is not None else real_z
+                    if path_view == "3D tensor" and path_z is not None:
+                        _add_simulation_sweep_paths(
+                            fig,
+                            loaded_real_sweep_runs,
+                            path_x,
+                            path_y,
+                            path_z,
+                            line_width=real_selected_path_line_width,
+                            marker_size=real_selected_path_marker_size,
+                        )
+                    elif path_view == "2D map":
+                        _add_simulation_sweep_paths(
+                            fig,
+                            loaded_real_sweep_runs,
+                            path_x,
+                            path_y,
+                            None,
+                            slice_axis=(
+                                slice_axis
+                                if slice_axis is not None
+                                else real_2d_slice_column
+                            ),
+                            slice_value=(
+                                slice_value
+                                if slice_value is not None
+                                else real_2d_slice_value
+                            ),
+                            line_width=real_selected_path_line_width,
+                            marker_size=real_selected_path_marker_size,
+                        )
+
                 real_plot_state_key = (
                     f"v3_{real_color_by}_{real_group_color_label or 'categorical'}_"
                     f"log{int(bool(real_log_frequency))}_"
-                    f"path{int(bool(real_show_iteration_path))}"
+                    f"path{int(bool(real_show_iteration_path))}_"
+                    f"selectedpaths{int(bool(real_show_selected_channel_paths))}_"
+                    f"{real_3d_slice_token}_{real_3d_slice_sweep_token}"
                 )
+
                 if real_phase == "both" and real_view == "1D slice":
                     if real_channel_mode == "Plot channels individually":
                         individual_channels = sorted(
@@ -16292,14 +17403,14 @@ def render_bo_session_app() -> None:
                                 color_by=real_color_by,
                                 group_color_values=real_group_color_values,
                                 group_color_label=real_group_color_label,
-                                show_iteration_path=real_show_iteration_path,
+                                show_iteration_path=real_effective_show_iteration_path,
                                 axis_ranges=real_axis_ranges,
                                 value_range=real_value_range,
                             )
                             if (
                                 real_color_by in {"Group", "Channel"}
                                 and not real_group_color_values
-                                and not real_show_iteration_path
+                                and not real_effective_show_iteration_path
                             ):
                                 real_figure = _strip_plotly_color_references(real_figure)
                             _plotly_chart_with_colorbars(
@@ -16323,14 +17434,14 @@ def render_bo_session_app() -> None:
                             color_by=real_color_by,
                             group_color_values=real_group_color_values,
                             group_color_label=real_group_color_label,
-                            show_iteration_path=real_show_iteration_path,
+                            show_iteration_path=real_effective_show_iteration_path,
                             axis_ranges=real_axis_ranges,
                             value_range=real_value_range,
                         )
                         if (
                             real_color_by in {"Group", "Channel"}
                             and not real_group_color_values
-                            and not real_show_iteration_path
+                            and not real_effective_show_iteration_path
                         ):
                             real_figure = _strip_plotly_color_references(real_figure)
                         _plotly_chart_with_colorbars(
@@ -16390,11 +17501,32 @@ def render_bo_session_app() -> None:
                                         if count_mode
                                         else series_points
                                     ),
-                                    show_iteration_path=real_show_iteration_path,
+                                    show_iteration_path=(
+                                        real_effective_show_iteration_path
+                                    ),
                                     count_bin_sizes=count_bin_sizes,
                                     axis_ranges=real_axis_ranges,
                                     value_range=real_value_range,
                                     title_note=real_2d_title_note,
+                                    slice_axis=(
+                                        real_3d_slice_axis
+                                        if real_view == "3D tensor"
+                                        else real_2d_slice_column
+                                    ),
+                                    slice_value=(
+                                        real_3d_slice_value
+                                        if real_view == "3D tensor"
+                                        else real_2d_slice_value
+                                    ),
+                                    slice_sweep_values=(
+                                        real_3d_slice_sweep_values
+                                        if real_view == "3D tensor" else None
+                                    ),
+                                    tensor_interpolation_source=real_2d_tensor_source(
+                                        phase,
+                                        series_name,
+                                    ),
+                                    show_measured_points=real_show_2d_measured_points,
                                 )
                                 plot_key = (
                                     f"bo_real_plot_{real_plot_state_key}_{phase}_"
@@ -16403,12 +17535,15 @@ def render_bo_session_app() -> None:
                                     f"{real_channel_mode}_{real_scope_key}_"
                                     f"{real_2d_slice_token}"
                                 )
+                                add_real_selected_channel_paths(real_figure)
                                 if real_view == "3D tensor":
                                     camera_storage_key = (
                                         f"real_3d_{real_scope_key}_{phase}_"
                                         f"{series_name}_{real_metric}_{real_channel_mode}_"
                                         f"{real_color_by}_{real_x}_{real_y}_{real_z}_"
-                                        f"log{int(bool(real_log_frequency))}"
+                                        f"log{int(bool(real_log_frequency))}_"
+                                        f"{real_3d_slice_token}_"
+                                        f"{real_3d_slice_sweep_token}"
                                     )
                                     _render_downloadable_plotly(
                                         column,
@@ -16470,17 +17605,36 @@ def render_bo_session_app() -> None:
                                 if count_mode
                                 else series_points
                             ),
-                            show_iteration_path=real_show_iteration_path,
+                            show_iteration_path=real_effective_show_iteration_path,
                             count_bin_sizes=count_bin_sizes,
                             axis_ranges=real_axis_ranges,
                             value_range=real_value_range,
                             title_note=real_2d_title_note,
+                            slice_axis=(
+                                real_3d_slice_axis
+                                if real_view == "3D tensor"
+                                else real_2d_slice_column
+                            ),
+                            slice_value=(
+                                real_3d_slice_value
+                                if real_view == "3D tensor"
+                                else real_2d_slice_value
+                            ),
+                            slice_sweep_values=(
+                                real_3d_slice_sweep_values
+                                if real_view == "3D tensor" else None
+                            ),
+                            tensor_interpolation_source=real_2d_tensor_source(
+                                real_phase,
+                                series_name,
+                            ),
+                            show_measured_points=real_show_2d_measured_points,
                         )
                         if (
                             real_view == "1D slice"
                             and real_color_by in {"Group", "Channel"}
                             and not real_group_color_values
-                            and not real_show_iteration_path
+                            and not real_effective_show_iteration_path
                         ):
                             real_figure = _strip_plotly_color_references(real_figure)
                         plot_key = (
@@ -16490,12 +17644,15 @@ def render_bo_session_app() -> None:
                             f"{real_channel_mode}_{real_scope_key}_"
                             f"{real_2d_slice_token}"
                         )
+                        add_real_selected_channel_paths(real_figure)
                         if real_view == "3D tensor":
                             camera_storage_key = (
                                 f"real_3d_{real_scope_key}_{real_phase}_"
                                 f"{series_name}_{real_metric}_{real_channel_mode}_"
                                 f"{real_color_by}_{real_x}_{real_y}_{real_z}_"
-                                f"log{int(bool(real_log_frequency))}"
+                                f"log{int(bool(real_log_frequency))}_"
+                                f"{real_3d_slice_token}_"
+                                f"{real_3d_slice_sweep_token}"
                             )
                             _render_downloadable_plotly(
                                 st,
@@ -16517,6 +17674,260 @@ def render_bo_session_app() -> None:
                                 use_container_width=True,
                                 key=plot_key,
                             )
+
+                if (
+                    real_view == "3D tensor"
+                    and not count_mode
+                    and real_3d_slice_axis is not None
+                    and real_3d_slice_value is not None
+                ):
+                    real_3d_slice_plot_key = (
+                        f"bo_real_highlighted_2d_slice_{real_scope_key}_"
+                        f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                        f"{real_x}_{real_y}_{real_z}_"
+                        f"{real_3d_slice_token}_{real_3d_slice_sweep_token}_"
+                        f"log{int(bool(real_log_frequency))}"
+                    )
+                    show_real_3d_slice_points = st.checkbox(
+                        "Show measured points on highlighted 2D slices",
+                        value=False,
+                        key=f"{real_3d_slice_plot_key}_show_points",
+                    )
+                    real_3d_slice_perimeter_thickness = st.slider(
+                        "Highlighted slice perimeter thickness",
+                        min_value=1,
+                        max_value=10,
+                        value=3,
+                        step=1,
+                        key=f"{real_3d_slice_plot_key}_perimeter_thickness",
+                    )
+                    requested_real_3d_slice_values = (
+                        real_3d_slice_sweep_values
+                        or [real_3d_slice_value]
+                    )
+                    real_3d_slice_button_label = (
+                        "Generate 2D plots for highlighted slices"
+                        if len(requested_real_3d_slice_values) > 1
+                        else "Generate 2D plot for highlighted slice"
+                    )
+                    if st.button(
+                        real_3d_slice_button_label,
+                        key=f"{real_3d_slice_plot_key}_button",
+                    ):
+                        real_3d_slice_axes = [
+                            axis for axis in (real_x, real_y, real_z)
+                            if axis != real_3d_slice_axis
+                        ]
+                        real_3d_slice_plots = []
+                        phase_names = (
+                            ("buffer", "target")
+                            if real_phase == "both"
+                            else (real_phase,)
+                        )
+                        if len(real_3d_slice_axes) == 2:
+                            for slice_color_index, requested_slice_value in enumerate(
+                                requested_real_3d_slice_values
+                            ):
+                                for phase_name in phase_names:
+                                    phase_source = real_2d_tensor_source(
+                                        phase_name,
+                                        require_2d_slice=False,
+                                    )
+                                    if phase_source is None or phase_source.empty:
+                                        continue
+                                    plot_series = (
+                                        list(phase_source.groupby(
+                                            "channel",
+                                            sort=False,
+                                        ))
+                                        if real_channel_mode in (
+                                            "Plot channels individually",
+                                            "Plot channel groups",
+                                        )
+                                        else [(None, phase_source)]
+                                    )
+                                    for series_name, source_points in plot_series:
+                                        slice_points = _apply_numeric_slice(
+                                            source_points,
+                                            real_3d_slice_axis,
+                                            requested_slice_value,
+                                        ).reset_index(drop=True)
+                                        if slice_points.empty:
+                                            continue
+                                        slice_figure = _plot_real_data_landscape(
+                                            slice_points,
+                                            real_metric,
+                                            phase_name,
+                                            "2D map",
+                                            real_3d_slice_axes[0],
+                                            real_3d_slice_axes[1],
+                                            None,
+                                            tensor_height=plot_3d_height,
+                                            dot_size=plot_dot_size,
+                                            dot_opacity=plot_dot_opacity,
+                                            log_frequency=real_log_frequency,
+                                            color_by=real_color_by,
+                                            group_color_values=real_group_color_values,
+                                            group_color_label=real_group_color_label,
+                                            iteration_path=(
+                                                slice_points
+                                                if real_effective_show_iteration_path
+                                                else None
+                                            ),
+                                            show_iteration_path=(
+                                                real_effective_show_iteration_path
+                                            ),
+                                            axis_ranges=real_axis_ranges,
+                                            value_range=real_value_range,
+                                            title_note=_numeric_slice_title_note(
+                                                real_3d_slice_axis,
+                                                requested_slice_value,
+                                            ),
+                                            slice_axis=real_3d_slice_axis,
+                                            slice_value=requested_slice_value,
+                                            tensor_interpolation_source=source_points,
+                                            show_measured_points=(
+                                                show_real_3d_slice_points
+                                            ),
+                                        )
+                                        add_real_selected_channel_paths(
+                                            slice_figure,
+                                            plot_x=real_3d_slice_axes[0],
+                                            plot_y=real_3d_slice_axes[1],
+                                            plot_z=None,
+                                            view="2D map",
+                                            slice_axis=real_3d_slice_axis,
+                                            slice_value=requested_slice_value,
+                                        )
+                                        slice_color, plotly_slice_color = (
+                                            _slice_highlight_color(
+                                                slice_color_index,
+                                                len(requested_real_3d_slice_values),
+                                            )
+                                        )
+                                        _apply_plotly_slice_perimeter_style(
+                                            slice_figure,
+                                            plotly_slice_color,
+                                            thickness=(
+                                                real_3d_slice_perimeter_thickness
+                                            ),
+                                        )
+                                        real_3d_slice_plots.append({
+                                            "figure": slice_figure,
+                                            "axes": real_3d_slice_axes,
+                                            "frame": slice_points,
+                                            "phase": phase_name,
+                                            "series_name": series_name,
+                                            "slice_value": float(requested_slice_value),
+                                            "slice_color": slice_color,
+                                            "plotly_slice_color": plotly_slice_color,
+                                        })
+                        if real_3d_slice_plots:
+                            st.session_state[real_3d_slice_plot_key] = {
+                                "plots": real_3d_slice_plots,
+                                "axes": real_3d_slice_axes,
+                            }
+                        else:
+                            st.session_state.pop(real_3d_slice_plot_key, None)
+                            st.warning(
+                                "No real-data points match the highlighted 3D "
+                                "slice sweep."
+                            )
+                    highlighted_real_3d_slice_plot = st.session_state.get(
+                        real_3d_slice_plot_key
+                    )
+                    if highlighted_real_3d_slice_plot is not None:
+                        real_3d_slice_axes = highlighted_real_3d_slice_plot.get(
+                            "axes",
+                            [],
+                        )
+                        real_3d_slice_plots = highlighted_real_3d_slice_plot.get(
+                            "plots",
+                            [],
+                        )
+                        st.markdown(
+                            "##### Highlighted slice 2D maps"
+                            if len(real_3d_slice_plots) > 1
+                            else "##### Highlighted slice 2D map"
+                        )
+                        for slice_plot_index, slice_plot in enumerate(
+                            real_3d_slice_plots,
+                            start=1,
+                        ):
+                            slice_value_label = float(slice_plot["slice_value"])
+                            if len(real_3d_slice_plots) > 1:
+                                series_name = slice_plot.get("series_name")
+                                series_label = (
+                                    f" | {series_name}"
+                                    if series_name is not None else ""
+                                )
+                                st.markdown(
+                                    f"#### {str(slice_plot.get('phase')).title()}"
+                                    f"{series_label} | "
+                                    f"{_metric_label(real_3d_slice_axis)} = "
+                                    f"{slice_value_label:g}"
+                                )
+                            real_slice_export_width = max(
+                                500,
+                                int(1200 * plot_width_percent / 100),
+                            )
+                            real_slice_export_height = max(
+                                320,
+                                int(
+                                    round(
+                                        real_slice_export_width
+                                        / SURROGATE_2D_FIGURE_ASPECT
+                                    )
+                                ),
+                            )
+                            _apply_plotly_2d_slice_aspect(
+                                slice_plot["figure"],
+                                width=real_slice_export_width,
+                                height=real_slice_export_height,
+                            )
+                            _apply_plotly_slice_perimeter_style(
+                                slice_plot["figure"],
+                                slice_plot.get(
+                                    "plotly_slice_color",
+                                    "rgba(255,59,48,1)",
+                                ),
+                                thickness=real_3d_slice_perimeter_thickness,
+                            )
+                            _render_downloadable_plotly(
+                                st,
+                                slice_plot["figure"],
+                                key=(
+                                    f"{real_3d_slice_plot_key}_plot_"
+                                    f"{slice_plot_index}_{slice_value_label:g}"
+                                ),
+                                file_stem=(
+                                    "real_data_highlighted_slice_"
+                                    f"{_safe_download_stem(real_metric)}_"
+                                    f"{real_3d_slice_axes[0]}_"
+                                    f"{real_3d_slice_axes[1]}_"
+                                    f"{real_3d_slice_axis}_"
+                                    f"{slice_value_label:g}"
+                                ),
+                                width_percent=plot_width_percent,
+                                export_width=real_slice_export_width,
+                                export_height=real_slice_export_height,
+                            )
+                            with st.expander(
+                                "Highlighted slice values"
+                                if len(real_3d_slice_plots) == 1
+                                else (
+                                    "Highlighted slice values | "
+                                    f"{_metric_label(real_3d_slice_axis)} = "
+                                    f"{slice_value_label:g}"
+                                )
+                            ):
+                                st.dataframe(
+                                    slice_plot["frame"].sort_values(
+                                        real_3d_slice_axes
+                                    ),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
 
                 if (
                     real_view == "2D map"
@@ -16639,7 +18050,9 @@ def render_bo_session_app() -> None:
                                             if count_mode
                                             else sweep_series_points
                                         ),
-                                        show_iteration_path=real_show_iteration_path,
+                                        show_iteration_path=(
+                                            real_effective_show_iteration_path
+                                        ),
                                         count_bin_sizes=count_bin_sizes,
                                         axis_ranges=real_axis_ranges,
                                         value_range=real_value_range,
@@ -16647,6 +18060,26 @@ def render_bo_session_app() -> None:
                                             real_2d_slice_column,
                                             sweep_value,
                                         ),
+                                        slice_axis=real_2d_slice_column,
+                                        slice_value=sweep_value,
+                                        tensor_interpolation_source=(
+                                            real_2d_tensor_source(
+                                                sweep_phase,
+                                                sweep_series_name,
+                                            )
+                                        ),
+                                        show_measured_points=(
+                                            real_show_2d_measured_points
+                                        ),
+                                    )
+                                    add_real_selected_channel_paths(
+                                        sweep_figure,
+                                        plot_x=real_x,
+                                        plot_y=real_y,
+                                        plot_z=None,
+                                        view="2D map",
+                                        slice_axis=real_2d_slice_column,
+                                        slice_value=sweep_value,
                                     )
                                     _plotly_chart_with_colorbars(
                                         _sized_plot_container(
@@ -16777,6 +18210,7 @@ def render_bo_session_app() -> None:
                                     "valid_points": valid_points,
                                     "grid_frame": grid_frame,
                                     "error": error,
+                                    "source_points": source_points,
                                 }
                                 progress.progress(
                                     1.0,
@@ -16789,6 +18223,10 @@ def render_bo_session_app() -> None:
                                 valid_points = interpolation_result["valid_points"]
                                 grid_frame = interpolation_result["grid_frame"]
                                 error = interpolation_result["error"]
+                                source_points = interpolation_result.get(
+                                    "source_points",
+                                    pd.DataFrame(),
+                                )
                                 if error:
                                     st.warning(error)
                                 elif grid_frame.empty:
@@ -16927,6 +18365,13 @@ def render_bo_session_app() -> None:
                                         f"{interpolation_key}_plot_"
                                         f"{interpolation_slice_token}"
                                     )
+                                    interpolation_3d_camera_storage_key = (
+                                        f"real_interpolated_3d_"
+                                        f"{real_scope_key}_{real_metric}_"
+                                        f"{interpolation_phase}_{real_x}_"
+                                        f"{real_y}_{real_z}_"
+                                        f"{interpolation_slice_token}"
+                                    )
                                     interpolation_click_pick_enabled = (
                                         interpolation_slice_axis is not None
                                         and
@@ -16972,11 +18417,7 @@ def render_bo_session_app() -> None:
                                             width_percent=plot_width_percent,
                                             export_height=plot_3d_height,
                                             camera_storage_key=(
-                                                f"real_interpolated_3d_"
-                                                f"{real_scope_key}_{real_metric}_"
-                                                f"{interpolation_phase}_{real_x}_"
-                                                f"{real_y}_{real_z}_"
-                                                f"{interpolation_slice_token}"
+                                                interpolation_3d_camera_storage_key
                                             ),
                                         )
                                     if (
@@ -17031,6 +18472,14 @@ def render_bo_session_app() -> None:
                                             f"{interpolation_key}_2d_slice_"
                                             f"{interpolation_slice_token}"
                                         )
+                                        show_interpolation_slice_points = st.checkbox(
+                                            "Show measured points on highlighted 2D slice",
+                                            value=False,
+                                            key=(
+                                                f"{interpolation_slice_plot_key}_"
+                                                "show_points"
+                                            ),
+                                        )
                                         if st.button(
                                             "Generate 2D plot for highlighted slice",
                                             key=(
@@ -17052,6 +18501,16 @@ def render_bo_session_app() -> None:
                                                 len(interpolation_slice_plot_axes) == 2
                                                 and not slice_grid.empty
                                             ):
+                                                reverse_slice_x, reverse_slice_y = (
+                                                    _slice_axis_reverse_flags(
+                                                        _stored_plotly_camera(
+                                                            interpolation_3d_camera_storage_key
+                                                        ),
+                                                        (real_x, real_y, real_z),
+                                                        interpolation_slice_plot_axes[0],
+                                                        interpolation_slice_plot_axes[1],
+                                                    )
+                                                )
                                                 slice_figure = (
                                                     _plot_interpolated_2d_slice(
                                                         valid_points,
@@ -17063,12 +18522,57 @@ def render_bo_session_app() -> None:
                                                         interpolation_slice_value,
                                                         log_frequency=real_log_frequency,
                                                         value_range=real_value_range,
+                                                        reverse_x=reverse_slice_x,
+                                                        reverse_y=reverse_slice_y,
+                                                        show_measured_points=(
+                                                            show_interpolation_slice_points
+                                                        ),
                                                     )
                                                 )
+                                                original_tensor_figure = None
+                                                if not source_points.empty:
+                                                    original_tensor_figure = (
+                                                        _plot_real_data_landscape(
+                                                            source_points,
+                                                            real_metric,
+                                                            interpolation_phase,
+                                                            "3D tensor",
+                                                            real_x,
+                                                            real_y,
+                                                            real_z,
+                                                            tensor_height=plot_3d_height,
+                                                            dot_size=plot_dot_size,
+                                                            dot_opacity=plot_dot_opacity,
+                                                            log_frequency=real_log_frequency,
+                                                            color_by=real_color_by,
+                                                            group_color_values=real_group_color_values,
+                                                            group_color_label=real_group_color_label,
+                                                            iteration_path=source_points,
+                                                            show_iteration_path=(
+                                                                real_effective_show_iteration_path
+                                                            ),
+                                                            axis_ranges=real_axis_ranges,
+                                                            value_range=real_value_range,
+                                                            title_note=_numeric_slice_title_note(
+                                                                interpolation_slice_axis,
+                                                                interpolation_slice_value,
+                                                            ),
+                                                            slice_axis=interpolation_slice_axis,
+                                                            slice_value=interpolation_slice_value,
+                                                        )
+                                                    )
+                                                    original_tensor_figure.update_layout(
+                                                        title=(
+                                                            f"Original measured {real_metric} 3D tensor"
+                                                            "<br>"
+                                                            f"{_numeric_slice_title_note(interpolation_slice_axis, interpolation_slice_value)}"
+                                                        )
+                                                    )
                                                 st.session_state[
                                                     interpolation_slice_plot_key
                                                 ] = {
                                                     "figure": slice_figure,
+                                                    "original_tensor_figure": original_tensor_figure,
                                                     "axes": (
                                                         interpolation_slice_plot_axes
                                                     ),
@@ -17090,10 +18594,67 @@ def render_bo_session_app() -> None:
                                         )
                                         if highlighted_interpolation_slice is not None:
                                             st.markdown(
-                                                "##### Highlighted slice 2D map"
+                                                "##### Highlighted slice views"
                                             )
                                             slice_axes = (
                                                 highlighted_interpolation_slice["axes"]
+                                            )
+                                            original_tensor_figure = (
+                                                highlighted_interpolation_slice.get(
+                                                    "original_tensor_figure"
+                                                )
+                                            )
+                                            if original_tensor_figure is not None:
+                                                _render_downloadable_plotly(
+                                                    st,
+                                                    original_tensor_figure,
+                                                    key=(
+                                                        f"{interpolation_slice_plot_key}_"
+                                                        "original_tensor_plot"
+                                                    ),
+                                                    file_stem=(
+                                                        "original_3d_tensor_highlighted_slice_"
+                                                        f"{_safe_download_stem(real_metric)}_"
+                                                        f"{real_x}_{real_y}_{real_z}_"
+                                                        f"{interpolation_slice_token}"
+                                                    ),
+                                                    width_percent=plot_width_percent,
+                                                    export_height=plot_3d_height,
+                                                    camera_storage_key=(
+                                                        f"real_original_3d_highlighted_"
+                                                        f"{real_scope_key}_{real_metric}_"
+                                                        f"{interpolation_phase}_{real_x}_"
+                                                        f"{real_y}_{real_z}_"
+                                                        f"{interpolation_slice_token}"
+                                                    ),
+                                                )
+                                            interpolation_slice_export_width = max(
+                                                500,
+                                                int(
+                                                    1200
+                                                    * plot_width_percent
+                                                    / 100
+                                                ),
+                                            )
+                                            interpolation_slice_export_height = max(
+                                                320,
+                                                int(
+                                                    round(
+                                                        interpolation_slice_export_width
+                                                        / SURROGATE_2D_FIGURE_ASPECT
+                                                    )
+                                                ),
+                                            )
+                                            _apply_plotly_2d_slice_aspect(
+                                                highlighted_interpolation_slice[
+                                                    "figure"
+                                                ],
+                                                width=(
+                                                    interpolation_slice_export_width
+                                                ),
+                                                height=(
+                                                    interpolation_slice_export_height
+                                                ),
                                             )
                                             _render_downloadable_plotly(
                                                 st,
@@ -17111,18 +18672,23 @@ def render_bo_session_app() -> None:
                                                     f"{interpolation_slice_token}"
                                                 ),
                                                 width_percent=plot_width_percent,
-                                                export_height=460,
+                                                export_width=(
+                                                    interpolation_slice_export_width
+                                                ),
+                                                export_height=(
+                                                    interpolation_slice_export_height
+                                                ),
                                             )
-                                            with st.expander(
-                                                "Highlighted slice grid values"
-                                            ):
-                                                st.dataframe(
-                                                    highlighted_interpolation_slice[
-                                                        "frame"
-                                                    ].sort_values(slice_axes),
-                                                    use_container_width=True,
-                                                    hide_index=True,
-                                                )
+                                            st.markdown(
+                                                "###### Highlighted slice grid values"
+                                            )
+                                            st.dataframe(
+                                                highlighted_interpolation_slice[
+                                                    "frame"
+                                                ].sort_values(slice_axes),
+                                                use_container_width=True,
+                                                hide_index=True,
+                                            )
                                     st.download_button(
                                         "Download interpolated grid CSV",
                                         data=grid_frame.to_csv(index=False).encode(),
@@ -17257,7 +18823,7 @@ def render_bo_session_app() -> None:
                                                     == "Average selected channels"
                                                 ),
                                             )
-                                        yield _plot_real_data_landscape(
+                                        frame_figure = _plot_real_data_landscape(
                                             frame_points,
                                             real_metric,
                                             phase,
@@ -17278,13 +18844,60 @@ def render_bo_session_app() -> None:
                                             ),
                                             iteration_path=frame_path,
                                             show_iteration_path=(
-                                                real_show_iteration_path
+                                                real_effective_show_iteration_path
                                             ),
                                             count_bin_sizes=count_bin_sizes,
                                             axis_ranges=real_axis_ranges,
                                             value_range=real_value_range,
                                             title_note=real_2d_title_note,
                                         )
+                                        if real_show_selected_channel_paths:
+                                            frame_runs = []
+                                            for run in loaded_real_sweep_runs:
+                                                history = run["history"]
+                                                filtered_history = history.loc[
+                                                    pd.to_numeric(
+                                                        history["iteration"],
+                                                        errors="coerce",
+                                                    )
+                                                    <= int(frame_iteration)
+                                                ].copy()
+                                                if filtered_history.empty:
+                                                    continue
+                                                frame_run = dict(run)
+                                                frame_run["history"] = filtered_history
+                                                frame_runs.append(frame_run)
+                                            if real_view == "3D tensor" and real_z is not None:
+                                                _add_simulation_sweep_paths(
+                                                    frame_figure,
+                                                    frame_runs,
+                                                    real_x,
+                                                    real_y,
+                                                    real_z,
+                                                    line_width=(
+                                                        real_selected_path_line_width
+                                                    ),
+                                                    marker_size=(
+                                                        real_selected_path_marker_size
+                                                    ),
+                                                )
+                                            elif real_view == "2D map":
+                                                _add_simulation_sweep_paths(
+                                                    frame_figure,
+                                                    frame_runs,
+                                                    real_x,
+                                                    real_y,
+                                                    None,
+                                                    slice_axis=real_2d_slice_column,
+                                                    slice_value=real_2d_slice_value,
+                                                    line_width=(
+                                                        real_selected_path_line_width
+                                                    ),
+                                                    marker_size=(
+                                                        real_selected_path_marker_size
+                                                    ),
+                                                )
+                                        yield frame_figure
 
                                 generated_gifs[target_name] = _figures_to_gif(
                                     real_frames(),
@@ -18471,6 +20084,14 @@ def render_bo_session_app() -> None:
                             surrogate_3d_slice_sweep_values
                             or [surrogate_3d_slice_value]
                         )
+                        surrogate_slice_perimeter_thickness = st.slider(
+                            "Highlighted slice perimeter thickness",
+                            min_value=1,
+                            max_value=10,
+                            value=3,
+                            step=1,
+                            key=f"{slice_plot_key}_perimeter_thickness",
+                        )
                         slice_button_label = (
                             "Generate 2D plots for highlighted slices"
                             if len(requested_slice_values) > 1
@@ -18527,6 +20148,9 @@ def render_bo_session_app() -> None:
                                     _apply_slice_perimeter_style(
                                         slice_figure,
                                         slice_color,
+                                        thickness=(
+                                            surrogate_slice_perimeter_thickness
+                                        ),
                                     )
                                     slice_plots.append({
                                         "figure": slice_figure,
@@ -18574,6 +20198,11 @@ def render_bo_session_app() -> None:
                                         f"#### {_metric_label(surrogate_3d_slice_axis)} = "
                                         f"{slice_value_label:g}"
                                     )
+                                _apply_slice_perimeter_style(
+                                    slice_plot["figure"],
+                                    slice_plot.get("slice_color", (1.0, 0.0, 0.0)),
+                                    thickness=surrogate_slice_perimeter_thickness,
+                                )
                                 _render_downloadable_pyplot(
                                     st,
                                     slice_plot["figure"],
@@ -18883,6 +20512,477 @@ def render_bo_session_app() -> None:
             "Matérn-5/2 GP, expected-improvement term, and exploration blend "
             "shown in the optimization metadata tab."
         )
+        loaded_sweep_available = False
+        if loaded_sweep_available:
+            loaded_sweep_metadata = (
+                (full_session.get("state") or {}).get("simulation_metadata") or {}
+            )
+            loaded_sweep_axes = [
+                str(axis)
+                for axis in (
+                    loaded_sweep_metadata.get("axes")
+                    or (full_session.get("state") or {}).get("active_parameters")
+                    or []
+                )
+                if axis is not None
+            ][:3]
+            loaded_sweep_ground_truth = full_session.get("simulation_ground_truth")
+            loaded_sweep_value_column = _simulation_optimum_value_column(
+                loaded_sweep_ground_truth,
+            )
+            loaded_sweep_runs = (
+                _simulation_loaded_sweep_runs(full_session, loaded_sweep_axes)
+                if len(loaded_sweep_axes) == 3 else []
+            )
+            if (
+                len(loaded_sweep_axes) == 3
+                and loaded_sweep_value_column is not None
+                and loaded_sweep_runs
+            ):
+                st.markdown("#### Loaded simulated sweep paths")
+                sweep_view_columns = st.columns(5)
+                loaded_sweep_view = sweep_view_columns[0].radio(
+                    "Path view",
+                    ["3D tensor", "2D slice"],
+                    horizontal=True,
+                    key="bo_loaded_sim_sweep_path_view",
+                )
+                background_channel = None
+                background_label = "Average all channel tensors"
+                if (
+                    loaded_sweep_ground_truth is not None
+                    and not loaded_sweep_ground_truth.empty
+                    and "ground_truth_channel" in loaded_sweep_ground_truth.columns
+                ):
+                    background_channels = sorted(
+                        loaded_sweep_ground_truth[
+                            "ground_truth_channel"
+                        ].dropna().astype(str).unique(),
+                        key=_channel_sort_key,
+                    )
+                    background_options = [
+                        "Average all channel tensors",
+                        *[f"Channel {channel}" for channel in background_channels],
+                    ]
+                    background_label = sweep_view_columns[1].selectbox(
+                        "Tensor background",
+                        background_options,
+                        key="bo_loaded_sim_sweep_background_channel",
+                    )
+                    if background_label != "Average all channel tensors":
+                        background_channel = background_label.removeprefix(
+                            "Channel "
+                        )
+                else:
+                    sweep_view_columns[1].caption(
+                        "Tensor background: saved ground truth"
+                    )
+                loaded_sweep_line_width = int(sweep_view_columns[2].slider(
+                    "Path line width",
+                    min_value=1,
+                    max_value=10,
+                    value=4,
+                    step=1,
+                    key="bo_loaded_sim_sweep_line_width",
+                ))
+                loaded_sweep_marker_size = int(sweep_view_columns[3].slider(
+                    "Path marker size",
+                    min_value=3,
+                    max_value=14,
+                    value=6,
+                    step=1,
+                    key="bo_loaded_sim_sweep_marker_size",
+                ))
+                loaded_sweep_value_label = str(
+                    loaded_sweep_metadata.get("value_label")
+                    or loaded_sweep_value_column
+                )
+                loaded_sweep_grid = _simulation_ground_truth_grid(
+                    loaded_sweep_ground_truth,
+                    loaded_sweep_axes,
+                    value_column=loaded_sweep_value_column,
+                    background_channel=background_channel,
+                )
+                if loaded_sweep_grid.empty:
+                    st.info(
+                        "The loaded simulated sweep does not include a usable "
+                        "ground-truth tensor for this background selection."
+                    )
+                else:
+                    loaded_sim_x, loaded_sim_y, loaded_sim_z = loaded_sweep_axes
+                    empty_observed = pd.DataFrame(columns=[
+                        "iteration",
+                        loaded_sim_x,
+                        loaded_sim_y,
+                        loaded_sim_z,
+                        "value",
+                    ])
+                    loaded_sweep_gif_context = None
+                    if loaded_sweep_view == "3D tensor":
+                        loaded_sweep_figure = _plot_interpolated_3d_landscape(
+                            empty_observed,
+                            loaded_sweep_grid,
+                            loaded_sweep_value_label,
+                            loaded_sim_x,
+                            loaded_sim_y,
+                            loaded_sim_z,
+                            tensor_height=plot_3d_height,
+                            dot_size=plot_dot_size,
+                            dot_opacity=plot_dot_opacity,
+                        )
+                        _add_simulation_sweep_paths(
+                            loaded_sweep_figure,
+                            loaded_sweep_runs,
+                            loaded_sim_x,
+                            loaded_sim_y,
+                            loaded_sim_z,
+                            line_width=loaded_sweep_line_width,
+                            marker_size=loaded_sweep_marker_size,
+                        )
+                        loaded_sweep_figure.update_layout(
+                            title=(
+                                "Loaded simulated sweep paths"
+                                f"<br>{background_label}"
+                            )
+                        )
+                        _render_downloadable_plotly(
+                            st,
+                            loaded_sweep_figure,
+                            key=(
+                                "bo_loaded_sim_sweep_all_paths_3d_"
+                                f"{selected_session_folder}"
+                            ),
+                            file_stem="loaded_simulated_sweep_all_paths_3d",
+                            width_percent=plot_width_percent,
+                            export_height=plot_3d_height,
+                            camera_storage_key=(
+                                "loaded_sim_sweep_all_paths_"
+                                f"{selected_session_folder}"
+                            ),
+                            eager_png=False,
+                        )
+                        loaded_sweep_gif_context = {
+                            "view": "3D tensor",
+                            "plot_axes": [loaded_sim_x, loaded_sim_y, loaded_sim_z],
+                            "slice_axis": None,
+                            "slice_value": None,
+                            "export_width": max(
+                                500,
+                                int(1200 * plot_width_percent / 100),
+                            ),
+                            "export_height": plot_3d_height,
+                            "camera_storage_key": (
+                                "loaded_sim_sweep_all_paths_"
+                                f"{selected_session_folder}"
+                            ),
+                            "file_stem": "loaded_simulated_sweep_all_paths_3d",
+                            "title_note": background_label,
+                        }
+                    else:
+                        slice_axis_options = list(loaded_sweep_axes)
+                        _preserve_valid_widget_value(
+                            "bo_loaded_sim_sweep_slice_axis",
+                            slice_axis_options,
+                            loaded_sim_z,
+                        )
+                        slice_axis = sweep_view_columns[4].selectbox(
+                            "Slice axis",
+                            slice_axis_options,
+                            format_func=_metric_label,
+                            key="bo_loaded_sim_sweep_slice_axis",
+                        )
+                        slice_values = _numeric_slice_values(
+                            loaded_sweep_grid,
+                            slice_axis,
+                        )
+                        if not slice_values:
+                            st.info("No slice values are available for this axis.")
+                        else:
+                            _preserve_valid_widget_value(
+                                "bo_loaded_sim_sweep_slice_value",
+                                slice_values,
+                                slice_values[0],
+                            )
+                            slice_value = float(st.selectbox(
+                                f"Slice {_metric_label(slice_axis)}",
+                                slice_values,
+                                format_func=lambda value: f"{float(value):g}",
+                                key="bo_loaded_sim_sweep_slice_value",
+                            ))
+                            slice_plot_axes = [
+                                axis for axis in loaded_sweep_axes
+                                if axis != slice_axis
+                            ]
+                            loaded_sweep_figure = _plot_interpolated_2d_slice(
+                                empty_observed,
+                                loaded_sweep_grid,
+                                loaded_sweep_value_label,
+                                slice_plot_axes[0],
+                                slice_plot_axes[1],
+                                slice_axis,
+                                slice_value,
+                            )
+                            _add_simulation_sweep_paths(
+                                loaded_sweep_figure,
+                                loaded_sweep_runs,
+                                slice_plot_axes[0],
+                                slice_plot_axes[1],
+                                None,
+                                slice_axis=slice_axis,
+                                slice_value=slice_value,
+                                line_width=loaded_sweep_line_width,
+                                marker_size=loaded_sweep_marker_size,
+                            )
+                            loaded_sweep_figure.update_layout(
+                                title=(
+                                    "Loaded simulated sweep paths"
+                                    f"<br>{background_label} | "
+                                    f"{_numeric_slice_title_note(slice_axis, slice_value)}"
+                                )
+                            )
+                            sweep_export_width = max(
+                                500,
+                                int(1200 * plot_width_percent / 100),
+                            )
+                            sweep_export_height = max(
+                                320,
+                                int(round(
+                                    sweep_export_width
+                                    / SURROGATE_2D_FIGURE_ASPECT
+                                )),
+                            )
+                            _apply_plotly_2d_slice_aspect(
+                                loaded_sweep_figure,
+                                width=sweep_export_width,
+                                height=sweep_export_height,
+                            )
+                            _render_downloadable_plotly(
+                                st,
+                                loaded_sweep_figure,
+                                key=(
+                                    "bo_loaded_sim_sweep_all_paths_2d_"
+                                    f"{selected_session_folder}_{slice_axis}_"
+                                    f"{slice_value:g}"
+                                ),
+                                file_stem=(
+                                    "loaded_simulated_sweep_all_paths_2d_"
+                                    f"{slice_axis}_{slice_value:g}"
+                                ),
+                                width_percent=plot_width_percent,
+                                export_width=sweep_export_width,
+                                export_height=sweep_export_height,
+                            )
+                            loaded_sweep_gif_context = {
+                                "view": "2D slice",
+                                "plot_axes": slice_plot_axes,
+                                "slice_axis": slice_axis,
+                                "slice_value": slice_value,
+                                "export_width": sweep_export_width,
+                                "export_height": sweep_export_height,
+                                "camera_storage_key": None,
+                                "file_stem": (
+                                    "loaded_simulated_sweep_all_paths_2d_"
+                                    f"{slice_axis}_{slice_value:g}"
+                                ),
+                                "title_note": (
+                                    f"{background_label} | "
+                                    f"{_numeric_slice_title_note(slice_axis, slice_value)}"
+                                ),
+                            }
+                    if loaded_sweep_gif_context is not None:
+                        st.markdown("##### Loaded simulated sweep path GIF")
+                        gif_columns = st.columns(3)
+                        loaded_sweep_gif_duration = int(gif_columns[0].slider(
+                            "GIF frame duration",
+                            min_value=100,
+                            max_value=2000,
+                            value=400,
+                            step=100,
+                            format="%d ms",
+                            key="bo_loaded_sim_sweep_gif_duration",
+                        ))
+                        loaded_sweep_gif_iterations = sorted({
+                            int(iteration)
+                            for run in loaded_sweep_runs
+                            for iteration in pd.to_numeric(
+                                run["history"].get("iteration", pd.Series(dtype=float)),
+                                errors="coerce",
+                            ).dropna()
+                        })
+                        gif_columns[1].metric(
+                            "GIF frames",
+                            len(loaded_sweep_gif_iterations),
+                        )
+                        gif_columns[2].caption(
+                            "Each frame includes all channel paths through that iteration."
+                        )
+                        loaded_sweep_gif_key = (
+                            "bo_loaded_sim_sweep_paths_gif_"
+                            f"{selected_session_folder}_"
+                            f"{loaded_sweep_gif_context['view']}_"
+                            f"{loaded_sweep_gif_context['slice_axis']}_"
+                            f"{loaded_sweep_gif_context['slice_value']}"
+                        )
+
+                        def loaded_sweep_path_frame(max_iteration: int) -> go.Figure:
+                            frame_runs = []
+                            for run in loaded_sweep_runs:
+                                history = run["history"]
+                                filtered_history = history.loc[
+                                    pd.to_numeric(
+                                        history["iteration"],
+                                        errors="coerce",
+                                    )
+                                    <= int(max_iteration)
+                                ].copy()
+                                if filtered_history.empty:
+                                    continue
+                                frame_run = dict(run)
+                                frame_run["history"] = filtered_history
+                                frame_runs.append(frame_run)
+                            if loaded_sweep_gif_context["view"] == "3D tensor":
+                                frame_figure = _plot_interpolated_3d_landscape(
+                                    empty_observed,
+                                    loaded_sweep_grid,
+                                    loaded_sweep_value_label,
+                                    loaded_sim_x,
+                                    loaded_sim_y,
+                                    loaded_sim_z,
+                                    tensor_height=plot_3d_height,
+                                    dot_size=plot_dot_size,
+                                    dot_opacity=plot_dot_opacity,
+                                )
+                                _add_simulation_sweep_paths(
+                                    frame_figure,
+                                    frame_runs,
+                                    loaded_sim_x,
+                                    loaded_sim_y,
+                                    loaded_sim_z,
+                                    line_width=loaded_sweep_line_width,
+                                    marker_size=loaded_sweep_marker_size,
+                                )
+                            else:
+                                frame_figure = _plot_interpolated_2d_slice(
+                                    empty_observed,
+                                    loaded_sweep_grid,
+                                    loaded_sweep_value_label,
+                                    loaded_sweep_gif_context["plot_axes"][0],
+                                    loaded_sweep_gif_context["plot_axes"][1],
+                                    loaded_sweep_gif_context["slice_axis"],
+                                    loaded_sweep_gif_context["slice_value"],
+                                )
+                                _add_simulation_sweep_paths(
+                                    frame_figure,
+                                    frame_runs,
+                                    loaded_sweep_gif_context["plot_axes"][0],
+                                    loaded_sweep_gif_context["plot_axes"][1],
+                                    None,
+                                    slice_axis=loaded_sweep_gif_context["slice_axis"],
+                                    slice_value=loaded_sweep_gif_context["slice_value"],
+                                    line_width=loaded_sweep_line_width,
+                                    marker_size=loaded_sweep_marker_size,
+                                )
+                                _apply_plotly_2d_slice_aspect(
+                                    frame_figure,
+                                    width=loaded_sweep_gif_context["export_width"],
+                                    height=loaded_sweep_gif_context["export_height"],
+                                )
+                            frame_figure.update_layout(
+                                title=(
+                                    "Loaded simulated sweep paths"
+                                    f"<br>{loaded_sweep_gif_context['title_note']} | "
+                                    f"Iteration {int(max_iteration)}"
+                                )
+                            )
+                            return frame_figure
+
+                        if st.button(
+                            "Generate loaded simulated sweep GIF",
+                            key=f"{loaded_sweep_gif_key}_button",
+                            disabled=not loaded_sweep_gif_iterations,
+                        ):
+                            progress = st.progress(
+                                0.0,
+                                text="Preparing loaded simulated sweep GIF...",
+                            )
+                            try:
+                                plotly_camera = None
+                                camera_key = loaded_sweep_gif_context[
+                                    "camera_storage_key"
+                                ]
+                                if camera_key:
+                                    plotly_camera = _stored_plotly_camera(camera_key)
+
+                                def gif_frames():
+                                    for frame_iteration in loaded_sweep_gif_iterations:
+                                        yield loaded_sweep_path_frame(frame_iteration)
+
+                                gif_bytes = _figures_to_gif(
+                                    gif_frames(),
+                                    loaded_sweep_gif_duration,
+                                    plotly_width=loaded_sweep_gif_context[
+                                        "export_width"
+                                    ],
+                                    plotly_height=loaded_sweep_gif_context[
+                                        "export_height"
+                                    ],
+                                    plotly_camera=plotly_camera,
+                                    total_frames=len(loaded_sweep_gif_iterations),
+                                    progress_callback=(
+                                        lambda current, total:
+                                        progress.progress(
+                                            current / max(1, total),
+                                            text=(
+                                                "Encoding loaded simulated sweep GIF: "
+                                                f"frame {current}/{total}"
+                                            ),
+                                        )
+                                    ),
+                                )
+                                st.session_state[loaded_sweep_gif_key] = gif_bytes
+                                progress.progress(
+                                    1.0,
+                                    text="Loaded simulated sweep GIF complete.",
+                                )
+                            except Exception as exc:
+                                st.session_state.pop(loaded_sweep_gif_key, None)
+                                progress.empty()
+                                st.error(
+                                    "Loaded simulated sweep GIF generation failed: "
+                                    f"{exc}"
+                                )
+                        loaded_sweep_gif = st.session_state.get(
+                            loaded_sweep_gif_key
+                        )
+                        if loaded_sweep_gif:
+                            st.image(loaded_sweep_gif)
+                            st.download_button(
+                                "Download loaded simulated sweep GIF",
+                                data=loaded_sweep_gif,
+                                file_name=(
+                                    f"{loaded_sweep_gif_context['file_stem']}.gif"
+                                ),
+                                mime="image/gif",
+                                key=f"{loaded_sweep_gif_key}_download",
+                            )
+                with st.expander("Loaded simulated sweep path rows"):
+                    st.dataframe(
+                        _simulation_history_display_frame(
+                            pd.concat(
+                                [
+                                    run["history"].assign(
+                                        channel=run.get("channel"),
+                                        path_label=run.get("label"),
+                                    )
+                                    for run in loaded_sweep_runs
+                                ],
+                                ignore_index=True,
+                            )
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                st.divider()
         sim_source_options = [
             "Interpolate loaded real observations",
             "Upload ground-truth CSV",
@@ -18907,6 +21007,8 @@ def render_bo_session_app() -> None:
         sim_x = sim_y = sim_z = None
         sim_value_column = "ground_truth_value"
         sim_value_label = "Fitness"
+        sim_per_channel_ground_truths = False
+        sim_per_channel_repeats = 1
         if sim_source == "Upload ground-truth CSV":
             uploaded_landscape = st.file_uploader(
                 "Ground-truth tensor CSV",
@@ -19034,7 +21136,7 @@ def render_bo_session_app() -> None:
             if not sim_metric_options:
                 st.info("No real-data metrics are available for simulation.")
             else:
-                sim_controls = st.columns(4)
+                sim_controls = st.columns(5)
                 _preserve_valid_widget_value(
                     "bo_sim_real_metric",
                     sim_metric_options,
@@ -19045,7 +21147,6 @@ def render_bo_session_app() -> None:
                     sim_metric_options,
                     key="bo_sim_real_metric",
                 )
-                sim_value_label = sim_metric
                 sim_phase_options = (
                     ["measurement"]
                     if sim_metric == "Paired Q"
@@ -19058,11 +21159,25 @@ def render_bo_session_app() -> None:
                     sim_phase_options,
                     "measurement" if "measurement" in sim_phase_options else sim_phase_options[0],
                 )
+                def sim_phase_label(phase_name: str) -> str:
+                    if paired_objective and sim_metric != "Paired Q":
+                        return f"{str(phase_name).title()} {sim_metric}"
+                    return str(phase_name).title()
+
                 sim_phase = sim_controls[1].selectbox(
-                    "Metric phase",
+                    (
+                        f"{sim_metric} source"
+                        if paired_objective and sim_metric != "Paired Q"
+                        else "Metric phase"
+                    ),
                     sim_phase_options,
-                    format_func=str.title,
+                    format_func=sim_phase_label,
                     key="bo_sim_real_phase",
+                )
+                sim_value_label = (
+                    sim_phase_label(sim_phase)
+                    if paired_objective and sim_metric != "Paired Q"
+                    else sim_metric
                 )
                 sim_channel_options = _real_data_channels(group_scoped_observations)
                 sim_channels_key = "bo_sim_real_channels"
@@ -19091,11 +21206,46 @@ def render_bo_session_app() -> None:
                 else:
                     sim_selected_channels = []
                     sim_controls[2].caption("No channel metrics found.")
-                sim_average_channels = sim_controls[3].checkbox(
+                sim_per_channel_ground_truths = sim_controls[3].checkbox(
+                    "Per-channel ground truths",
+                    value=False,
+                    key="bo_sim_per_channel_ground_truths",
+                    disabled=not sim_selected_channels,
+                    help=(
+                        "Build one separate 3D ground-truth tensor per selected "
+                        "channel, then run the selected BO simulation mode on "
+                        "each tensor."
+                    ),
+                )
+                sim_average_channels = sim_controls[4].checkbox(
                     "Average selected channels",
                     value=True,
                     key="bo_sim_average_channels",
+                    disabled=sim_per_channel_ground_truths,
                 )
+                if sim_per_channel_ground_truths:
+                    sim_average_channels = False
+                    repeat_columns = st.columns([1, 3])
+                    sim_per_channel_repeats = int(repeat_columns[0].number_input(
+                        "Runs per channel",
+                        min_value=1,
+                        max_value=1000,
+                        value=3,
+                        step=1,
+                        key="bo_sim_per_channel_repeats",
+                    ))
+                    per_channel_total = (
+                        len(sim_selected_channels) * sim_per_channel_repeats
+                    )
+                    repeat_columns[1].caption(
+                        "Each selected channel gets its own interpolated "
+                        "ground-truth tensor. The selected simulation mode runs "
+                        "on every channel tensor."
+                    )
+                    st.caption(
+                        f"Selected channels: {len(sim_selected_channels)}. "
+                        f"Minimum planned simulations: {per_channel_total}."
+                    )
                 raw_cache_key = (
                     str(selected_session_folder),
                     str(selected_observation_group_scope),
@@ -19103,6 +21253,7 @@ def render_bo_session_app() -> None:
                     sim_phase,
                     tuple(map(str, sim_selected_channels)),
                     bool(sim_average_channels),
+                    bool(sim_per_channel_ground_truths),
                     len(group_scoped_observations),
                     len(full_session.get("observations") or []),
                 )
@@ -19323,7 +21474,11 @@ def render_bo_session_app() -> None:
                         elif grid_frame.empty:
                             st.warning("No ground-truth grid rows were generated.")
                         else:
-                            sim_value_label = sim_metric
+                            sim_value_label = (
+                                sim_phase_label(sim_phase)
+                                if paired_objective and sim_metric != "Paired Q"
+                                else sim_metric
+                            )
                             sim_source_points = valid_points
                             sim_ground_truth = grid_frame.rename(
                                 columns={"interpolated_value": sim_value_column}
@@ -19392,7 +21547,6 @@ def render_bo_session_app() -> None:
                     "Initial maximin sweep",
                     "GP falloff sweep",
                     "Multi-parameter sweep",
-                    "Per-channel ground truths",
                 ],
                 horizontal=False,
                 key="bo_sim_run_mode",
@@ -19594,31 +21748,7 @@ def render_bo_session_app() -> None:
                     "seed determine the first point."
                 ),
             )
-            sim_per_channel_repeats = 1
-            if sim_run_mode == "Per-channel ground truths":
-                per_channel_columns = setup_columns[1].columns([1, 3])
-                sim_per_channel_repeats = int(per_channel_columns[0].number_input(
-                    "Runs per channel",
-                    min_value=1,
-                    max_value=1000,
-                    value=3,
-                    step=1,
-                    key="bo_sim_per_channel_repeats",
-                ))
-                per_channel_columns[1].caption(
-                    "Builds one ground-truth tensor for each selected channel, "
-                    "then runs the same BO settings repeatedly on each tensor."
-                )
-                per_channel_total = (
-                    len(locals().get("sim_selected_channels", []) or [])
-                    * sim_per_channel_repeats
-                )
-                st.caption(
-                    f"Selected channels: {len(locals().get('sim_selected_channels', []) or [])}. "
-                    f"Planned simulations: {per_channel_total}."
-                )
-                exploration_sweep_text = ""
-            elif sim_run_mode == "Multi-parameter sweep":
+            if sim_run_mode == "Multi-parameter sweep":
                 multi_columns = setup_columns[1].columns(4)
                 multi_exploration_text = multi_columns[0].text_input(
                     "Explore weights",
@@ -19834,9 +21964,10 @@ def render_bo_session_app() -> None:
                     sim_source,
                     sim_value_label,
                     locals().get("sim_phase", ""),
-                    tuple(map(str, locals().get("sim_selected_channels", []) or [])),
-                    bool(locals().get("sim_average_channels", False)),
-                    sim_x,
+                        tuple(map(str, locals().get("sim_selected_channels", []) or [])),
+                        bool(locals().get("sim_average_channels", False)),
+                        bool(locals().get("sim_per_channel_ground_truths", False)),
+                        sim_x,
                     sim_y,
                     sim_z,
                     int(locals().get("sim_resolution", 0) or 0),
@@ -19848,7 +21979,7 @@ def render_bo_session_app() -> None:
                     int(sim_trace_nearest),
                     sim_initial_mode,
                     sim_run_mode,
-                    int(locals().get("sim_per_channel_repeats", 1)),
+                        int(locals().get("sim_per_channel_repeats", 1)),
                     sim_falloff_sweep_parameter,
                     exploration_sweep_text,
                     int(sim_initial),
@@ -20014,7 +22145,7 @@ def render_bo_session_app() -> None:
                     else "Run multi-parameter sweep"
                     if sim_run_mode == "Multi-parameter sweep"
                     else "Run per-channel simulations"
-                    if sim_run_mode == "Per-channel ground truths"
+                    if sim_per_channel_ground_truths
                     else "Run simulated BO"
                 ),
                 key=f"{run_key}_button",
@@ -20024,7 +22155,7 @@ def render_bo_session_app() -> None:
                     st.session_state.pop(write_status_key, None)
                     if (
                         sim_ground_truth.empty
-                        and sim_run_mode != "Per-channel ground truths"
+                        and not sim_per_channel_ground_truths
                     ):
                         progress.progress(
                             0.03,
@@ -20054,7 +22185,11 @@ def render_bo_session_app() -> None:
                             )
                         sim_source_points = valid_points
                         if sim_source == "Interpolate loaded real observations":
-                            sim_value_label = sim_metric
+                            sim_value_label = (
+                                sim_phase_label(sim_phase)
+                                if paired_objective and sim_metric != "Paired Q"
+                                else sim_metric
+                            )
                         sim_ground_truth = grid_frame.rename(
                             columns={"interpolated_value": sim_value_column}
                         )
@@ -20099,7 +22234,14 @@ def render_bo_session_app() -> None:
                             })
                     elif sim_run_mode == "Multi-parameter sweep":
                         run_specs = parse_multi_sweep(exploration_sweep_text)
-                    elif sim_run_mode == "Per-channel ground truths":
+                    else:
+                        run_specs = [{
+                            "exploration": sim_exploration,
+                            "initial_random_points": sim_initial,
+                            "falloff_fractions": dict(sim_falloffs),
+                            "sweep_value": None,
+                        }]
+                    if sim_per_channel_ground_truths:
                         if sim_source != "Interpolate loaded real observations":
                             raise ValueError(
                                 "Per-channel ground truths require loaded real observations."
@@ -20108,10 +22250,12 @@ def render_bo_session_app() -> None:
                             raise ValueError(
                                 "Select at least one channel for per-channel ground truths."
                             )
+                        base_run_specs = list(run_specs)
                         run_specs = []
                         channel_ground_truth_frames = []
                         channel_source_frames = []
                         total_channel_models = max(1, len(sim_selected_channels))
+                        total_base_specs = max(1, len(base_run_specs))
                         for channel_index, channel in enumerate(
                             map(str, sim_selected_channels),
                             start=1,
@@ -20162,23 +22306,48 @@ def render_bo_session_app() -> None:
                             valid_points["ground_truth_channel"] = channel
                             channel_ground_truth_frames.append(channel_ground_truth)
                             channel_source_frames.append(valid_points)
-                            for repeat_index in range(1, sim_per_channel_repeats + 1):
-                                run_specs.append({
-                                    "exploration": sim_exploration,
-                                    "initial_random_points": sim_initial,
-                                    "falloff_fractions": dict(sim_falloffs),
-                                    "repeat_index": repeat_index,
-                                    "repeat_count": sim_per_channel_repeats,
-                                    "seed": (
-                                        sim_seed
-                                        + (channel_index - 1) * sim_per_channel_repeats
-                                        + repeat_index
-                                        - 1
-                                    ),
-                                    "sweep_value": channel,
-                                    "ground_truth_channel": channel,
-                                    "ground_truth": channel_ground_truth,
-                                })
+                            for spec_index, base_spec in enumerate(base_run_specs):
+                                for channel_repeat_index in range(
+                                    1,
+                                    sim_per_channel_repeats + 1,
+                                ):
+                                    expanded_spec = dict(base_spec)
+                                    base_seed = base_spec.get("seed")
+                                    if base_seed is None:
+                                        expanded_seed = (
+                                            sim_seed
+                                            + (
+                                                channel_index - 1
+                                            )
+                                            * total_base_specs
+                                            * sim_per_channel_repeats
+                                            + spec_index
+                                            * sim_per_channel_repeats
+                                            + channel_repeat_index
+                                            - 1
+                                        )
+                                    else:
+                                        expanded_seed = (
+                                            int(base_seed)
+                                            + (
+                                                channel_index - 1
+                                            )
+                                            * sim_per_channel_repeats
+                                            + channel_repeat_index
+                                            - 1
+                                        )
+                                    expanded_spec.update({
+                                        "channel_repeat_index": (
+                                            channel_repeat_index
+                                        ),
+                                        "channel_repeat_count": (
+                                            sim_per_channel_repeats
+                                        ),
+                                        "seed": expanded_seed,
+                                        "ground_truth_channel": channel,
+                                        "ground_truth": channel_ground_truth,
+                                    })
+                                    run_specs.append(expanded_spec)
                         sim_ground_truth = pd.concat(
                             channel_ground_truth_frames,
                             ignore_index=True,
@@ -20187,14 +22356,11 @@ def render_bo_session_app() -> None:
                             channel_source_frames,
                             ignore_index=True,
                         )
-                        sim_value_label = sim_metric
-                    else:
-                        run_specs = [{
-                            "exploration": sim_exploration,
-                            "initial_random_points": sim_initial,
-                            "falloff_fractions": dict(sim_falloffs),
-                            "sweep_value": None,
-                        }]
+                        sim_value_label = (
+                            sim_phase_label(sim_phase)
+                            if paired_objective and sim_metric != "Paired Q"
+                            else sim_metric
+                        )
                     simulation_settings = {
                         "iterations": sim_iterations,
                         "initial_random_points": sim_initial,
@@ -20209,18 +22375,21 @@ def render_bo_session_app() -> None:
                         "ground_truth_log_frequency": bool(
                             locals().get("sim_log_frequency", False)
                         ),
-                        "ground_truth_metric": sim_value_label,
-                        "ground_truth_phase": locals().get("sim_phase"),
-                        "ground_truth_channels": list(map(
-                            str,
-                            locals().get("sim_selected_channels", []) or [],
-                        )),
-                        "ground_truth_average_channels": bool(
-                            locals().get("sim_average_channels", False)
-                        ),
-                        "per_channel_ground_truth_repeats": int(
-                            locals().get("sim_per_channel_repeats", 1)
-                        ),
+                            "ground_truth_metric": sim_value_label,
+                            "ground_truth_phase": locals().get("sim_phase"),
+                            "ground_truth_channels": list(map(
+                                str,
+                                locals().get("sim_selected_channels", []) or [],
+                            )),
+                            "ground_truth_average_channels": bool(
+                                locals().get("sim_average_channels", False)
+                            ),
+                            "per_channel_ground_truths": bool(
+                                locals().get("sim_per_channel_ground_truths", False)
+                            ),
+                            "per_channel_ground_truth_repeats": int(
+                                locals().get("sim_per_channel_repeats", 1)
+                            ),
                         "fidelity": sim_fidelity,
                         "initial_point_mode": sim_initial_mode,
                         "trace_channels": list(map(str, sim_trace_channels)),
@@ -20282,6 +22451,12 @@ def render_bo_session_app() -> None:
                         run_falloff_value = run_spec.get("gp_falloff_value")
                         run_repeat_index = run_spec.get("repeat_index")
                         run_repeat_count = run_spec.get("repeat_count")
+                        run_channel_repeat_index = run_spec.get(
+                            "channel_repeat_index"
+                        )
+                        run_channel_repeat_count = run_spec.get(
+                            "channel_repeat_count"
+                        )
                         run_ground_truth_channel = run_spec.get("ground_truth_channel")
                         run_ground_truth = run_spec.get("ground_truth")
                         if run_ground_truth is None or run_ground_truth.empty:
@@ -20314,16 +22489,25 @@ def render_bo_session_app() -> None:
                                 f"initial={run_initial_points:g}"
                                 f"{falloff_part}{repeat_part}"
                             )
-                        elif sim_run_mode == "Per-channel ground truths":
-                            repeat_part = (
-                                f" rep {int(run_repeat_index)}/{int(run_repeat_count)}"
-                                if run_repeat_index and run_repeat_count
-                                else f" rep {replicate_index}"
-                            )
-                            run_label = f"Ch {run_ground_truth_channel}{repeat_part}"
                         else:
                             run_label = f"explore={exploration_value:g}"
-                        if replicate_total > 1 and sim_run_mode != "Multi-parameter sweep":
+                        if run_ground_truth_channel is not None:
+                            run_label = f"Ch {run_ground_truth_channel} | {run_label}"
+                            if (
+                                run_channel_repeat_index
+                                and run_channel_repeat_count
+                                and int(run_channel_repeat_count) > 1
+                            ):
+                                run_label = (
+                                    f"{run_label} channel rep "
+                                    f"{int(run_channel_repeat_index)}/"
+                                    f"{int(run_channel_repeat_count)}"
+                                )
+                        if (
+                            replicate_total > 1
+                            and sim_run_mode != "Multi-parameter sweep"
+                            and run_ground_truth_channel is None
+                        ):
                             run_label = f"{run_label} rep {replicate_index}"
                         progress.progress(
                             _progress_fraction(
@@ -20579,20 +22763,21 @@ def render_bo_session_app() -> None:
                             "GP falloff",
                             "Ground-truth channel",
                         ]
-                        comparison_default_color = (
-                            "GP falloff"
-                            if sim_result.get("mode") in {
-                                "GP falloff sweep",
-                                "Multi-parameter sweep",
-                            }
-                            else "Ground-truth channel"
-                            if sim_result.get("mode") == "Per-channel ground truths"
-                            else "Initial maximin points"
-                            if sim_result.get("mode") == "Initial maximin sweep"
-                            else "Explore weight"
-                            if sim_result.get("mode") == "Exploration sweep"
-                            else "Default"
-                        )
+                        if (sim_result.get("settings") or {}).get(
+                            "per_channel_ground_truths"
+                        ):
+                            comparison_default_color = "Ground-truth channel"
+                        elif sim_result.get("mode") in {
+                            "GP falloff sweep",
+                            "Multi-parameter sweep",
+                        }:
+                            comparison_default_color = "GP falloff"
+                        elif sim_result.get("mode") == "Initial maximin sweep":
+                            comparison_default_color = "Initial maximin points"
+                        elif sim_result.get("mode") == "Exploration sweep":
+                            comparison_default_color = "Explore weight"
+                        else:
+                            comparison_default_color = "Default"
                         comparison_color_key = f"{run_key}_comparison_color_by"
                         _preserve_valid_widget_value(
                             comparison_color_key,
@@ -20763,11 +22948,14 @@ def render_bo_session_app() -> None:
                         key=f"{run_key}_ground_truth_download",
                     )
                     st.markdown("#### Write simulated BO session")
+                    per_channel_simulation_export = (
+                        bool((sim_result.get("settings") or {}).get(
+                            "per_channel_ground_truths"
+                        ))
+                    )
                     compact_only_simulation_export = (
                         sim_result.get("mode") == "Multi-parameter sweep"
-                    )
-                    per_channel_simulation_export = (
-                        sim_result.get("mode") == "Per-channel ground truths"
+                        and not per_channel_simulation_export
                     )
                     if compact_only_simulation_export:
                         write_scope_options = ["Compact sweep summary"]
