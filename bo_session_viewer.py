@@ -620,6 +620,83 @@ def _channel_group_optimization_metadata(
     return metadata
 
 
+def _metadata_family_value_token(value: Any) -> str:
+    numeric = _finite_float(value)
+    if numeric is not None:
+        return f"{numeric:.12g}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_")
+
+
+def _metadata_family_value_label(value: Any) -> str:
+    numeric = _finite_float(value)
+    if numeric is not None:
+        return f"{numeric:g}"
+    return str(value)
+
+
+def _observation_group_family_options(
+    metadata: list[dict],
+    available_group_ids: set[int],
+) -> dict[str, dict]:
+    families: dict[tuple[str, str, str], set[int]] = {}
+
+    def add_family(kind: str, label: str, value: Any, group_id: Any) -> None:
+        numeric_group_id = _finite_float(group_id)
+        if numeric_group_id is None:
+            return
+        group_int = int(numeric_group_id)
+        if group_int not in available_group_ids:
+            return
+        numeric_value = _finite_float(value)
+        if numeric_value is None:
+            return
+        token = _metadata_family_value_token(numeric_value)
+        families.setdefault((kind, label, token), set()).add(group_int)
+
+    for item in metadata:
+        group_id = item.get("id")
+        add_family(
+            "exploration",
+            f"Explore weight = {_metadata_family_value_label(item.get('exploration'))}",
+            item.get("exploration"),
+            group_id,
+        )
+        add_family(
+            "initial",
+            (
+                "Initial maximin points = "
+                f"{_metadata_family_value_label(item.get('n_initial_points'))}"
+            ),
+            item.get("n_initial_points"),
+            group_id,
+        )
+        for parameter, value in (item.get("gp_falloff_fractions") or {}).items():
+            add_family(
+                f"gp_falloff:{parameter}",
+                (
+                    f"{_metric_label(parameter)} GP falloff = "
+                    f"{_metadata_family_value_label(value)}"
+                ),
+                value,
+                group_id,
+            )
+
+    options: dict[str, dict] = {}
+    for (kind, label, token), group_ids in sorted(
+        families.items(),
+        key=lambda entry: (entry[0][0], entry[0][1], entry[0][2]),
+    ):
+        if not group_ids:
+            continue
+        key = f"family:{kind}:{token}"
+        sorted_ids = sorted(group_ids)
+        options[key] = {
+            "ids": sorted_ids,
+            "label": f"{label} ({len(sorted_ids)} groups)",
+        }
+    return options
+
+
 def _observation_table(session: dict) -> pd.DataFrame:
     def add_best_q_column(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty or "Q_run" not in frame.columns:
@@ -13159,34 +13236,96 @@ def render_bo_session_app() -> None:
     observation_group_ids = sorted({
         int(obs.get("group_id", 1)) for obs in observations
     })
+    observation_group_metadata = _channel_group_optimization_metadata(
+        full_session,
+        groups,
+    )
+    observation_group_family_options = _observation_group_family_options(
+        observation_group_metadata,
+        set(observation_group_ids),
+    )
+    session_metadata = (full_session.get("state") or {}).get("simulation_metadata") or {}
+    session_records = (
+        (full_session.get("config") or {}).get("records")
+        if isinstance(full_session.get("config"), dict)
+        else {}
+    ) or {}
+    compact_simulation_session = bool(
+        session_metadata.get("compact_export")
+        or session_records.get("compact_simulation_export")
+    )
     observation_selector_columns = st.columns(2)
     with observation_selector_columns[0]:
-        observation_group_options = ["all", *observation_group_ids]
-        _preserve_valid_widget_value(
-            "bo_observation_group_scope",
-            observation_group_options,
+        observation_group_options = [
             "all",
+            *observation_group_family_options.keys(),
+            *observation_group_ids,
+        ]
+        default_observation_group_scope = (
+            next(iter(observation_group_family_options), None)
+            or (observation_group_ids[0] if observation_group_ids else "all")
+            if compact_simulation_session
+            else "all"
         )
-        selected_observation_group_scope = st.selectbox(
-            "Observation group",
-            observation_group_options,
-            format_func=lambda group_id: next(
+        if compact_simulation_session and default_observation_group_scope != "all":
+            compact_default_session_key = "bo_observation_group_scope_compact_session"
+            compact_session_token = str(full_session.get("root") or selected_session_folder)
+            if st.session_state.get(compact_default_session_key) != compact_session_token:
+                st.session_state["bo_observation_group_scope"] = (
+                    default_observation_group_scope
+                )
+                st.session_state["bo_observation_group_scope__preferred"] = (
+                    default_observation_group_scope
+                )
+                st.session_state[compact_default_session_key] = compact_session_token
+
+        def observation_group_scope_label(scope: Any) -> str:
+            if scope == "all":
+                return "All groups"
+            if isinstance(scope, str) and scope in observation_group_family_options:
+                return observation_group_family_options[scope]["label"]
+            return next(
                 (
                     f"{group['name']} (channels "
                     f"{', '.join(map(str, group['channels']))})"
                     for group in groups
-                    if group["id"] == group_id
+                    if int(group["id"]) == int(scope)
                 ),
-                "All groups" if group_id == "all" else f"Group {group_id}",
-            ),
+                f"Group {scope}",
+            )
+
+        _preserve_valid_widget_value(
+            "bo_observation_group_scope",
+            observation_group_options,
+            default_observation_group_scope,
+        )
+        selected_observation_group_scope = st.selectbox(
+            "Observation group",
+            observation_group_options,
+            format_func=observation_group_scope_label,
             key="bo_observation_group_scope",
         )
+    if selected_observation_group_scope == "all":
+        selected_observation_group_ids = set(observation_group_ids)
+    elif (
+        isinstance(selected_observation_group_scope, str)
+        and selected_observation_group_scope in observation_group_family_options
+    ):
+        selected_observation_group_ids = set(
+            observation_group_family_options[
+                selected_observation_group_scope
+            ]["ids"]
+        )
+    else:
+        selected_observation_group_ids = {
+            int(selected_observation_group_scope)
+        }
+    selected_observation_group_scope_label = observation_group_scope_label(
+        selected_observation_group_scope
+    )
     group_scoped_observations = [
         obs for obs in observations
-        if (
-            selected_observation_group_scope == "all"
-            or int(obs.get("group_id", 1)) == int(selected_observation_group_scope)
-        )
+        if int(obs.get("group_id", 1)) in selected_observation_group_ids
     ]
     scoped_iterations = sorted({
         int(obs["iteration"]) for obs in group_scoped_observations
@@ -13479,7 +13618,7 @@ def render_bo_session_app() -> None:
                 errors="coerce",
             )
             trend_history = history.loc[
-                history_group_ids == int(selected_observation_group_scope)
+                history_group_ids.isin(selected_observation_group_ids)
             ].reset_index(drop=True)
         trend_scope_key = str(selected_observation_group_scope)
         available_trend_iterations = pd.to_numeric(
@@ -13562,20 +13701,14 @@ def render_bo_session_app() -> None:
             ]
         channel_metrics = _channel_metric_columns(trend_history)
         if selected_observation_group_scope != "all":
-            selected_trend_group = next(
-                (
-                    group for group in groups
-                    if group["id"] == int(selected_observation_group_scope)
-                ),
-                None,
-            )
+            selected_trend_groups = [
+                group for group in groups
+                if int(group["id"]) in selected_observation_group_ids
+            ]
             configured_channels = {
                 str(channel)
-                for channel in (
-                    selected_trend_group.get("channels", [])
-                    if selected_trend_group is not None
-                    else []
-                )
+                for group in selected_trend_groups
+                for channel in group.get("channels", [])
             }
             if configured_channels:
                 channel_metrics = {
@@ -14046,7 +14179,7 @@ def render_bo_session_app() -> None:
                     _preserve_valid_widget_value(
                         "bo_hp_response_3d_slice_axis",
                         hp_3d_slice_axis_choices,
-                        hp_z,
+                        NO_HIGHLIGHTED_SLICE_LABEL,
                     )
                     hp_3d_slice_axis_choice = slice_control_columns[0].selectbox(
                         "Highlighted slice axis",
@@ -15591,17 +15724,7 @@ def render_bo_session_app() -> None:
     with traces:
         trace_observations = selected_observations
         trace_all_mode = not observation_is_single
-        selected_group_label = (
-            "All groups"
-            if selected_observation_group_scope == "all"
-            else next(
-                (
-                    group["name"] for group in groups
-                    if group["id"] == selected_observation_group_scope
-                ),
-                f"Group {selected_observation_group_scope}",
-            )
-        )
+        selected_group_label = selected_observation_group_scope_label
         selected_iteration_label = (
             "all iterations"
             if selected_iteration_scope == "all"
@@ -15611,8 +15734,7 @@ def render_bo_session_app() -> None:
             f"{selected_group_label} — {selected_iteration_label}"
         )
         qualify_trace_channels = (
-            selected_observation_group_scope == "all"
-            and len({
+            len({
                 int(item.get("group_id", 1))
                 for item in trace_observations
             }) > 1
@@ -16811,7 +16933,7 @@ def render_bo_session_app() -> None:
                     _preserve_valid_widget_value(
                         real_3d_slice_axis_key,
                         real_3d_slice_axis_choices,
-                        real_z,
+                        NO_HIGHLIGHTED_SLICE_LABEL,
                     )
                     real_3d_slice_axis_choice = real_3d_slice_columns[0].selectbox(
                         "Highlighted slice axis",
@@ -18253,7 +18375,7 @@ def render_bo_session_app() -> None:
                                     _preserve_valid_widget_value(
                                         interpolation_slice_axis_key,
                                         interpolation_slice_axis_choices,
-                                        real_z,
+                                        NO_HIGHLIGHTED_SLICE_LABEL,
                                     )
                                     interpolation_slice_axis_choice = (
                                         slice_control_columns[0].selectbox(
@@ -19626,7 +19748,7 @@ def render_bo_session_app() -> None:
                 _preserve_valid_widget_value(
                     surrogate_3d_slice_axis_key,
                     surrogate_3d_slice_axis_choices,
-                    z_name,
+                    NO_HIGHLIGHTED_SLICE_LABEL,
                 )
                 surrogate_3d_slice_axis_choice = slice_control_columns[0].selectbox(
                     "Highlighted slice axis",
@@ -21515,7 +21637,7 @@ def render_bo_session_app() -> None:
                 selected_metadata = next(
                     (
                         item for item in sim_metadata
-                        if int(item["id"]) == int(selected_observation_group_scope)
+                        if int(item["id"]) in selected_observation_group_ids
                     ),
                     None,
                 )
@@ -23228,12 +23350,13 @@ def render_bo_session_app() -> None:
             st.info("No observation groups are available for GIF generation.")
         else:
             gif_group_options = [group["id"] for group in groups]
+            selected_gif_group_candidates = [
+                group_id for group_id in gif_group_options
+                if int(group_id) in selected_observation_group_ids
+            ]
             default_gif_group = (
-                int(selected_observation_group_scope)
-                if (
-                    selected_observation_group_scope != "all"
-                    and int(selected_observation_group_scope) in gif_group_options
-                )
+                selected_gif_group_candidates[0]
+                if selected_gif_group_candidates
                 else gif_group_options[0]
             )
             _preserve_valid_widget_value(
