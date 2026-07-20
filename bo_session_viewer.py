@@ -3409,6 +3409,8 @@ def _plot_real_comparison_3d(
     z_name: str,
     colorscale: str,
     value_range: tuple[float, float] | None = None,
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
 ) -> go.Figure:
     columns = [x_name, y_name, z_name, value_column]
     metadata = [
@@ -3489,6 +3491,15 @@ def _plot_real_comparison_3d(
         hovertemplate="<br>".join(hover_lines) + "<extra></extra>",
         name=value_label,
     ))
+    _add_plotly_slice_plane(
+        fig,
+        valid,
+        x_axis=x_name,
+        y_axis=y_name,
+        z_axis=z_name,
+        slice_axis=slice_axis,
+        slice_value=slice_value,
+    )
     fig.update_layout(
         title=f"{value_label} at cached parameter coordinates",
         scene={
@@ -3501,6 +3512,179 @@ def _plot_real_comparison_3d(
         margin={"l": 0, "r": 0, "t": 45, "b": 0},
     )
     return _apply_plotly_colorbar_height(fig)
+
+
+def _plot_real_comparison_2d_slice(
+    points: pd.DataFrame,
+    *,
+    value_column: str,
+    value_label: str,
+    x_name: str,
+    y_name: str,
+    slice_axis: str,
+    slice_value: float,
+    colorscale: str,
+    value_range: tuple[float, float] | None = None,
+    log_frequency: bool = False,
+) -> go.Figure:
+    columns = [x_name, y_name, slice_axis, value_column]
+    fig = go.Figure()
+    if any(column not in points.columns for column in columns):
+        fig.add_annotation(
+            text="No comparison values are available for this slice.",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        title_note = _numeric_slice_title_note(slice_axis, slice_value)
+        fig.update_layout(
+            title=(
+                f"{value_label} comparison 2D slice"
+                + (f"<br>{title_note}" if title_note else "")
+            ),
+            xaxis_title=x_name,
+            yaxis_title=y_name,
+            height=420,
+            margin={"l": 65, "r": 90, "t": 65, "b": 65},
+        )
+        _apply_plotly_colorbar_height(fig)
+        _apply_plotly_2d_slice_aspect(
+            fig,
+            width=800,
+            height=int(round(800 / SURROGATE_2D_FIGURE_ASPECT)),
+        )
+        return fig
+    available_columns = [column for column in columns if column in points.columns]
+    source = points[available_columns].copy()
+    for column in columns:
+        if column in source.columns:
+            source[column] = pd.to_numeric(source[column], errors="coerce")
+    source = source.dropna(subset=columns)
+    if source.empty:
+        fig.add_annotation(
+            text="No comparison values are available for this slice.",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+    else:
+        working = source.rename(columns={value_column: "value"})
+        axis_ranges = {}
+        for axis_name in (x_name, y_name):
+            axis_values = pd.to_numeric(working[axis_name], errors="coerce")
+            axis_values = axis_values[np.isfinite(axis_values)]
+            if not axis_values.empty:
+                axis_ranges[axis_name] = (
+                    float(axis_values.min()),
+                    float(axis_values.max()),
+                )
+        _valid, grid_frame, _error = _interpolated_3d_grid(
+            working,
+            x_name,
+            y_name,
+            slice_axis,
+            resolution=60,
+            method="rbf",
+            fill_nearest=True,
+            log_frequency=log_frequency,
+            axis_include_values={slice_axis: [float(slice_value)]},
+            axis_ranges=axis_ranges,
+        )
+        slice_grid = _apply_numeric_slice(
+            grid_frame,
+            slice_axis,
+            slice_value,
+        ).reset_index(drop=True)
+        if slice_grid.empty:
+            slice_points = _apply_numeric_slice(
+                working,
+                slice_axis,
+                slice_value,
+            )
+            _slice_valid, fallback_grid = _interpolated_2d_grid(
+                slice_points,
+                x_name,
+                y_name,
+                resolution=120,
+                log_frequency=log_frequency,
+            )
+            if fallback_grid is not None:
+                grid_x, grid_y, grid_values = fallback_grid
+            else:
+                grid_x = grid_y = grid_values = None
+        else:
+            heatmap_grid = (
+                slice_grid
+                .pivot_table(
+                    index=y_name,
+                    columns=x_name,
+                    values="interpolated_value",
+                    aggfunc="mean",
+                )
+                .sort_index()
+                .sort_index(axis=1)
+            )
+            grid_x = heatmap_grid.columns.to_numpy(dtype=float)
+            grid_y = heatmap_grid.index.to_numpy(dtype=float)
+            grid_values = heatmap_grid.to_numpy(dtype=float)
+        if grid_values is None:
+            fig.add_annotation(
+                text="No interpolated comparison grid could be generated.",
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+            )
+        else:
+            display_value_range = value_range or _value_range_from_frame(
+                source.rename(columns={value_column: "value"}),
+                "value",
+            )
+            fig.add_trace(go.Heatmap(
+                x=grid_x,
+                y=grid_y,
+                z=grid_values,
+                colorscale=colorscale,
+                zmin=(
+                    display_value_range[0]
+                    if display_value_range is not None else None
+                ),
+                zmax=(
+                    display_value_range[1]
+                    if display_value_range is not None else None
+                ),
+                colorbar={"title": value_label},
+                hovertemplate=(
+                    f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                    f"{value_label}: %{{z:.4g}}<extra></extra>"
+                ),
+                connectgaps=False,
+            ))
+    title_note = _numeric_slice_title_note(slice_axis, slice_value)
+    fig.update_layout(
+        title=(
+            f"{value_label} comparison 2D slice"
+            + (f"<br>{title_note}" if title_note else "")
+        ),
+        xaxis_title=x_name,
+        yaxis_title=y_name,
+        xaxis_type="log" if log_frequency and x_name == "frequency" else "linear",
+        yaxis_type="log" if log_frequency and y_name == "frequency" else "linear",
+        height=420,
+        margin={"l": 65, "r": 90, "t": 65, "b": 65},
+    )
+    _apply_plotly_colorbar_height(fig)
+    _apply_plotly_2d_slice_aspect(
+        fig,
+        width=800,
+        height=int(round(800 / SURROGATE_2D_FIGURE_ASPECT)),
+    )
+    return fig
 
 
 def _real_count_occurrences(
@@ -4058,6 +4242,11 @@ def _plot_real_data_landscape(
                 fill_nearest=True,
                 log_frequency=log_frequency,
                 axis_include_values={slice_axis: [float(slice_value)]},
+                axis_ranges={
+                    axis_name: axis_ranges[axis_name]
+                    for axis_name in (x_name, y_name)
+                    if axis_ranges and axis_name in axis_ranges
+                },
             )
             slice_grid = _apply_numeric_slice(
                 tensor_grid,
@@ -4768,6 +4957,7 @@ def _interpolated_3d_grid(
     fill_nearest: bool = True,
     log_frequency: bool = False,
     axis_include_values: Mapping[str, Sequence[float]] | None = None,
+    axis_ranges: Mapping[str, tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     """Interpolate measured 3D points onto a regular grid for export/simulation."""
     columns = [x_name, y_name, z_name, "value"]
@@ -4802,6 +4992,43 @@ def _interpolated_3d_grid(
     }
     if any(spec is None for spec in axis_specs.values()):
         return valid, pd.DataFrame(), "Could not build one or more interpolation axes."
+    if axis_ranges:
+        for name in (x_name, y_name, z_name):
+            requested_range = axis_ranges.get(name)
+            if requested_range is None:
+                continue
+            range_values = pd.to_numeric(
+                pd.Series(list(requested_range)),
+                errors="coerce",
+            ).dropna()
+            if len(range_values) < 2:
+                continue
+            lower = float(range_values.iloc[0])
+            upper = float(range_values.iloc[1])
+            if not np.isfinite(lower) or not np.isfinite(upper):
+                continue
+            if np.isclose(lower, upper):
+                center = lower
+                padding = max(abs(center) * 0.05, 1e-9)
+                lower, upper = center - padding, center + padding
+            if lower > upper:
+                lower, upper = upper, lower
+            if log_frequency and name == "frequency":
+                if lower <= 0 or upper <= 0:
+                    continue
+                transformed_axis = np.linspace(
+                    float(np.log10(lower)),
+                    float(np.log10(upper)),
+                    size,
+                )
+                display_axis = np.power(10.0, transformed_axis)
+            else:
+                display_axis = np.linspace(lower, upper, size)
+                transformed_axis = display_axis
+            axis_specs[name] = (
+                transformed_axis.astype(float),
+                display_axis.astype(float),
+            )
     if axis_include_values:
         for name in (x_name, y_name, z_name):
             include_values = axis_include_values.get(name)
@@ -12638,6 +12865,33 @@ def _matplotlib_png_bytes(fig, *, dpi: int = 150) -> bytes:
     return buffer.getvalue()
 
 
+def _render_browser_download_link(
+    container,
+    label: str,
+    data: bytes,
+    *,
+    file_name: str,
+    mime: str,
+) -> None:
+    encoded = base64.b64encode(data).decode("ascii")
+    safe_label = html.escape(str(label))
+    safe_file_name = html.escape(str(file_name), quote=True)
+    safe_mime = html.escape(str(mime), quote=True)
+    container.markdown(
+        (
+            f'<a href="data:{safe_mime};base64,{encoded}" '
+            f'download="{safe_file_name}" '
+            'style="display:inline-flex;align-items:center;'
+            'justify-content:center;min-height:2.25rem;padding:0.25rem 0.75rem;'
+            'border:1px solid rgba(49,51,63,0.2);border-radius:0.5rem;'
+            'background:#fff;color:rgb(49,51,63);text-decoration:none;'
+            'font-size:0.875rem;line-height:1.6;">'
+            f"{safe_label}</a>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _render_downloadable_pyplot(
     container,
     fig,
@@ -12655,12 +12909,12 @@ def _render_downloadable_pyplot(
         use_container_width=True,
         bbox_inches=None,
     )
-    plot_column.download_button(
+    _render_browser_download_link(
+        plot_column,
         "Download plot",
-        data=png_bytes,
+        png_bytes,
         file_name=f"{_safe_download_stem(file_stem)}.png",
         mime="image/png",
-        key=f"{key}_download",
     )
     plt.close(fig)
 
@@ -12823,6 +13077,8 @@ def _render_camera_persistent_plotly(
     export_height: int | None = None,
     shared_camera_storage_key: str | None = None,
     apply_sync_nonce: int | None = None,
+    show_download: bool = False,
+    show_cache_view: bool = True,
 ) -> dict | None:
     _apply_plotly_colorbar_height(fig)
     storage_key = f"bo_viewer_camera:{camera_storage_key}"
@@ -12834,6 +13090,16 @@ def _render_camera_persistent_plotly(
         if apply_sync_nonce is not None
         else int(st.session_state.get("bo_3d_perspective_snap_nonce", 0))
     )
+    sync_camera = (
+        _valid_plotly_camera(
+            st.session_state.get(_plotly_camera_state_key(shared_storage_key))
+        )
+        if apply_nonce > 0 else None
+    )
+    if sync_camera is not None:
+        fig.update_layout(scene_camera=sync_camera)
+        current_camera = sync_camera
+        st.session_state[camera_state_key] = sync_camera
     component_figure = json.loads(
         json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
     )
@@ -12847,8 +13113,14 @@ def _render_camera_persistent_plotly(
             camera_storage_key=camera_storage_key,
             component_id=component_key,
             camera=current_camera,
+            sync_camera=sync_camera,
             height=int(height),
             apply_sync_nonce=apply_nonce,
+            show_cache_view=bool(show_cache_view),
+            show_download=bool(show_download),
+            download_file_stem=_safe_download_stem(file_stem),
+            download_width=int(export_width),
+            download_height=int(export_height or height),
             default=None,
             key=component_key,
         )
@@ -12858,9 +13130,19 @@ def _render_camera_persistent_plotly(
             returned_camera = render_component()
     else:
         returned_camera = render_component()
+    if isinstance(returned_camera, dict) and returned_camera.get("type") == "cache_view":
+        cached_camera = _valid_plotly_camera(returned_camera.get("camera"))
+        if cached_camera is not None:
+            _store_plotly_camera(storage_key, cached_camera)
+            _store_plotly_camera(shared_storage_key, cached_camera)
+            returned_shared_storage_key = returned_camera.get("shared_storage_key")
+            if isinstance(returned_shared_storage_key, str):
+                _store_plotly_camera(returned_shared_storage_key, cached_camera)
+            st.session_state[f"{_plotly_camera_state_key(shared_storage_key)}_cached"] = True
+            current_camera = cached_camera
+        return current_camera
     stored_camera = _store_plotly_camera(storage_key, returned_camera)
     if stored_camera is not None:
-        _store_plotly_camera(shared_storage_key, stored_camera)
         current_camera = stored_camera
     return current_camera
 
@@ -12909,12 +13191,12 @@ def _render_downloadable_plotly(
                 width=export_width,
                 height=export_height or int(fig.layout.height or 800),
             )
-            plot_column.download_button(
+            _render_browser_download_link(
+                plot_column,
                 "Download plot",
-                data=png_bytes,
+                png_bytes,
                 file_name=f"{_safe_download_stem(file_stem)}.png",
                 mime="image/png",
-                key=f"{key}_download",
             )
         except RuntimeError as exc:
             plot_column.caption(str(exc))
@@ -17321,25 +17603,6 @@ def render_bo_session_app() -> None:
                             if not classic_values.empty
                             else None
                         )
-                        sync_nonce_key = (
-                            f"bo_real_comparison_3d_sync_nonce_{real_scope_key}_"
-                            f"{real_metric}_{series_token}_{comparison_x}_"
-                            f"{comparison_y}_{comparison_z}"
-                        )
-                        st.session_state.setdefault(sync_nonce_key, 0)
-                        if st.button(
-                            "Sync 3D perspectives now",
-                            help=(
-                                "Applies the most recently adjusted comparison "
-                                "3D camera for this overview set only."
-                            ),
-                            key=f"{sync_nonce_key}_button",
-                        ):
-                            st.session_state[sync_nonce_key] = (
-                                int(st.session_state.get(sync_nonce_key, 0)) + 1
-                            )
-                            st.rerun()
-                        overview_columns = st.columns(3)
                         comparison_camera_storage_key = (
                             f"real_comparison_3d_{real_scope_key}_{real_metric}_"
                             f"{series_token}_{comparison_x}_{comparison_y}_"
@@ -17348,6 +17611,96 @@ def render_bo_session_app() -> None:
                         comparison_shared_storage_key = (
                             f"bo_viewer_camera:shared:{comparison_camera_storage_key}"
                         )
+                        comparison_cached_camera = _valid_plotly_camera(
+                            st.session_state.get(
+                                _plotly_camera_state_key(
+                                    comparison_shared_storage_key
+                                )
+                            )
+                        )
+                        sync_nonce_key = (
+                            f"bo_real_comparison_3d_sync_nonce_{real_scope_key}_"
+                            f"{real_metric}_{series_token}_{comparison_x}_"
+                            f"{comparison_y}_{comparison_z}"
+                        )
+                        st.session_state.setdefault(sync_nonce_key, 0)
+                        comparison_sync_nonce = int(
+                            st.session_state.get(sync_nonce_key, 0)
+                        )
+                        st.caption(
+                            (
+                                "Cached 3D view is ready for sync."
+                                if comparison_cached_camera is not None
+                                else (
+                                    "Click Cache view below one plot first. "
+                                    "Sync is enabled after the cached view reaches Streamlit."
+                                )
+                            )
+                        )
+                        if st.button(
+                            "Sync 3D perspectives now",
+                            disabled=comparison_cached_camera is None,
+                            help=(
+                                "Applies the most recently cached comparison "
+                                "3D camera for this overview set only."
+                            ),
+                            key=f"{sync_nonce_key}_button",
+                        ):
+                            comparison_sync_nonce = (
+                                int(st.session_state.get(sync_nonce_key, 0)) + 1
+                            )
+                            st.session_state[sync_nonce_key] = comparison_sync_nonce
+                        comparison_slice_axis_key = (
+                            f"bo_real_comparison_3d_slice_axis_{real_scope_key}_"
+                            f"{real_metric}_{series_token}_{comparison_x}_"
+                            f"{comparison_y}_{comparison_z}"
+                        )
+                        comparison_slice_axis_options = [
+                            NO_HIGHLIGHTED_SLICE_LABEL,
+                            comparison_x,
+                            comparison_y,
+                            comparison_z,
+                        ]
+                        comparison_selected_slice_axis = None
+                        comparison_selected_slice_value = None
+                        current_comparison_slice_axis_choice = (
+                            st.session_state.get(
+                                comparison_slice_axis_key,
+                                NO_HIGHLIGHTED_SLICE_LABEL,
+                            )
+                        )
+                        if (
+                            current_comparison_slice_axis_choice
+                            in comparison_slice_axis_options
+                            and current_comparison_slice_axis_choice
+                            != NO_HIGHLIGHTED_SLICE_LABEL
+                        ):
+                            comparison_selected_slice_axis = (
+                                current_comparison_slice_axis_choice
+                            )
+                            comparison_slice_value_key = (
+                                f"{comparison_slice_axis_key}_value_"
+                                f"{comparison_selected_slice_axis}"
+                            )
+                            comparison_slice_values = _numeric_slice_values(
+                                series_points,
+                                comparison_selected_slice_axis,
+                            )
+                            current_comparison_slice_value = (
+                                st.session_state.get(comparison_slice_value_key)
+                            )
+                            if (
+                                current_comparison_slice_value
+                                in comparison_slice_values
+                            ):
+                                comparison_selected_slice_value = float(
+                                    current_comparison_slice_value
+                                )
+                            elif comparison_slice_values:
+                                comparison_selected_slice_value = float(
+                                    comparison_slice_values[0]
+                                )
+                        overview_columns = st.columns(3)
                         overview_specs = [
                             (
                                 overview_columns[0],
@@ -17378,6 +17731,9 @@ def render_bo_session_app() -> None:
                             colorscale,
                             value_range,
                         ) in overview_specs:
+                            plot_camera_storage_key = (
+                                f"{comparison_camera_storage_key}_{value_column}"
+                            )
                             comparison_fig = _plot_real_comparison_3d(
                                 series_points,
                                 value_column=value_column,
@@ -17387,8 +17743,10 @@ def render_bo_session_app() -> None:
                                 z_name=comparison_z,
                                 colorscale=colorscale,
                                 value_range=value_range,
+                                slice_axis=comparison_selected_slice_axis,
+                                slice_value=comparison_selected_slice_value,
                             )
-                            _render_camera_persistent_plotly(
+                            rendered_camera = _render_camera_persistent_plotly(
                                 overview_column,
                                 comparison_fig,
                                 key=(
@@ -17396,18 +17754,175 @@ def render_bo_session_app() -> None:
                                     f"{real_scope_key}_{real_metric}_{series_token}_"
                                     f"{comparison_x}_{comparison_y}_{comparison_z}"
                                 ),
-                                camera_storage_key=(
-                                    f"{comparison_camera_storage_key}_{value_column}"
-                                ),
+                                camera_storage_key=plot_camera_storage_key,
                                 shared_camera_storage_key=comparison_shared_storage_key,
-                                apply_sync_nonce=int(st.session_state[sync_nonce_key]),
+                                apply_sync_nonce=comparison_sync_nonce,
                                 height=int(comparison_fig.layout.height or 440),
                                 file_stem=(
                                     f"real_comparison_3d_{value_column}_"
                                     f"{real_metric}_{series_token}_{comparison_x}_"
                                     f"{comparison_y}_{comparison_z}"
                                 ),
+                                show_download=False,
                             )
+                            download_camera = (
+                                comparison_cached_camera
+                                if comparison_cached_camera is not None
+                                else rendered_camera
+                            )
+                            download_fig = go.Figure(comparison_fig)
+                            _apply_plotly_camera(download_fig, download_camera)
+                            try:
+                                png_bytes = _plotly_png_bytes(
+                                    download_fig,
+                                    width=900,
+                                    height=700,
+                                    scale=2,
+                                )
+                                _render_browser_download_link(
+                                    overview_column,
+                                    "Download plot",
+                                    png_bytes,
+                                    file_name=(
+                                        f"{_safe_download_stem('real_comparison_3d')}_"
+                                        f"{_safe_download_stem(value_column)}_"
+                                        f"{_safe_download_stem(real_metric)}_"
+                                        f"{_safe_download_stem(series_token)}_"
+                                        f"{_safe_download_stem(comparison_x)}_"
+                                        f"{_safe_download_stem(comparison_y)}_"
+                                        f"{_safe_download_stem(comparison_z)}.png"
+                                    ),
+                                    mime="image/png",
+                                )
+                            except RuntimeError as exc:
+                                overview_column.caption(str(exc))
+                        if comparison_sync_nonce > 0:
+                            st.session_state[sync_nonce_key] = 0
+                        _preserve_valid_widget_value(
+                            comparison_slice_axis_key,
+                            comparison_slice_axis_options,
+                            NO_HIGHLIGHTED_SLICE_LABEL,
+                        )
+                        comparison_slice_axis_choice = st.selectbox(
+                            "Comparison highlighted slice axis",
+                            comparison_slice_axis_options,
+                            format_func=lambda value: (
+                                value
+                                if value == NO_HIGHLIGHTED_SLICE_LABEL
+                                else _metric_label(value)
+                            ),
+                            key=comparison_slice_axis_key,
+                        )
+                        comparison_slice_axis = (
+                            None
+                            if (
+                                comparison_slice_axis_choice
+                                == NO_HIGHLIGHTED_SLICE_LABEL
+                            )
+                            else comparison_slice_axis_choice
+                        )
+                        if comparison_slice_axis is not None:
+                            comparison_slice_values = _numeric_slice_values(
+                                series_points,
+                                comparison_slice_axis,
+                            )
+                            if not comparison_slice_values:
+                                st.info(
+                                    "No comparison slice values are available for "
+                                    f"{_metric_label(comparison_slice_axis)}."
+                                )
+                            else:
+                                comparison_slice_value_key = (
+                                    f"{comparison_slice_axis_key}_value_"
+                                    f"{comparison_slice_axis}"
+                                )
+                                _preserve_valid_widget_value(
+                                    comparison_slice_value_key,
+                                    comparison_slice_values,
+                                    comparison_slice_values[0],
+                                )
+                                comparison_slice_value = float(st.selectbox(
+                                    (
+                                        "Comparison slice "
+                                        f"{_metric_label(comparison_slice_axis)}"
+                                    ),
+                                    comparison_slice_values,
+                                    format_func=lambda value: f"{float(value):g}",
+                                    key=comparison_slice_value_key,
+                                ))
+                                comparison_slice_axes = [
+                                    axis for axis in (
+                                        comparison_x,
+                                        comparison_y,
+                                        comparison_z,
+                                    )
+                                    if axis != comparison_slice_axis
+                                ]
+                                if len(comparison_slice_axes) == 2:
+                                    st.markdown(
+                                        "##### Comparison highlighted slice 2D maps"
+                                    )
+                                    comparison_log_frequency = bool(
+                                        st.session_state.get(
+                                            "bo_real_log_frequency__preferred",
+                                            st.session_state.get(
+                                                "bo_real_log_frequency",
+                                                False,
+                                            ),
+                                        )
+                                    )
+                                    slice_columns = st.columns(3)
+                                    for slice_index, (
+                                        _overview_column,
+                                        value_column,
+                                        value_label,
+                                        colorscale,
+                                        value_range,
+                                    ) in enumerate(overview_specs):
+                                        slice_fig = _plot_real_comparison_2d_slice(
+                                            series_points,
+                                            value_column=value_column,
+                                            value_label=value_label,
+                                            x_name=comparison_slice_axes[0],
+                                            y_name=comparison_slice_axes[1],
+                                            slice_axis=comparison_slice_axis,
+                                            slice_value=comparison_slice_value,
+                                            colorscale=colorscale,
+                                            value_range=value_range,
+                                            log_frequency=comparison_log_frequency,
+                                        )
+                                        _apply_plotly_slice_perimeter_style(
+                                            slice_fig,
+                                            "rgba(255,59,48,1)",
+                                            thickness=3,
+                                        )
+                                        _render_downloadable_plotly(
+                                            slice_columns[slice_index],
+                                            slice_fig,
+                                            key=(
+                                                f"bo_real_comparison_2d_slice_"
+                                                f"{value_column}_{real_scope_key}_"
+                                                f"{real_metric}_{series_token}_"
+                                                f"{comparison_slice_axis}_"
+                                                f"{comparison_slice_value:g}_"
+                                                f"{comparison_slice_axes[0]}_"
+                                                f"{comparison_slice_axes[1]}"
+                                            ),
+                                            file_stem=(
+                                                f"real_comparison_2d_slice_"
+                                                f"{value_column}_{real_metric}_"
+                                                f"{series_token}_"
+                                                f"{comparison_slice_axis}_"
+                                                f"{comparison_slice_value:g}_"
+                                                f"{comparison_slice_axes[0]}_"
+                                                f"{comparison_slice_axes[1]}"
+                                            ),
+                                            width_percent=100,
+                                            export_width=800,
+                                            export_height=int(round(
+                                                800 / SURROGATE_2D_FIGURE_ASPECT
+                                            )),
+                                        )
                 real_view_options = ["1D slice"]
                 if len(real_dimensions) >= 2:
                     real_view_options.append("2D map")

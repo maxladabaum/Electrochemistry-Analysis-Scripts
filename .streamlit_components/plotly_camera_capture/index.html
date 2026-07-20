@@ -15,20 +15,52 @@
       width: 100%;
       height: 100%;
     }
+    #controls {
+      display: none;
+      gap: 8px;
+      margin: 8px 0 0 0;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    #download, #cache-view {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 4px 12px;
+      border: 1px solid rgba(49,51,63,0.2);
+      border-radius: 8px;
+      background: #fff;
+      color: rgb(49,51,63);
+      font: 14px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      cursor: pointer;
+    }
+    #cache-view.cached {
+      border-color: rgba(22,163,74,0.55);
+      color: rgb(22,101,52);
+    }
   </style>
 </head>
 <body>
   <div id="plot"></div>
+  <div id="controls">
+    <button id="cache-view" type="button">Cache view</button>
+    <button id="download" type="button">Download plot</button>
+  </div>
   <script>
     const STREAMLIT_READY = "streamlit:componentReady";
     const STREAMLIT_RENDER = "streamlit:render";
     const STREAMLIT_SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
     const SHARED_CAMERA_KEY = "bo_viewer_camera:latest_3d_perspective";
     const graph = document.getElementById("plot");
+    const controls = document.getElementById("controls");
+    const downloadButton = document.getElementById("download");
+    const cacheViewButton = document.getElementById("cache-view");
     let latestArgs = null;
     let sendTimer = null;
     let resizeTimer = null;
     let suppressCameraEvents = false;
+    let lastCamera = null;
 
     function streamlitMessage(type, data) {
       window.parent.postMessage({
@@ -80,6 +112,24 @@
     }
 
     function renderedCamera() {
+      const scene = (
+        graph._fullLayout &&
+        graph._fullLayout.scene &&
+        graph._fullLayout.scene._scene
+      ) ? graph._fullLayout.scene._scene : null;
+      if (scene && typeof scene.getCamera === "function") {
+        try {
+          const camera = scene.getCamera();
+          if (camera && camera.eye) {
+            return JSON.parse(JSON.stringify(camera));
+          }
+        } catch (error) {}
+      }
+      if (scene && scene.camera && scene.camera.eye) {
+        try {
+          return JSON.parse(JSON.stringify(scene.camera));
+        } catch (error) {}
+      }
       const renderedCamera = (
         graph._fullLayout &&
         graph._fullLayout.scene &&
@@ -157,19 +207,23 @@
       if (!latestArgs || !camera || !camera.eye) {
         return;
       }
+      lastCamera = JSON.parse(JSON.stringify(camera));
       saveCamera(latestArgs.storage_key, camera);
-      saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
+    }
+
+    function persistCameraNow(camera) {
+      if (latestArgs && latestArgs.storage_key) {
+        saveCamera(latestArgs.storage_key, camera);
+      }
+      persistUserCamera(camera);
     }
 
     function scheduleCameraSend(camera) {
-      if (latestArgs && latestArgs.storage_key) {
-        saveCamera(latestArgs.storage_key, camera);
-        saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
-      }
+      persistCameraNow(camera);
       window.clearTimeout(sendTimer);
       sendTimer = window.setTimeout(function() {
         persistUserCamera(camera);
-      }, 250);
+      }, 50);
     }
 
     function persistRenderedCamera() {
@@ -180,6 +234,98 @@
       if (camera && camera.eye) {
         scheduleCameraSend(camera);
       }
+    }
+
+    function persistSettledRenderedCamera() {
+      persistRenderedCamera();
+      window.setTimeout(persistRenderedCamera, 25);
+      window.setTimeout(persistRenderedCamera, 75);
+      window.setTimeout(persistRenderedCamera, 150);
+    }
+
+    function safeFileStem(value) {
+      const stem = String(value || "plot")
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+      return stem || "plot";
+    }
+
+    function triggerDataUrlDownload(dataUrl, filename) {
+      const link = document.createElement("a");
+      link.href = dataUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function downloadCurrentPlot() {
+      persistSettledRenderedCamera();
+      if (!graph || !graph._fullLayout) {
+        return;
+      }
+      const options = {
+        format: "png",
+        filename: safeFileStem(latestArgs && latestArgs.download_file_stem),
+        width: Number(latestArgs && latestArgs.download_width) || 1200,
+        height: Number(latestArgs && latestArgs.download_height) || Number(latestArgs && latestArgs.height) || 700,
+        scale: 2,
+      };
+      requestPlotResize();
+      window.setTimeout(function() {
+        const camera = lastCamera || renderedCamera();
+        const relayoutPromise = camera
+          ? Plotly.relayout(graph, {"scene.camera": camera})
+          : Promise.resolve();
+        relayoutPromise.then(function() {
+          return new Promise(function(resolve) {
+            window.requestAnimationFrame(function() {
+              window.requestAnimationFrame(resolve);
+            });
+          });
+        }).then(function() {
+          requestPlotResize();
+          return new Promise(function(resolve) {
+            window.setTimeout(resolve, 150);
+          });
+        }).then(function() {
+          return Plotly.toImage(graph, options);
+        }).then(function(dataUrl) {
+          triggerDataUrlDownload(dataUrl, options.filename + ".png");
+        }).catch(function(error) {
+          console.error("Plotly image export failed", error);
+        });
+      }, 250);
+    }
+
+    function cacheCurrentView() {
+      const camera = (
+        lastCamera ||
+        loadCamera(latestArgs && latestArgs.storage_key) ||
+        renderedCamera()
+      );
+      if (!latestArgs || !camera || !camera.eye) {
+        return;
+      }
+      lastCamera = JSON.parse(JSON.stringify(camera));
+      saveCamera(latestArgs.storage_key, camera);
+      saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
+      setComponentValue({
+        type: "cache_view",
+        camera: camera,
+        storage_key: latestArgs.storage_key,
+        shared_storage_key: latestArgs.shared_storage_key || SHARED_CAMERA_KEY,
+      });
+      cacheViewButton.textContent = "Cached view";
+      cacheViewButton.classList.add("cached");
+      window.setTimeout(function() {
+        cacheViewButton.textContent = "Cache view";
+        cacheViewButton.classList.remove("cached");
+      }, 1200);
+    }
+
+    function cacheSettledCurrentView() {
+      window.setTimeout(cacheCurrentView, 75);
     }
 
     function requestPlotResize() {
@@ -194,8 +340,14 @@
     function render(args) {
       latestArgs = args || {};
       const height = Number(latestArgs.height || 700);
+      const showCacheView = Boolean(latestArgs.show_cache_view);
+      const showDownload = Boolean(latestArgs.show_download);
+      const showControls = showDownload || showCacheView;
       graph.style.height = height + "px";
-      setFrameHeight(height);
+      controls.style.display = showControls ? "flex" : "none";
+      downloadButton.style.display = showDownload ? "inline-flex" : "none";
+      cacheViewButton.style.display = showCacheView ? "inline-flex" : "none";
+      setFrameHeight(height + (showControls ? 52 : 0));
       window.clearTimeout(sendTimer);
 
       const figure = latestArgs.figure || {};
@@ -203,29 +355,19 @@
       figure.layout.scene = figure.layout.scene || {};
       figure.layout.scene.dragmode = "orbit";
       const storedCamera = loadCamera(latestArgs.storage_key);
-      const syncNonce = Number(latestArgs.apply_sync_nonce || 0);
-      const nonceKey = (
-        latestArgs.storage_key +
-        ":" +
-        (latestArgs.component_id || "default") +
-        ":last_sync_nonce"
-      );
-      const lastSyncNonce = loadNumber(nonceKey);
-      const syncedCamera = (
-        syncNonce > lastSyncNonce
-      ) ? loadCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY) : null;
-      if (syncNonce > lastSyncNonce) {
-        saveNumber(nonceKey, syncNonce);
-      }
-      const initialCamera = syncedCamera || storedCamera || latestArgs.camera;
+      const initialCamera = latestArgs.sync_camera || storedCamera || latestArgs.camera;
       if (initialCamera) {
+        lastCamera = JSON.parse(JSON.stringify(initialCamera));
         figure.layout.scene.camera = initialCamera;
         saveCamera(latestArgs.storage_key, initialCamera);
+      } else {
+        lastCamera = null;
       }
       const config = {
         responsive: true,
         displaylogo: false,
         scrollZoom: true,
+        preserveDrawingBuffer: true,
         modeBarButtonsToRemove: ["toImage"],
       };
       suppressCameraEvents = true;
@@ -272,15 +414,17 @@
       render((data.args || {}));
     });
     window.addEventListener("resize", requestPlotResize);
-    window.addEventListener("pointerup", persistRenderedCamera);
-    window.addEventListener("mouseup", persistRenderedCamera);
-    window.addEventListener("touchend", persistRenderedCamera);
-    graph.addEventListener("pointerup", persistRenderedCamera);
-    graph.addEventListener("mouseup", persistRenderedCamera);
-    graph.addEventListener("touchend", persistRenderedCamera);
+    window.addEventListener("pointerup", persistSettledRenderedCamera);
+    window.addEventListener("mouseup", persistSettledRenderedCamera);
+    window.addEventListener("touchend", persistSettledRenderedCamera);
+    graph.addEventListener("pointerup", persistSettledRenderedCamera);
+    graph.addEventListener("mouseup", persistSettledRenderedCamera);
+    graph.addEventListener("touchend", persistSettledRenderedCamera);
     graph.addEventListener("wheel", function() {
-      window.setTimeout(persistRenderedCamera, 0);
+      window.setTimeout(persistSettledRenderedCamera, 0);
     });
+    downloadButton.addEventListener("click", downloadCurrentPlot);
+    cacheViewButton.addEventListener("click", cacheSettledCurrentView);
     if (window.ResizeObserver) {
       new ResizeObserver(requestPlotResize).observe(document.body);
     }
