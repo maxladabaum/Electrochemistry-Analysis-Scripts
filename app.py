@@ -79,6 +79,20 @@ def _append_unique_folder(folders: List[str], picked: str) -> List[str]:
     return [*folders, picked_clean]
 
 
+def _analysis_selection_key(analysis_mode: str, folders: List[str]) -> Tuple[str, Tuple[str, ...]]:
+    return analysis_mode, tuple(folders)
+
+
+def _clear_loaded_analysis_state() -> None:
+    st.session_state.results = None
+    st.session_state.last_results = None
+    st.session_state.results_mode = None
+    st.session_state.last_results_mode = None
+    st.session_state.results_folder_key = None
+    st.session_state.swv_annotation_signature = None
+    st.session_state.swv_annotated_results = None
+
+
 def _measurement_voltage_bounds(
     folders: Tuple[str, ...],
     mode: str,
@@ -737,6 +751,7 @@ def build_export_pdf(
 
 LANGMUIR_METRIC_KEY = "peak_current_selected"
 DEFAULT_SWV_VLINES_TEXT = ""
+DEFAULT_SWV_CROP_RANGE = (-1.0, 1.0)
 VLINE_ANNOTATION_HELP = (
     "One marker per line: scan,label. The scan is the x-axis position. "
     "For titration Kd, start the label with the concentration for the interval after that marker. "
@@ -1374,6 +1389,7 @@ for k, v in dict(
     last_results=None,
     results_mode=None,
     last_results_mode=None,
+    results_folder_key=None,
     folders=[],
     run_count=0,
     swv_post_method_filter_enabled=False,
@@ -1451,9 +1467,15 @@ with st.sidebar:
     st.session_state.folders = edited
     folders = edited
 
+    current_selection_key = _analysis_selection_key(analysis_mode, folders)
+    loaded_selection_key = st.session_state.get("results_folder_key")
+    if st.session_state.get("results") is not None and loaded_selection_key != current_selection_key:
+        _clear_loaded_analysis_state()
+
     if folders:
         if st.button("  Clear all folders", use_container_width=True):
             st.session_state.folders = []
+            _clear_loaded_analysis_state()
             st.rerun()
 
     folder_errors = [f for f in folders if not os.path.isdir(f)]
@@ -1506,20 +1528,20 @@ with st.sidebar:
         crop_state_key = ("SWV", tuple(folders))
         if st.session_state.get("swv_crop_folder_key") != crop_state_key:
             bounds = _measurement_voltage_bounds(tuple(folders), mode="swv")
-            if bounds is not None:
-                st.session_state.swv_crop_min = bounds[0]
-                st.session_state.swv_crop_max = bounds[1]
+            crop_defaults = bounds if bounds is not None else DEFAULT_SWV_CROP_RANGE
+            st.session_state.swv_crop_min = crop_defaults[0]
+            st.session_state.swv_crop_max = crop_defaults[1]
             st.session_state.swv_crop_folder_key = crop_state_key
         crop_min = col1.number_input(
             "Crop min (V)",
-            value=-0.61,
+            value=float(st.session_state.get("swv_crop_min", DEFAULT_SWV_CROP_RANGE[0])),
             step=0.01,
             format="%.3f",
             key="swv_crop_min",
         )
         crop_max = col2.number_input(
             "Crop max (V)",
-            value=-0.30,
+            value=float(st.session_state.get("swv_crop_max", DEFAULT_SWV_CROP_RANGE[1])),
             step=0.01,
             format="%.3f",
             key="swv_crop_max",
@@ -1822,6 +1844,9 @@ if run_clicked and folders and not folder_errors:
             st.session_state.last_results = results
             st.session_state.last_results_mode = analysis_mode
         st.session_state.results_mode = analysis_mode
+        st.session_state.results_folder_key = _analysis_selection_key(analysis_mode, folders)
+        st.session_state.swv_annotation_signature = None
+        st.session_state.swv_annotated_results = None
         st.session_state.run_count += 1
     except Exception as e:
         st.error(f"Analysis failed: {e}")

@@ -13,6 +13,7 @@
     }
     #plot {
       width: 100%;
+      height: 100%;
     }
   </style>
 </head>
@@ -26,6 +27,7 @@
     const graph = document.getElementById("plot");
     let latestArgs = null;
     let sendTimer = null;
+    let resizeTimer = null;
     let suppressCameraEvents = false;
 
     function streamlitMessage(type, data) {
@@ -77,16 +79,57 @@
       } catch (error) {}
     }
 
+    function renderedCamera() {
+      const renderedCamera = (
+        graph._fullLayout &&
+        graph._fullLayout.scene &&
+        graph._fullLayout.scene.camera
+      ) ? graph._fullLayout.scene.camera : null;
+      return renderedCamera ? JSON.parse(JSON.stringify(renderedCamera)) : null;
+    }
+
     function mergeCameraUpdate(update) {
-      const current = (
+      const baseCamera = renderedCamera() || (
         graph.layout &&
         graph.layout.scene &&
         graph.layout.scene.camera
-      ) ? JSON.parse(JSON.stringify(graph.layout.scene.camera)) : {};
-      if (update && update["scene.camera"]) {
-        return update["scene.camera"];
+      );
+      const current = baseCamera ? JSON.parse(JSON.stringify(baseCamera)) : {};
+      if (
+        update &&
+        Object.prototype.hasOwnProperty.call(update, "scene.camera") &&
+        update["scene.camera"] &&
+        typeof update["scene.camera"] === "object"
+      ) {
+        ["eye", "center", "up"].forEach(function(part) {
+          if (
+            update["scene.camera"][part] &&
+            typeof update["scene.camera"][part] === "object"
+          ) {
+            current[part] = current[part] || {};
+            ["x", "y", "z"].forEach(function(axis) {
+              if (Object.prototype.hasOwnProperty.call(update["scene.camera"][part], axis)) {
+                current[part][axis] = update["scene.camera"][part][axis];
+              }
+            });
+          }
+        });
       }
       ["eye", "center", "up"].forEach(function(part) {
+        const partKey = "scene.camera." + part;
+        if (
+          update &&
+          Object.prototype.hasOwnProperty.call(update, partKey) &&
+          update[partKey] &&
+          typeof update[partKey] === "object"
+        ) {
+          current[part] = current[part] || {};
+          ["x", "y", "z"].forEach(function(axis) {
+            if (Object.prototype.hasOwnProperty.call(update[partKey], axis)) {
+              current[part][axis] = update[partKey][axis];
+            }
+          });
+        }
         ["x", "y", "z"].forEach(function(axis) {
           const key = "scene.camera." + part + "." + axis;
           if (update && Object.prototype.hasOwnProperty.call(update, key)) {
@@ -116,7 +159,6 @@
       }
       saveCamera(latestArgs.storage_key, camera);
       saveCamera(latestArgs.shared_storage_key || SHARED_CAMERA_KEY, camera);
-      setComponentValue(camera);
     }
 
     function scheduleCameraSend(camera) {
@@ -130,6 +172,25 @@
       }, 250);
     }
 
+    function persistRenderedCamera() {
+      if (suppressCameraEvents) {
+        return;
+      }
+      const camera = renderedCamera();
+      if (camera && camera.eye) {
+        scheduleCameraSend(camera);
+      }
+    }
+
+    function requestPlotResize() {
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(function() {
+        if (graph && graph._fullLayout) {
+          Plotly.Plots.resize(graph);
+        }
+      }, 50);
+    }
+
     function render(args) {
       latestArgs = args || {};
       const height = Number(latestArgs.height || 700);
@@ -140,9 +201,15 @@
       const figure = latestArgs.figure || {};
       figure.layout = figure.layout || {};
       figure.layout.scene = figure.layout.scene || {};
+      figure.layout.scene.dragmode = "orbit";
       const storedCamera = loadCamera(latestArgs.storage_key);
       const syncNonce = Number(latestArgs.apply_sync_nonce || 0);
-      const nonceKey = latestArgs.storage_key + ":last_sync_nonce";
+      const nonceKey = (
+        latestArgs.storage_key +
+        ":" +
+        (latestArgs.component_id || "default") +
+        ":last_sync_nonce"
+      );
       const lastSyncNonce = loadNumber(nonceKey);
       const syncedCamera = (
         syncNonce > lastSyncNonce
@@ -150,7 +217,7 @@
       if (syncNonce > lastSyncNonce) {
         saveNumber(nonceKey, syncNonce);
       }
-      const initialCamera = syncedCamera || latestArgs.camera || storedCamera;
+      const initialCamera = syncedCamera || storedCamera || latestArgs.camera;
       if (initialCamera) {
         figure.layout.scene.camera = initialCamera;
         saveCamera(latestArgs.storage_key, initialCamera);
@@ -163,17 +230,30 @@
       };
       suppressCameraEvents = true;
       Plotly.react(graph, figure.data || [], figure.layout, config).then(function() {
+        requestPlotResize();
         if (initialCamera) {
           return Plotly.relayout(graph, {"scene.camera": initialCamera});
         }
         return null;
       }).finally(function() {
+        requestPlotResize();
+        window.setTimeout(requestPlotResize, 250);
         window.setTimeout(function() {
           suppressCameraEvents = false;
         }, 0);
       });
       graph.removeAllListeners && graph.removeAllListeners("plotly_relayout");
+      graph.removeAllListeners && graph.removeAllListeners("plotly_relayouting");
       graph.on("plotly_relayout", function(update) {
+        if (suppressCameraEvents) {
+          return;
+        }
+        if (!hasCameraUpdate(update)) {
+          return;
+        }
+        scheduleCameraSend(mergeCameraUpdate(update));
+      });
+      graph.on("plotly_relayouting", function(update) {
         if (suppressCameraEvents) {
           return;
         }
@@ -191,6 +271,19 @@
       }
       render((data.args || {}));
     });
+    window.addEventListener("resize", requestPlotResize);
+    window.addEventListener("pointerup", persistRenderedCamera);
+    window.addEventListener("mouseup", persistRenderedCamera);
+    window.addEventListener("touchend", persistRenderedCamera);
+    graph.addEventListener("pointerup", persistRenderedCamera);
+    graph.addEventListener("mouseup", persistRenderedCamera);
+    graph.addEventListener("touchend", persistRenderedCamera);
+    graph.addEventListener("wheel", function() {
+      window.setTimeout(persistRenderedCamera, 0);
+    });
+    if (window.ResizeObserver) {
+      new ResizeObserver(requestPlotResize).observe(document.body);
+    }
 
     streamlitMessage(STREAMLIT_READY, {apiVersion: 1});
     setFrameHeight(700);

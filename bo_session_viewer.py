@@ -3210,6 +3210,299 @@ def _real_group_metric_points(
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def _real_comparison_payload(
+    points: pd.DataFrame,
+    *,
+    metric: str,
+    phase: str,
+    channel_mode: str,
+    session_path: Path,
+) -> dict:
+    return {
+        "points": points.copy(),
+        "metric": metric,
+        "phase": phase,
+        "channel_mode": channel_mode,
+        "session_path": str(session_path),
+        "row_count": int(len(points)),
+    }
+
+
+def _real_comparison_join_columns(
+    current: pd.DataFrame,
+    cached: pd.DataFrame,
+) -> list[str]:
+    parameter_columns = [
+        parameter for parameter in PARAMETERS
+        if parameter in current.columns and parameter in cached.columns
+    ]
+    series_columns = [
+        column for column in ("phase", "channel", "group_id")
+        if column in current.columns and column in cached.columns
+    ]
+    return [*parameter_columns, *series_columns]
+
+
+def _comparison_join_frame(frame: pd.DataFrame, join_columns: list[str]) -> pd.DataFrame:
+    prepared = frame.copy()
+    for column in join_columns:
+        if column in PARAMETERS:
+            prepared[column] = pd.to_numeric(prepared[column], errors="coerce").round(12)
+        elif column == "group_id":
+            prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
+        else:
+            prepared[column] = prepared[column].astype(str)
+    prepared["value"] = pd.to_numeric(prepared["value"], errors="coerce")
+    prepared = prepared.dropna(subset=[*join_columns, "value"])
+    metadata_columns = [
+        column for column in prepared.columns
+        if column not in {*join_columns, "value"}
+    ]
+    aggregations = {"value": "mean"}
+    aggregations.update({column: "first" for column in metadata_columns})
+    return prepared.groupby(join_columns, as_index=False, dropna=False).agg(aggregations)
+
+
+def _real_comparison_delta_points(
+    current: pd.DataFrame,
+    cached: pd.DataFrame,
+) -> tuple[pd.DataFrame, str | None]:
+    if current.empty or cached.empty:
+        return pd.DataFrame(), "Current and cached comparison tables must both contain rows."
+    join_columns = _real_comparison_join_columns(current, cached)
+    parameter_columns = [column for column in join_columns if column in PARAMETERS]
+    if not parameter_columns:
+        return pd.DataFrame(), "No shared parameter columns are available for comparison."
+    series_columns = [column for column in join_columns if column not in parameter_columns]
+    current_join = _comparison_join_frame(current, [*parameter_columns, *series_columns])
+    cached_join = _comparison_join_frame(cached, [*parameter_columns, *series_columns])
+
+    output_frames = []
+    skipped_series = []
+    if series_columns:
+        cached_groups = cached_join.groupby(series_columns, sort=False, dropna=False)
+    else:
+        cached_groups = [((), cached_join)]
+    for series_key, cached_series in cached_groups:
+        if series_columns:
+            if not isinstance(series_key, tuple):
+                series_key = (series_key,)
+            current_series = current_join
+            label_parts = []
+            for column, value in zip(series_columns, series_key):
+                current_series = current_series[current_series[column] == value]
+                label_parts.append(f"{column}={value}")
+            series_label = ", ".join(label_parts)
+        else:
+            current_series = current_join
+            series_label = "all rows"
+
+        active_parameters = [
+            column for column in parameter_columns
+            if pd.to_numeric(current_series[column], errors="coerce").nunique(dropna=True) > 1
+        ]
+        if not active_parameters:
+            skipped_series.append(series_label)
+            continue
+        current_valid = current_series.dropna(subset=[*active_parameters, "value"])
+        cached_valid = cached_series.dropna(subset=active_parameters)
+        if len(current_valid) < len(active_parameters) + 1 or cached_valid.empty:
+            skipped_series.append(series_label)
+            continue
+        coordinates = np.column_stack([
+            pd.to_numeric(current_valid[column], errors="coerce").to_numpy(dtype=float)
+            for column in active_parameters
+        ])
+        query_coordinates = np.column_stack([
+            pd.to_numeric(cached_valid[column], errors="coerce").to_numpy(dtype=float)
+            for column in active_parameters
+        ])
+        values = pd.to_numeric(current_valid["value"], errors="coerce").to_numpy(dtype=float)
+        finite_source = np.isfinite(coordinates).all(axis=1) & np.isfinite(values)
+        finite_query = np.isfinite(query_coordinates).all(axis=1)
+        if finite_source.sum() < len(active_parameters) + 1 or not finite_query.any():
+            skipped_series.append(series_label)
+            continue
+        try:
+            interpolated_current = np.full(len(cached_valid), np.nan, dtype=float)
+            interpolated_current[finite_query] = _rbf_interpolation_values(
+                coordinates[finite_source],
+                values[finite_source],
+                query_coordinates[finite_query],
+            )
+        except Exception:
+            skipped_series.append(series_label)
+            continue
+
+        cached_lookup = cached_valid.reset_index(drop=True).copy()
+        cached_lookup["_comparison_row"] = np.arange(len(cached_lookup))
+        exact_current = (
+            current_valid
+            .groupby(active_parameters, as_index=False, dropna=False)["value"]
+            .mean()
+            .rename(columns={"value": "exact_current_value"})
+        )
+        exact_matches = cached_lookup.merge(
+            exact_current,
+            on=active_parameters,
+            how="left",
+            sort=False,
+        )
+        exact_values = pd.to_numeric(
+            exact_matches.sort_values("_comparison_row")["exact_current_value"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        exact_mask = np.isfinite(exact_values)
+        interpolated_current[exact_mask] = exact_values[exact_mask]
+
+        compared = cached_valid.copy()
+        compared["cached_value"] = pd.to_numeric(
+            compared["value"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        compared["current_value"] = interpolated_current
+        compared = compared[np.isfinite(compared["current_value"])]
+        compared = compared[np.isfinite(compared["cached_value"])]
+        if compared.empty:
+            skipped_series.append(series_label)
+            continue
+        compared["value"] = compared["current_value"] - compared["cached_value"]
+        compared["comparison_delta"] = compared["value"]
+        output_frames.append(compared)
+
+    if not output_frames:
+        return (
+            pd.DataFrame(),
+            "RBF comparison could not evaluate any cached parameter coordinates "
+            "from the current session data.",
+        )
+    result = pd.concat(output_frames, ignore_index=True)
+    if skipped_series:
+        skipped_preview = "; ".join(skipped_series[:4])
+        suffix = "..." if len(skipped_series) > 4 else ""
+        return (
+            result,
+            f"RBF comparison skipped {len(skipped_series)} sparse series: "
+            f"{skipped_preview}{suffix}",
+        )
+    return result, None
+
+
+def _split_real_points_by_phase(points: pd.DataFrame, phases: Sequence[str]) -> dict[str, pd.DataFrame]:
+    if points.empty or "phase" not in points.columns:
+        return {phase: pd.DataFrame() for phase in phases}
+    return {
+        phase: points.loc[points["phase"].astype(str) == str(phase)]
+        .drop(columns=["phase"])
+        .reset_index(drop=True)
+        for phase in phases
+    }
+
+
+def _plot_real_comparison_3d(
+    points: pd.DataFrame,
+    *,
+    value_column: str,
+    value_label: str,
+    x_name: str,
+    y_name: str,
+    z_name: str,
+    colorscale: str,
+    value_range: tuple[float, float] | None = None,
+) -> go.Figure:
+    columns = [x_name, y_name, z_name, value_column]
+    metadata = [
+        column for column in (
+            "phase",
+            "channel",
+            "group_id",
+            "cached_value",
+            "current_value",
+            "comparison_delta",
+        )
+        if column in points.columns and column not in columns
+    ]
+    valid = points[columns + metadata].copy()
+    valid[columns] = valid[columns].apply(pd.to_numeric, errors="coerce")
+    valid = valid.dropna(subset=columns)
+    fig = go.Figure()
+    if valid.empty:
+        fig.add_annotation(
+            text="No comparison values are available for these axes.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=420)
+        return fig
+    value_min = (
+        float(value_range[0])
+        if value_range is not None
+        else float(valid[value_column].min())
+    )
+    value_max = (
+        float(value_range[1])
+        if value_range is not None
+        else float(valid[value_column].max())
+    )
+    if value_min == value_max:
+        value_max = value_min + 1.0
+    custom_columns = [
+        column for column in (
+            "phase",
+            "channel",
+            "cached_value",
+            "current_value",
+            "comparison_delta",
+        )
+        if column in valid.columns
+    ]
+    customdata = valid[custom_columns] if custom_columns else None
+    hover_lines = [
+        f"{x_name}: %{{x:.4g}}",
+        f"{y_name}: %{{y:.4g}}",
+        f"{z_name}: %{{z:.4g}}",
+        f"{value_label}: %{{marker.color:.4g}}",
+    ]
+    for index, column in enumerate(custom_columns):
+        if column in {"cached_value", "current_value", "comparison_delta"}:
+            hover_lines.append(f"{column}: %{{customdata[{index}]:.4g}}")
+        else:
+            hover_lines.append(f"{column}: %{{customdata[{index}]}}")
+    fig.add_trace(go.Scatter3d(
+        x=valid[x_name],
+        y=valid[y_name],
+        z=valid[z_name],
+        mode="markers",
+        marker={
+            "size": 5,
+            "opacity": 0.8,
+            "color": valid[value_column],
+            "colorscale": colorscale,
+            "cmin": value_min,
+            "cmax": value_max,
+            "colorbar": {"title": value_label},
+        },
+        customdata=customdata,
+        hovertemplate="<br>".join(hover_lines) + "<extra></extra>",
+        name=value_label,
+    ))
+    fig.update_layout(
+        title=f"{value_label} at cached parameter coordinates",
+        scene={
+            "dragmode": "orbit",
+            "xaxis": {"title": x_name},
+            "yaxis": {"title": y_name},
+            "zaxis": {"title": z_name},
+        },
+        height=440,
+        margin={"l": 0, "r": 0, "t": 45, "b": 0},
+    )
+    return _apply_plotly_colorbar_height(fig)
+
+
 def _real_count_occurrences(
     observations: list[dict],
     selected_channels: list[str],
@@ -3400,6 +3693,7 @@ def _plot_real_data_landscape(
     slice_sweep_values: Sequence[float] | None = None,
     tensor_interpolation_source: pd.DataFrame | None = None,
     show_measured_points: bool = False,
+    value_colorscale: str = "Viridis",
 ):
     def series_label(value: Any) -> str:
         text = str(value)
@@ -3526,7 +3820,7 @@ def _plot_real_data_landscape(
                 j=face_j,
                 k=face_k,
                 intensity=intensities,
-                colorscale="Viridis",
+                colorscale=value_colorscale,
                 cmin=value_min,
                 cmax=value_max,
                 showscale=trace_index == 0,
@@ -3600,7 +3894,7 @@ def _plot_real_data_landscape(
             x=count_grid.columns.to_numpy(),
             y=count_grid.index.to_numpy(),
             z=count_grid.to_numpy(),
-            colorscale="Viridis",
+            colorscale=value_colorscale,
             zmin=(
                 display_value_range[0]
                 if display_value_range is not None else None
@@ -3663,7 +3957,7 @@ def _plot_real_data_landscape(
             if color_by == "Measured value":
                 marker.update({
                     "color": group["value"],
-                    "colorscale": "Viridis",
+                    "colorscale": value_colorscale,
                     "cmin": value_min,
                     "cmax": value_max,
                     "showscale": len(fig.data) == 0,
@@ -3801,7 +4095,7 @@ def _plot_real_data_landscape(
                 x=grid_x,
                 y=grid_y,
                 z=grid_values,
-                colorscale="Viridis",
+                colorscale=value_colorscale,
                 zmin=(
                     display_value_range[0]
                     if display_value_range is not None else None
@@ -3821,7 +4115,7 @@ def _plot_real_data_landscape(
             fig.add_trace(go.Scatter(
                 x=valid[x_name], y=valid[y_name], mode="markers",
                 marker={
-                    "size": 8, "color": valid["value"], "colorscale": "Viridis",
+                    "size": 8, "color": valid["value"], "colorscale": value_colorscale,
                     "cmin": (
                         display_value_range[0]
                         if display_value_range is not None else None
@@ -4665,6 +4959,7 @@ def _plot_interpolated_3d_landscape(
     value_range: tuple[float, float] | None = None,
     slice_axis: str | None = None,
     slice_value: float | None = None,
+    value_colorscale: str = "Viridis",
 ) -> go.Figure:
     """Render interpolated values as a discrete 3D tensor of grid points."""
     value_min = (
@@ -4694,7 +4989,7 @@ def _plot_interpolated_3d_landscape(
         marker={
             "size": max(2, dot_size - 1),
             "color": plot_grid["interpolated_value"],
-            "colorscale": "Viridis",
+            "colorscale": value_colorscale,
             "cmin": value_min,
             "cmax": value_max,
             "opacity": dot_opacity,
@@ -4832,6 +5127,7 @@ def _plot_interpolated_2d_slice(
     reverse_x: bool = False,
     reverse_y: bool = False,
     show_measured_points: bool = False,
+    value_colorscale: str = "Viridis",
 ) -> go.Figure:
     """Render a 2D map from one fixed slice of an interpolated 3D grid."""
     slice_grid = _apply_numeric_slice(
@@ -4860,7 +5156,7 @@ def _plot_interpolated_2d_slice(
             x=heatmap_grid.columns.to_numpy(dtype=float),
             y=heatmap_grid.index.to_numpy(dtype=float),
             z=heatmap_grid.to_numpy(dtype=float),
-            colorscale="Viridis",
+            colorscale=value_colorscale,
             zmin=(
                 display_value_range[0]
                 if display_value_range is not None else None
@@ -12525,30 +12821,46 @@ def _render_camera_persistent_plotly(
     file_stem: str,
     export_width: int = 1200,
     export_height: int | None = None,
+    shared_camera_storage_key: str | None = None,
+    apply_sync_nonce: int | None = None,
 ) -> dict | None:
     _apply_plotly_colorbar_height(fig)
     storage_key = f"bo_viewer_camera:{camera_storage_key}"
+    shared_storage_key = shared_camera_storage_key or _SHARED_3D_CAMERA_STORAGE_KEY
     camera_state_key = _plotly_camera_state_key(storage_key)
     current_camera = _valid_plotly_camera(st.session_state.get(camera_state_key))
-    apply_nonce = int(st.session_state.get("bo_3d_perspective_snap_nonce", 0))
+    apply_nonce = (
+        int(apply_sync_nonce)
+        if apply_sync_nonce is not None
+        else int(st.session_state.get("bo_3d_perspective_snap_nonce", 0))
+    )
     component_figure = json.loads(
         json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
     )
     component_key = f"{key}_camera_component"
-    returned_camera = _plotly_camera_capture(
-        figure=component_figure,
-        storage_key=storage_key,
-        shared_storage_key=_SHARED_3D_CAMERA_STORAGE_KEY,
-        camera_storage_key=camera_storage_key,
-        camera=current_camera,
-        height=int(height),
-        apply_sync_nonce=apply_nonce,
-        default=None,
-        key=component_key,
-    )
+
+    def render_component():
+        return _plotly_camera_capture(
+            figure=component_figure,
+            storage_key=storage_key,
+            shared_storage_key=shared_storage_key,
+            camera_storage_key=camera_storage_key,
+            component_id=component_key,
+            camera=current_camera,
+            height=int(height),
+            apply_sync_nonce=apply_nonce,
+            default=None,
+            key=component_key,
+        )
+
+    if hasattr(container, "__enter__") and hasattr(container, "__exit__"):
+        with container:
+            returned_camera = render_component()
+    else:
+        returned_camera = render_component()
     stored_camera = _store_plotly_camera(storage_key, returned_camera)
     if stored_camera is not None:
-        _store_plotly_camera(_SHARED_3D_CAMERA_STORAGE_KEY, stored_camera)
+        _store_plotly_camera(shared_storage_key, stored_camera)
         current_camera = stored_camera
     return current_camera
 
@@ -12722,6 +13034,60 @@ def _prepare_preferred_multiselect_value(
         st.session_state[fallback_key] = display_values
     st.session_state[widget_key] = display_values
     return preference_valid, display_values
+
+
+def _reset_bo_group_channel_selector_defaults(session_token: str) -> None:
+    """Start each loaded BO session with all groups/channels selected."""
+    marker_key = "bo_group_channel_defaults_session"
+    if st.session_state.get(marker_key) == session_token:
+        return
+
+    exact_keys = {
+        "bo_channel_group_scope",
+        "bo_channel_group_scope__preferred",
+        "bo_observation_group_scope",
+        "bo_observation_group_scope__preferred",
+        "bo_observation_group_scope_compact_session",
+        "bo_surrogate_groups",
+        "bo_surrogate_pref_groups",
+    }
+    prefixes = (
+        "bo_trend_channels_",
+        "bo_hp_response_channels_",
+        "bo_paired_channels_",
+        "bo_chronological_channels_",
+        "bo_trace_channels_",
+        "bo_real_groups_",
+        "bo_real_channels_",
+        "bo_sim_real_channels",
+        "bo_trend_iteration_start_",
+        "bo_trend_iteration_end_",
+    )
+    suffixes = (
+        "__preferred",
+        "__preferred__fallback_display",
+        "__fallback_display",
+    )
+    keys_to_clear = []
+    for key in list(st.session_state.keys()):
+        if key in exact_keys or key.startswith(prefixes):
+            keys_to_clear.append(key)
+            continue
+        if key.endswith(suffixes):
+            base_key = key
+            for suffix in suffixes:
+                if base_key.endswith(suffix):
+                    base_key = base_key[: -len(suffix)]
+                    break
+            if base_key in exact_keys or base_key.startswith(prefixes):
+                keys_to_clear.append(key)
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+    st.session_state["bo_channel_group_scope"] = "all"
+    st.session_state["bo_channel_group_scope__preferred"] = "all"
+    st.session_state["bo_observation_group_scope"] = "all"
+    st.session_state["bo_observation_group_scope__preferred"] = "all"
+    st.session_state[marker_key] = session_token
 
 
 def _capture_widget_preference(widget_key: str, preference_key: str) -> None:
@@ -13027,6 +13393,9 @@ def render_bo_session_app() -> None:
     except Exception as exc:
         st.error(str(exc))
         return
+    _reset_bo_group_channel_selector_defaults(
+        str(Path(selected_session_folder).expanduser().resolve())
+    )
 
     full_session = session
     groups = _session_channel_groups(session)
@@ -13244,16 +13613,6 @@ def render_bo_session_app() -> None:
         observation_group_metadata,
         set(observation_group_ids),
     )
-    session_metadata = (full_session.get("state") or {}).get("simulation_metadata") or {}
-    session_records = (
-        (full_session.get("config") or {}).get("records")
-        if isinstance(full_session.get("config"), dict)
-        else {}
-    ) or {}
-    compact_simulation_session = bool(
-        session_metadata.get("compact_export")
-        or session_records.get("compact_simulation_export")
-    )
     observation_selector_columns = st.columns(2)
     with observation_selector_columns[0]:
         observation_group_options = [
@@ -13261,23 +13620,7 @@ def render_bo_session_app() -> None:
             *observation_group_family_options.keys(),
             *observation_group_ids,
         ]
-        default_observation_group_scope = (
-            next(iter(observation_group_family_options), None)
-            or (observation_group_ids[0] if observation_group_ids else "all")
-            if compact_simulation_session
-            else "all"
-        )
-        if compact_simulation_session and default_observation_group_scope != "all":
-            compact_default_session_key = "bo_observation_group_scope_compact_session"
-            compact_session_token = str(full_session.get("root") or selected_session_folder)
-            if st.session_state.get(compact_default_session_key) != compact_session_token:
-                st.session_state["bo_observation_group_scope"] = (
-                    default_observation_group_scope
-                )
-                st.session_state["bo_observation_group_scope__preferred"] = (
-                    default_observation_group_scope
-                )
-                st.session_state[compact_default_session_key] = compact_session_token
+        default_observation_group_scope = "all"
 
         def observation_group_scope_label(scope: Any) -> str:
             if scope == "all":
@@ -13631,6 +13974,11 @@ def render_bo_session_app() -> None:
         else:
             minimum_iteration = int(available_trend_iterations.min())
             maximum_iteration = int(available_trend_iterations.max())
+            default_iteration_start = (
+                1
+                if minimum_iteration <= 1 <= maximum_iteration
+                else minimum_iteration
+            )
             range_columns = st.columns(2)
             range_key = trend_scope_key
             trend_start_key = f"bo_trend_iteration_start_{range_key}"
@@ -13647,7 +13995,7 @@ def render_bo_session_app() -> None:
             )
             preferred_start = int(st.session_state.get(
                 trend_start_preference_key,
-                minimum_iteration,
+                default_iteration_start,
             ))
             preferred_end = int(st.session_state.get(
                 trend_end_preference_key,
@@ -13665,7 +14013,7 @@ def render_bo_session_app() -> None:
                 "Plot iteration start",
                 min_value=minimum_iteration,
                 max_value=maximum_iteration,
-                value=minimum_iteration,
+                value=default_iteration_start,
                 step=1,
                 key=trend_start_key,
             ))
@@ -14045,6 +14393,8 @@ def render_bo_session_app() -> None:
             f"{trend_scope_key}_{iteration_start}_{iteration_end}_"
             f"{chart_key_suffix}"
         )
+        if group_color_values is None:
+            trend_figure = _strip_categorical_plot_colorbars(trend_figure)
         trend_y_limits = _manual_y_axis_range_control(
             "trend",
             f"bo_trend_{trend_scope_key}_{metric}",
@@ -16718,6 +17068,85 @@ def render_bo_session_app() -> None:
             ],
             ignore_index=True,
         ) if any(not points.empty for points in real_points_by_phase.values()) else pd.DataFrame()
+        display_real_metric = real_metric
+        active_comparison_payload = None
+        comparison_overview_points = pd.DataFrame()
+        st.markdown("#### Session comparison")
+        st.caption(
+            "Cache the current real-data metric table, load another BO session, "
+            "then load the cached values to plot current minus cached values."
+        )
+        comparison_controls = st.columns([1, 1, 1])
+        if comparison_controls[0].button(
+            "Cache comparison values",
+            disabled=combined_real_points.empty,
+            use_container_width=True,
+            key="bo_real_cache_comparison_values",
+        ):
+            st.session_state["bo_real_comparison_cached"] = _real_comparison_payload(
+                combined_real_points,
+                metric=real_metric,
+                phase=real_phase,
+                channel_mode=real_channel_mode,
+                session_path=selected_session_folder,
+            )
+            st.session_state.pop("bo_real_comparison_active", None)
+            st.success(
+                f"Cached {len(combined_real_points):,} {real_metric} row(s) "
+                "for comparison."
+            )
+        cached_comparison_payload = st.session_state.get(
+            "bo_real_comparison_cached"
+        )
+        if comparison_controls[1].button(
+            "Load comparison values",
+            disabled=not cached_comparison_payload or combined_real_points.empty,
+            use_container_width=True,
+            key="bo_real_load_comparison_values",
+        ):
+            st.session_state["bo_real_comparison_active"] = cached_comparison_payload
+        if comparison_controls[2].button(
+            "Clear comparison",
+            disabled=not st.session_state.get("bo_real_comparison_active"),
+            use_container_width=True,
+            key="bo_real_clear_comparison_values",
+        ):
+            st.session_state.pop("bo_real_comparison_active", None)
+            st.rerun()
+        if combined_real_points.empty:
+            st.caption(
+                "Cache comparison values is disabled until the current metric, "
+                "phase, and channel selection produces rows."
+            )
+        if cached_comparison_payload:
+            comparison_controls[0].caption(
+                f"Cached {cached_comparison_payload.get('row_count', 0):,} "
+                f"{cached_comparison_payload.get('metric', 'metric')} row(s)."
+            )
+        active_comparison_payload = st.session_state.get(
+            "bo_real_comparison_active"
+        )
+        if active_comparison_payload and not combined_real_points.empty:
+            cached_metric = active_comparison_payload.get("metric")
+            if cached_metric != real_metric:
+                st.warning(
+                    "Cached comparison metric is "
+                    f"{cached_metric}; select {cached_metric} to compare values."
+                )
+            else:
+                comparison_points, comparison_error = _real_comparison_delta_points(
+                    combined_real_points,
+                    active_comparison_payload["points"],
+                )
+                if comparison_error:
+                    st.warning(comparison_error)
+                if not comparison_points.empty:
+                    comparison_overview_points = comparison_points
+                    st.success(
+                        f"Loaded comparison values: {len(comparison_points):,} "
+                        "cached coordinate(s) evaluated with current-session RBF interpolation."
+                    )
+        real_value_colorscale = "Viridis"
         unsliced_real_points_by_phase = {
             phase: points.copy()
             for phase, points in real_points_by_phase.items()
@@ -16746,6 +17175,239 @@ def render_bo_session_app() -> None:
             if not real_dimensions:
                 st.info("No experimental parameter varied in the recorded observations.")
             else:
+                comparison_3d_active = {
+                    "cached_value",
+                    "current_value",
+                    "comparison_delta",
+                }.issubset(comparison_overview_points.columns)
+                if comparison_3d_active and len(real_dimensions) >= 3:
+                    st.markdown("#### Comparison 3D overview")
+                    st.caption(
+                        "Cached metric values and current-session RBF-evaluated "
+                        "values are shown at the cached session's parameter "
+                        "coordinates. In individual-channel mode, each channel "
+                        "gets its own set of synced 3D views."
+                    )
+                    preferred_comparison_axes = [
+                        parameter
+                        for parameter in (
+                            "frequency",
+                            "amplitude",
+                            "step_potential",
+                        )
+                        if parameter in real_dimensions
+                    ]
+                    for parameter in real_dimensions:
+                        if parameter not in preferred_comparison_axes:
+                            preferred_comparison_axes.append(parameter)
+                    preferred_comparison_axes = preferred_comparison_axes[:3]
+                    comparison_axis_columns = st.columns(3)
+                    comparison_x_key = (
+                        f"bo_real_comparison_3d_x_{real_scope_key}_{real_metric}"
+                    )
+                    _preserve_valid_widget_value(
+                        comparison_x_key,
+                        real_dimensions,
+                        preferred_comparison_axes[0],
+                    )
+                    comparison_x = comparison_axis_columns[0].selectbox(
+                        "Comparison 3D X",
+                        real_dimensions,
+                        key=comparison_x_key,
+                    )
+                    comparison_y_options = [
+                        name for name in real_dimensions if name != comparison_x
+                    ]
+                    comparison_y_key = (
+                        f"bo_real_comparison_3d_y_{real_scope_key}_{real_metric}"
+                    )
+                    _preserve_valid_widget_value(
+                        comparison_y_key,
+                        comparison_y_options,
+                        next(
+                            (
+                                axis for axis in preferred_comparison_axes
+                                if axis in comparison_y_options
+                            ),
+                            comparison_y_options[0],
+                        ),
+                    )
+                    comparison_y = comparison_axis_columns[1].selectbox(
+                        "Comparison 3D Y",
+                        comparison_y_options,
+                        key=comparison_y_key,
+                    )
+                    comparison_z_options = [
+                        name for name in real_dimensions
+                        if name not in {comparison_x, comparison_y}
+                    ]
+                    comparison_z_key = (
+                        f"bo_real_comparison_3d_z_{real_scope_key}_{real_metric}"
+                    )
+                    _preserve_valid_widget_value(
+                        comparison_z_key,
+                        comparison_z_options,
+                        next(
+                            (
+                                axis for axis in preferred_comparison_axes
+                                if axis in comparison_z_options
+                            ),
+                            comparison_z_options[0],
+                        ),
+                    )
+                    comparison_z = comparison_axis_columns[2].selectbox(
+                        "Comparison 3D Z",
+                        comparison_z_options,
+                        key=comparison_z_key,
+                    )
+                    if (
+                        real_channel_mode == "Plot channels individually"
+                        and "channel" in comparison_overview_points.columns
+                    ):
+                        channel_groups = [
+                            (str(channel), channel_points.copy())
+                            for channel, channel_points in sorted(
+                                comparison_overview_points.groupby(
+                                    "channel",
+                                    sort=False,
+                                ),
+                                key=lambda item: _channel_sort_key(str(item[0])),
+                            )
+                        ]
+                        channel_options = [
+                            channel for channel, _points in channel_groups
+                        ]
+                        comparison_channel_key = (
+                            f"bo_real_comparison_3d_channel_{real_scope_key}_"
+                            f"{real_metric}"
+                        )
+                        _preserve_valid_widget_value(
+                            comparison_channel_key,
+                            channel_options,
+                            channel_options[0],
+                        )
+                        selected_comparison_channel = st.selectbox(
+                            "Comparison overview channel",
+                            channel_options,
+                            format_func=lambda channel: f"Ch {channel}",
+                            key=comparison_channel_key,
+                        )
+                        comparison_series = [
+                            (
+                                f"Ch {channel}",
+                                f"channel_{_safe_download_stem(channel)}",
+                                channel_points,
+                            )
+                            for channel, channel_points in channel_groups
+                            if channel == str(selected_comparison_channel)
+                        ]
+                    else:
+                        comparison_series = [("", "all", comparison_overview_points)]
+                    for series_label, series_token, series_points in comparison_series:
+                        if series_points.empty:
+                            continue
+                        if series_label:
+                            st.markdown(f"##### {series_label}")
+                        classic_values = pd.to_numeric(
+                            pd.concat([
+                                series_points["cached_value"],
+                                series_points["current_value"],
+                            ]),
+                            errors="coerce",
+                        )
+                        classic_values = classic_values[np.isfinite(classic_values)]
+                        classic_range = (
+                            (float(classic_values.min()), float(classic_values.max()))
+                            if not classic_values.empty
+                            else None
+                        )
+                        sync_nonce_key = (
+                            f"bo_real_comparison_3d_sync_nonce_{real_scope_key}_"
+                            f"{real_metric}_{series_token}_{comparison_x}_"
+                            f"{comparison_y}_{comparison_z}"
+                        )
+                        st.session_state.setdefault(sync_nonce_key, 0)
+                        if st.button(
+                            "Sync 3D perspectives now",
+                            help=(
+                                "Applies the most recently adjusted comparison "
+                                "3D camera for this overview set only."
+                            ),
+                            key=f"{sync_nonce_key}_button",
+                        ):
+                            st.session_state[sync_nonce_key] = (
+                                int(st.session_state.get(sync_nonce_key, 0)) + 1
+                            )
+                            st.rerun()
+                        overview_columns = st.columns(3)
+                        comparison_camera_storage_key = (
+                            f"real_comparison_3d_{real_scope_key}_{real_metric}_"
+                            f"{series_token}_{comparison_x}_{comparison_y}_"
+                            f"{comparison_z}"
+                        )
+                        comparison_shared_storage_key = (
+                            f"bo_viewer_camera:shared:{comparison_camera_storage_key}"
+                        )
+                        overview_specs = [
+                            (
+                                overview_columns[0],
+                                "cached_value",
+                                f"Cached {real_metric}",
+                                "Viridis",
+                                classic_range,
+                            ),
+                            (
+                                overview_columns[1],
+                                "current_value",
+                                f"Current RBF {real_metric}",
+                                "Viridis",
+                                classic_range,
+                            ),
+                            (
+                                overview_columns[2],
+                                "comparison_delta",
+                                f"Δ {real_metric}",
+                                "Magma",
+                                None,
+                            ),
+                        ]
+                        for (
+                            overview_column,
+                            value_column,
+                            value_label,
+                            colorscale,
+                            value_range,
+                        ) in overview_specs:
+                            comparison_fig = _plot_real_comparison_3d(
+                                series_points,
+                                value_column=value_column,
+                                value_label=value_label,
+                                x_name=comparison_x,
+                                y_name=comparison_y,
+                                z_name=comparison_z,
+                                colorscale=colorscale,
+                                value_range=value_range,
+                            )
+                            _render_camera_persistent_plotly(
+                                overview_column,
+                                comparison_fig,
+                                key=(
+                                    f"bo_real_comparison_3d_{value_column}_"
+                                    f"{real_scope_key}_{real_metric}_{series_token}_"
+                                    f"{comparison_x}_{comparison_y}_{comparison_z}"
+                                ),
+                                camera_storage_key=(
+                                    f"{comparison_camera_storage_key}_{value_column}"
+                                ),
+                                shared_camera_storage_key=comparison_shared_storage_key,
+                                apply_sync_nonce=int(st.session_state[sync_nonce_key]),
+                                height=int(comparison_fig.layout.height or 440),
+                                file_stem=(
+                                    f"real_comparison_3d_{value_column}_"
+                                    f"{real_metric}_{series_token}_{comparison_x}_"
+                                    f"{comparison_y}_{comparison_z}"
+                                ),
+                            )
                 real_view_options = ["1D slice"]
                 if len(real_dimensions) >= 2:
                     real_view_options.append("2D map")
@@ -17120,7 +17782,7 @@ def render_bo_session_app() -> None:
                                 float(full_range_points[dimension].max())
                                 + half_bin,
                             )
-                    full_value_frames = [full_range_points]
+                    full_value_frames = [full_range_points.assign(phase="measurement")]
                 else:
                     full_value_frames = []
                     for phase in requested_phases:
@@ -17149,7 +17811,7 @@ def render_bo_session_app() -> None:
                             real_2d_slice_value,
                         )
                         if not full_points.empty:
-                            full_value_frames.append(full_points)
+                            full_value_frames.append(full_points.assign(phase=phase))
                 real_crop_axes = [
                     dimension
                     for dimension in (real_x, real_y, real_z)
@@ -17245,7 +17907,7 @@ def render_bo_session_app() -> None:
                     if manual_real_value_range:
                         value_range_columns = st.columns(2)
                         real_value_min = float(value_range_columns[0].number_input(
-                            f"{real_metric} minimum",
+                            f"{display_real_metric} minimum",
                             value=float(real_auto_value_range[0]),
                             format="%.6g",
                             key=(
@@ -17254,7 +17916,7 @@ def render_bo_session_app() -> None:
                             ),
                         ))
                         real_value_max = float(value_range_columns[1].number_input(
-                            f"{real_metric} maximum",
+                            f"{display_real_metric} maximum",
                             value=float(real_auto_value_range[1]),
                             format="%.6g",
                             key=(
@@ -17501,6 +18163,126 @@ def render_bo_session_app() -> None:
                     f"{real_3d_slice_token}_{real_3d_slice_sweep_token}"
                 )
 
+                real_3d_slice_plot_key = None
+                highlighted_real_3d_slice_plot = None
+                real_3d_slice_axes = []
+                real_3d_slice_plots = []
+                real_3d_slice_perimeter_thickness = 3
+                if (
+                    real_view == "3D tensor"
+                    and not count_mode
+                    and real_3d_slice_axis is not None
+                    and real_3d_slice_value is not None
+                ):
+                    real_3d_slice_plot_key = (
+                        f"bo_real_highlighted_2d_slice_{real_scope_key}_"
+                        f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                        f"{real_x}_{real_y}_{real_z}_"
+                        f"{real_3d_slice_token}_{real_3d_slice_sweep_token}_"
+                        f"log{int(bool(real_log_frequency))}"
+                    )
+                    real_3d_slice_perimeter_thickness = int(
+                        st.session_state.get(
+                            f"{real_3d_slice_plot_key}_perimeter_thickness",
+                            3,
+                        )
+                    )
+                    highlighted_real_3d_slice_plot = st.session_state.get(
+                        real_3d_slice_plot_key
+                    )
+                    if highlighted_real_3d_slice_plot is not None:
+                        real_3d_slice_axes = (
+                            highlighted_real_3d_slice_plot.get("axes", [])
+                        )
+                        real_3d_slice_plots = (
+                            highlighted_real_3d_slice_plot.get("plots", [])
+                        )
+
+                def render_real_highlighted_slice_plot(
+                    container,
+                    slice_plot_index: int,
+                    slice_plot: dict,
+                    *,
+                    show_heading: bool,
+                    display_width_percent: int | None = None,
+                ) -> None:
+                    slice_value_label = float(slice_plot["slice_value"])
+                    effective_width_percent = (
+                        plot_width_percent
+                        if display_width_percent is None
+                        else display_width_percent
+                    )
+                    if show_heading:
+                        series_name = slice_plot.get("series_name")
+                        series_label = (
+                            f" | {series_name}" if series_name is not None else ""
+                        )
+                        container.markdown(
+                            f"#### {str(slice_plot.get('phase')).title()}"
+                            f"{series_label} | "
+                            f"{_metric_label(real_3d_slice_axis)} = "
+                            f"{slice_value_label:g}"
+                        )
+                    real_slice_export_width = max(
+                        500,
+                        int(1200 * plot_width_percent / 100),
+                    )
+                    real_slice_export_height = max(
+                        320,
+                        int(round(
+                            real_slice_export_width
+                            / SURROGATE_2D_FIGURE_ASPECT
+                        )),
+                    )
+                    _apply_plotly_2d_slice_aspect(
+                        slice_plot["figure"],
+                        width=real_slice_export_width,
+                        height=real_slice_export_height,
+                    )
+                    _apply_plotly_slice_perimeter_style(
+                        slice_plot["figure"],
+                        slice_plot.get(
+                            "plotly_slice_color",
+                            "rgba(255,59,48,1)",
+                        ),
+                        thickness=real_3d_slice_perimeter_thickness,
+                    )
+                    _render_downloadable_plotly(
+                        container,
+                        slice_plot["figure"],
+                        key=(
+                            f"{real_3d_slice_plot_key}_plot_"
+                            f"{slice_plot_index}_{slice_value_label:g}"
+                        ),
+                        file_stem=(
+                            "real_data_highlighted_slice_"
+                            f"{_safe_download_stem(real_metric)}_"
+                            f"{real_3d_slice_axes[0]}_"
+                            f"{real_3d_slice_axes[1]}_"
+                            f"{real_3d_slice_axis}_"
+                            f"{slice_value_label:g}"
+                        ),
+                        width_percent=effective_width_percent,
+                        export_width=real_slice_export_width,
+                        export_height=real_slice_export_height,
+                    )
+                    with container.expander(
+                        "Highlighted slice values"
+                        if len(real_3d_slice_plots) == 1
+                        else (
+                            "Highlighted slice values | "
+                            f"{_metric_label(real_3d_slice_axis)} = "
+                            f"{slice_value_label:g}"
+                        )
+                    ):
+                        st.dataframe(
+                            slice_plot["frame"].sort_values(
+                                real_3d_slice_axes
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
                 if real_phase == "both" and real_view == "1D slice":
                     if real_channel_mode == "Plot channels individually":
                         individual_channels = sorted(
@@ -17517,7 +18299,7 @@ def render_bo_session_app() -> None:
                                 real_points_by_phase["target"].loc[
                                     real_points_by_phase["target"]["channel"] == channel
                                 ],
-                                real_metric,
+                                display_real_metric,
                                 real_x,
                                 dot_size=plot_dot_size,
                                 dot_opacity=plot_dot_opacity,
@@ -17548,7 +18330,7 @@ def render_bo_session_app() -> None:
                         real_figure = _plot_real_data_both_1d(
                             real_points_by_phase["buffer"],
                             real_points_by_phase["target"],
-                            real_metric,
+                            display_real_metric,
                             real_x,
                             dot_size=plot_dot_size,
                             dot_opacity=plot_dot_opacity,
@@ -17603,9 +18385,30 @@ def render_bo_session_app() -> None:
                                         else str(series_name)
                                     )
                                     column.markdown(f"**{series_heading}**")
+                                associated_slice_plots = []
+                                plot_container = column
+                                if (
+                                    real_view == "3D tensor"
+                                    and real_channel_mode
+                                    == "Plot channels individually"
+                                ):
+                                    associated_slice_plots = [
+                                        (slice_plot_index, slice_plot)
+                                        for slice_plot_index, slice_plot in enumerate(
+                                            real_3d_slice_plots,
+                                            start=1,
+                                        )
+                                        if slice_plot.get("phase") == phase
+                                        and slice_plot.get("series_name")
+                                        == series_name
+                                    ]
+                                    if associated_slice_plots:
+                                        plot_container, slice_container = (
+                                            column.columns(2)
+                                        )
                                 real_figure = _plot_real_data_landscape(
                                     series_points,
-                                    real_metric,
+                                    display_real_metric,
                                     phase,
                                     real_view,
                                     real_x,
@@ -17649,6 +18452,7 @@ def render_bo_session_app() -> None:
                                         series_name,
                                     ),
                                     show_measured_points=real_show_2d_measured_points,
+                                    value_colorscale=real_value_colorscale,
                                 )
                                 plot_key = (
                                     f"bo_real_plot_{real_plot_state_key}_{phase}_"
@@ -17668,7 +18472,7 @@ def render_bo_session_app() -> None:
                                         f"{real_3d_slice_sweep_token}"
                                     )
                                     _render_downloadable_plotly(
-                                        column,
+                                        plot_container,
                                         real_figure,
                                         key=plot_key,
                                         file_stem=(
@@ -17676,10 +18480,33 @@ def render_bo_session_app() -> None:
                                             f"{real_metric}_3d_tensor_"
                                             f"{real_x}_{real_y}_{real_z}"
                                         ),
-                                        width_percent=plot_width_percent,
+                                        width_percent=(
+                                            100
+                                            if associated_slice_plots
+                                            else plot_width_percent
+                                        ),
                                         export_height=plot_3d_height,
                                         camera_storage_key=camera_storage_key,
                                     )
+                                    if associated_slice_plots:
+                                        slice_container.markdown(
+                                            "##### Highlighted slice 2D map"
+                                            if len(associated_slice_plots) == 1
+                                            else "##### Highlighted slice 2D maps"
+                                        )
+                                        for (
+                                            slice_plot_index,
+                                            slice_plot,
+                                        ) in associated_slice_plots:
+                                            render_real_highlighted_slice_plot(
+                                                slice_container,
+                                                slice_plot_index,
+                                                slice_plot,
+                                                show_heading=(
+                                                    len(associated_slice_plots) > 1
+                                                ),
+                                                display_width_percent=100,
+                                            )
                                 else:
                                     _plotly_chart_with_colorbars(
                                         _sized_plot_container(column, plot_width_percent),
@@ -17709,7 +18536,7 @@ def render_bo_session_app() -> None:
                             st.markdown(f"#### {series_heading}")
                         real_figure = _plot_real_data_landscape(
                             series_points,
-                            real_metric,
+                            display_real_metric,
                             real_phase,
                             real_view,
                             real_x,
@@ -17751,6 +18578,7 @@ def render_bo_session_app() -> None:
                                 series_name,
                             ),
                             show_measured_points=real_show_2d_measured_points,
+                            value_colorscale=real_value_colorscale,
                         )
                         if (
                             real_view == "1D slice"
@@ -17803,13 +18631,6 @@ def render_bo_session_app() -> None:
                     and real_3d_slice_axis is not None
                     and real_3d_slice_value is not None
                 ):
-                    real_3d_slice_plot_key = (
-                        f"bo_real_highlighted_2d_slice_{real_scope_key}_"
-                        f"{real_metric}_{real_phase}_{real_channel_mode}_"
-                        f"{real_x}_{real_y}_{real_z}_"
-                        f"{real_3d_slice_token}_{real_3d_slice_sweep_token}_"
-                        f"log{int(bool(real_log_frequency))}"
-                    )
                     show_real_3d_slice_points = st.checkbox(
                         "Show measured points on highlighted 2D slices",
                         value=False,
@@ -17878,7 +18699,7 @@ def render_bo_session_app() -> None:
                                             continue
                                         slice_figure = _plot_real_data_landscape(
                                             slice_points,
-                                            real_metric,
+                                            display_real_metric,
                                             phase_name,
                                             "2D map",
                                             real_3d_slice_axes[0],
@@ -17911,6 +18732,7 @@ def render_bo_session_app() -> None:
                                             show_measured_points=(
                                                 show_real_3d_slice_points
                                             ),
+                                            value_colorscale=real_value_colorscale,
                                         )
                                         add_real_selected_channel_paths(
                                             slice_figure,
@@ -17949,16 +18771,26 @@ def render_bo_session_app() -> None:
                                 "plots": real_3d_slice_plots,
                                 "axes": real_3d_slice_axes,
                             }
+                            if (
+                                real_phase == "both"
+                                and real_channel_mode
+                                == "Plot channels individually"
+                            ):
+                                st.rerun()
                         else:
                             st.session_state.pop(real_3d_slice_plot_key, None)
                             st.warning(
                                 "No real-data points match the highlighted 3D "
                                 "slice sweep."
                             )
-                    highlighted_real_3d_slice_plot = st.session_state.get(
-                        real_3d_slice_plot_key
-                    )
-                    if highlighted_real_3d_slice_plot is not None:
+                    if (
+                        highlighted_real_3d_slice_plot is not None
+                        and not (
+                            real_phase == "both"
+                            and real_channel_mode
+                            == "Plot channels individually"
+                        )
+                    ):
                         real_3d_slice_axes = highlighted_real_3d_slice_plot.get(
                             "axes",
                             [],
@@ -17976,80 +18808,12 @@ def render_bo_session_app() -> None:
                             real_3d_slice_plots,
                             start=1,
                         ):
-                            slice_value_label = float(slice_plot["slice_value"])
-                            if len(real_3d_slice_plots) > 1:
-                                series_name = slice_plot.get("series_name")
-                                series_label = (
-                                    f" | {series_name}"
-                                    if series_name is not None else ""
-                                )
-                                st.markdown(
-                                    f"#### {str(slice_plot.get('phase')).title()}"
-                                    f"{series_label} | "
-                                    f"{_metric_label(real_3d_slice_axis)} = "
-                                    f"{slice_value_label:g}"
-                                )
-                            real_slice_export_width = max(
-                                500,
-                                int(1200 * plot_width_percent / 100),
-                            )
-                            real_slice_export_height = max(
-                                320,
-                                int(
-                                    round(
-                                        real_slice_export_width
-                                        / SURROGATE_2D_FIGURE_ASPECT
-                                    )
-                                ),
-                            )
-                            _apply_plotly_2d_slice_aspect(
-                                slice_plot["figure"],
-                                width=real_slice_export_width,
-                                height=real_slice_export_height,
-                            )
-                            _apply_plotly_slice_perimeter_style(
-                                slice_plot["figure"],
-                                slice_plot.get(
-                                    "plotly_slice_color",
-                                    "rgba(255,59,48,1)",
-                                ),
-                                thickness=real_3d_slice_perimeter_thickness,
-                            )
-                            _render_downloadable_plotly(
+                            render_real_highlighted_slice_plot(
                                 st,
-                                slice_plot["figure"],
-                                key=(
-                                    f"{real_3d_slice_plot_key}_plot_"
-                                    f"{slice_plot_index}_{slice_value_label:g}"
-                                ),
-                                file_stem=(
-                                    "real_data_highlighted_slice_"
-                                    f"{_safe_download_stem(real_metric)}_"
-                                    f"{real_3d_slice_axes[0]}_"
-                                    f"{real_3d_slice_axes[1]}_"
-                                    f"{real_3d_slice_axis}_"
-                                    f"{slice_value_label:g}"
-                                ),
-                                width_percent=plot_width_percent,
-                                export_width=real_slice_export_width,
-                                export_height=real_slice_export_height,
+                                slice_plot_index,
+                                slice_plot,
+                                show_heading=len(real_3d_slice_plots) > 1,
                             )
-                            with st.expander(
-                                "Highlighted slice values"
-                                if len(real_3d_slice_plots) == 1
-                                else (
-                                    "Highlighted slice values | "
-                                    f"{_metric_label(real_3d_slice_axis)} = "
-                                    f"{slice_value_label:g}"
-                                )
-                            ):
-                                st.dataframe(
-                                    slice_plot["frame"].sort_values(
-                                        real_3d_slice_axes
-                                    ),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
 
                 if (
                     real_view == "2D map"
@@ -18154,7 +18918,7 @@ def render_bo_session_app() -> None:
                                         )
                                     sweep_figure = _plot_real_data_landscape(
                                         sweep_series_points,
-                                        real_metric,
+                                        display_real_metric,
                                         sweep_phase,
                                         real_view,
                                         real_x,
@@ -18193,6 +18957,7 @@ def render_bo_session_app() -> None:
                                         show_measured_points=(
                                             real_show_2d_measured_points
                                         ),
+                                        value_colorscale=real_value_colorscale,
                                     )
                                     add_real_selected_channel_paths(
                                         sweep_figure,
@@ -18470,7 +19235,7 @@ def render_bo_session_app() -> None:
                                         _plot_interpolated_3d_landscape(
                                             valid_points,
                                             grid_frame,
-                                            real_metric,
+                                            display_real_metric,
                                             real_x,
                                             real_y,
                                             real_z,
@@ -18481,6 +19246,7 @@ def render_bo_session_app() -> None:
                                             value_range=real_value_range,
                                             slice_axis=interpolation_slice_axis,
                                             slice_value=interpolation_slice_value,
+                                            value_colorscale=real_value_colorscale,
                                         )
                                     )
                                     interpolation_plot_key = (
@@ -18637,7 +19403,7 @@ def render_bo_session_app() -> None:
                                                     _plot_interpolated_2d_slice(
                                                         valid_points,
                                                         grid_frame,
-                                                        real_metric,
+                                                        display_real_metric,
                                                         interpolation_slice_plot_axes[0],
                                                         interpolation_slice_plot_axes[1],
                                                         interpolation_slice_axis,
@@ -18649,6 +19415,7 @@ def render_bo_session_app() -> None:
                                                         show_measured_points=(
                                                             show_interpolation_slice_points
                                                         ),
+                                                        value_colorscale=real_value_colorscale,
                                                     )
                                                 )
                                                 original_tensor_figure = None
@@ -18656,7 +19423,7 @@ def render_bo_session_app() -> None:
                                                     original_tensor_figure = (
                                                         _plot_real_data_landscape(
                                                             source_points,
-                                                            real_metric,
+                                                            display_real_metric,
                                                             interpolation_phase,
                                                             "3D tensor",
                                                             real_x,
@@ -18681,6 +19448,7 @@ def render_bo_session_app() -> None:
                                                             ),
                                                             slice_axis=interpolation_slice_axis,
                                                             slice_value=interpolation_slice_value,
+                                                            value_colorscale=real_value_colorscale,
                                                         )
                                                     )
                                                     original_tensor_figure.update_layout(
@@ -18947,7 +19715,7 @@ def render_bo_session_app() -> None:
                                             )
                                         frame_figure = _plot_real_data_landscape(
                                             frame_points,
-                                            real_metric,
+                                            display_real_metric,
                                             phase,
                                             real_view,
                                             real_x,
@@ -18972,6 +19740,7 @@ def render_bo_session_app() -> None:
                                             axis_ranges=real_axis_ranges,
                                             value_range=real_value_range,
                                             title_note=real_2d_title_note,
+                                            value_colorscale=real_value_colorscale,
                                         )
                                         if real_show_selected_channel_paths:
                                             frame_runs = []
@@ -23267,7 +24036,7 @@ def render_bo_session_app() -> None:
                                     sim_trace_channel_key,
                                     f"{sim_trace_channel_key}__preferred",
                                     trace_channels,
-                                    trace_channels[:1],
+                                    trace_channels,
                                 )
                             )
                             sim_trace_channels = trace_columns[1].multiselect(
