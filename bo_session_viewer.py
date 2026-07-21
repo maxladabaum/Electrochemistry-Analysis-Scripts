@@ -72,6 +72,15 @@ SURROGATE_VALUE_LABELS = {
     "predicted_std_Q": "Predicted Q std.",
     "acquisition_value": "Acquisition value",
 }
+PLOTLY_3D_TRACE_TYPES = {
+    "cone",
+    "isosurface",
+    "mesh3d",
+    "scatter3d",
+    "streamtube",
+    "surface",
+    "volume",
+}
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 OBSERVED_PATH_CMAP = LinearSegmentedColormap.from_list(
     "observed_iteration", OBSERVED_PATH_COLORS
@@ -325,7 +334,7 @@ def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list
             q_run = float(row.get("Q_run", row.get("observed_value")))
         except (TypeError, ValueError):
             continue
-        channel_text = str(row.get("channels", group_id))
+        channel_text = str(row.get("ground_truth_channel", row.get("channels", group_id)))
         try:
             channels = [
                 int(float(part.strip()))
@@ -406,6 +415,121 @@ def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list
     return observations
 
 
+def _normalize_simulated_channel_identities(
+    observations: list[dict],
+    history: pd.DataFrame,
+    config: dict,
+) -> tuple[list[dict], pd.DataFrame, dict]:
+    records = config.get("records") if isinstance(config, dict) else {}
+    if not records or not records.get("simulated_session"):
+        return observations, history, config
+    normalized_history = history.copy()
+    if (
+        not normalized_history.empty
+        and "ground_truth_channel" in normalized_history.columns
+        and "Q_run" in normalized_history.columns
+    ):
+        q_channel_columns = [
+            column for column in normalized_history.columns
+            if re.fullmatch(r"Q_ch\d+", str(column), re.IGNORECASE)
+        ]
+        normalized_history = normalized_history.drop(
+            columns=q_channel_columns,
+            errors="ignore",
+        )
+        for channel in normalized_history["ground_truth_channel"].dropna().astype(str).unique():
+            column = _simulation_history_channel_column(channel)
+            channel_rows = (
+                normalized_history["ground_truth_channel"].astype(str) == channel
+            )
+            normalized_history.loc[channel_rows, column] = normalized_history.loc[
+                channel_rows,
+                "Q_run",
+            ]
+        normalized_history["channels"] = normalized_history[
+            "ground_truth_channel"
+        ].astype(str)
+    normalized_observations = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            normalized_observations.append(observation)
+            continue
+        normalized = dict(observation)
+        quality = dict(normalized.get("quality") or {})
+        simulation_truth = dict(normalized.get("simulation_truth") or {})
+        channel = (
+            quality.get("ground_truth_channel")
+            or simulation_truth.get("ground_truth_channel")
+        )
+        if channel is not None:
+            channel_text = str(channel)
+            channel_values = _simulation_channel_list_value(channel_text)
+            q_run = _finite_float(
+                normalized.get("Q_run", quality.get("Q_run"))
+            )
+            normalized["channels"] = channel_values
+            components = dict(quality.get("channel_components") or {})
+            source_component = {}
+            if components:
+                source_component = dict(next(iter(components.values())) or {})
+            if q_run is not None:
+                source_component.setdefault("Q_channel", q_run)
+                source_component.setdefault("classic_Q", q_run)
+                source_component.setdefault("snr_score", q_run)
+                source_component.setdefault("normalized_SNR", q_run)
+            quality["channel_components"] = {channel_text: source_component}
+            normalized["quality"] = quality
+            channel_metrics = dict(normalized.get("channel_metrics") or {})
+            source_metrics = {}
+            if channel_metrics:
+                source_metrics = dict(next(iter(channel_metrics.values())) or {})
+            if q_run is not None:
+                source_metrics.setdefault("Q_channel", q_run)
+                source_metrics.setdefault("classic_Q", q_run)
+                source_metrics.setdefault("snr", max(0.0, q_run))
+                source_metrics.setdefault("snr_unadjusted", max(0.0, q_run))
+                source_metrics.setdefault("success_score", q_run)
+                source_metrics.setdefault("mean_peak_current_uA", q_run)
+            normalized["channel_metrics"] = {channel_text: source_metrics}
+        normalized_observations.append(normalized)
+    normalized_config = config
+    if (
+        isinstance(config, dict)
+        and not normalized_history.empty
+        and "ground_truth_channel" in normalized_history.columns
+    ):
+        normalized_config = json.loads(json.dumps(config))
+        real_channels = sorted(
+            normalized_history["ground_truth_channel"].dropna().astype(str).unique(),
+            key=_channel_sort_key,
+        )
+        normalized_config["channels"] = [
+            int(float(channel))
+            if _finite_float(channel) is not None
+            and float(_finite_float(channel)).is_integer()
+            else channel
+            for channel in real_channels
+        ]
+        for group in normalized_config.get("channel_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            group_id = _finite_float(group.get("id"))
+            if group_id is None or "group_id" not in normalized_history.columns:
+                continue
+            rows = normalized_history.loc[
+                pd.to_numeric(
+                    normalized_history["group_id"],
+                    errors="coerce",
+                ) == int(group_id)
+            ]
+            if rows.empty or rows["ground_truth_channel"].dropna().empty:
+                continue
+            channel = rows["ground_truth_channel"].dropna().astype(str).iloc[0]
+            group["ground_truth_channel"] = channel
+            group["channels"] = _simulation_channel_list_value(channel)
+    return normalized_observations, normalized_history, normalized_config
+
+
 def load_bo_session(folder: str | Path) -> dict:
     """Load a BO record folder without depending on experiment_automation."""
     root = Path(folder).expanduser().resolve()
@@ -432,6 +556,11 @@ def load_bo_session(folder: str | Path) -> dict:
         pd.read_csv(simulation_ground_truth_path)
         if simulation_ground_truth_path.is_file()
         else pd.DataFrame()
+    )
+    observations, history, config = _normalize_simulated_channel_identities(
+        observations,
+        history,
+        config,
     )
     return {
         "root": root,
@@ -545,6 +674,96 @@ def _channel_group_optimization_metadata(
     state_groups = groups_by_id(
         (session.get("state") or {}).get("channel_groups")
     )
+    history = session.get("history")
+    history_groups: dict[int, dict] = {}
+    if (
+        isinstance(history, pd.DataFrame)
+        and not history.empty
+        and "group_id" in history.columns
+    ):
+        metadata_columns = {
+            "exploration",
+            "initial_random_points",
+            "candidate_pool_size",
+            "local_candidate_pool_size",
+            "gp_noise_level",
+            "gp_optimizer_restarts",
+            "replicate",
+            "seed",
+        }
+        available_metadata_columns = [
+            column for column in metadata_columns
+            if column in history.columns
+        ]
+        falloff_columns = [
+            column for column in ("gp_falloff_parameter", "gp_falloff_value")
+            if column in history.columns
+        ]
+        name_columns = [
+            column for column in ("group_name", "run_label")
+            if column in history.columns
+        ]
+        channel_columns = [
+            column for column in ("channels", "ground_truth_channel")
+            if column in history.columns
+        ]
+        for raw_group_id, rows in history.groupby(
+            "group_id",
+            sort=False,
+            dropna=True,
+        ):
+            group_id_value = _finite_float(raw_group_id)
+            if group_id_value is None:
+                continue
+            group_id = int(group_id_value)
+            row_settings: dict[str, Any] = {}
+            for column in available_metadata_columns:
+                values = rows[column].dropna()
+                if values.empty:
+                    continue
+                numeric_value = _finite_float(values.iloc[0])
+                setting_key = {
+                    "initial_random_points": "n_initial_points",
+                    "replicate": "simulation_replicate",
+                    "seed": "simulation_seed",
+                }.get(column, column)
+                row_settings[setting_key] = (
+                    numeric_value
+                    if numeric_value is not None
+                    else values.astype(str).iloc[0]
+                )
+            for column in name_columns:
+                values = rows[column].dropna()
+                if not values.empty:
+                    row_settings["name"] = str(values.astype(str).iloc[0])
+                    break
+            for column in channel_columns:
+                values = rows[column].dropna()
+                if values.empty:
+                    continue
+                raw_channels = str(values.astype(str).iloc[0])
+                channels = [
+                    part.strip()
+                    for part in raw_channels.split(",")
+                    if part.strip()
+                ]
+                if channels:
+                    row_settings["channels"] = channels
+                    break
+            if set(falloff_columns) == {
+                "gp_falloff_parameter",
+                "gp_falloff_value",
+            }:
+                parameter_values = rows["gp_falloff_parameter"].dropna()
+                value_values = rows["gp_falloff_value"].dropna()
+                if not parameter_values.empty and not value_values.empty:
+                    falloff_value = _finite_float(value_values.iloc[0])
+                    if falloff_value is not None:
+                        row_settings["gp_falloff_fractions"] = {
+                            str(parameter_values.astype(str).iloc[0]): falloff_value
+                        }
+            if row_settings:
+                history_groups[group_id] = row_settings
     metadata = []
     for group in groups:
         if not isinstance(group, dict):
@@ -580,6 +799,7 @@ def _channel_group_optimization_metadata(
         }
         settings.update(as_dict(config_groups.get(group_id)))
         settings.update(as_dict(state_groups.get(group_id)))
+        settings.update(as_dict(history_groups.get(group_id)))
         exploration = settings.get("exploration")
         try:
             exploration = float(exploration)
@@ -839,6 +1059,9 @@ def _metric_label(metric: str) -> str:
         "best_Q": "Best Q",
         "Q_channel": "Channel Q",
         "Q_run": "Q run",
+        "frequency_at_best_q": "Frequency at best Q",
+        "amplitude_at_best_q": "Amplitude at best Q",
+        "step_potential_at_best_q": "Step size at best Q",
         "mean_peak_current_uA": "Peak height (µA)",
         "median_peak_current_uA": "Peak height (µA)",
         "snr_unadjusted": "Raw SNR",
@@ -1245,6 +1468,125 @@ def _session_simulation_optimum_reference(session: dict) -> dict[str, float] | N
     return None
 
 
+def _session_simulation_group_optimum_references(
+    session: dict,
+    frame: pd.DataFrame,
+) -> dict[int, dict[str, float]]:
+    ground_truth = session.get("simulation_ground_truth")
+    if (
+        not isinstance(ground_truth, pd.DataFrame)
+        or ground_truth.empty
+        or "ground_truth_channel" not in ground_truth.columns
+        or frame is None
+        or frame.empty
+        or "group_id" not in frame.columns
+    ):
+        return {}
+    value_column = _simulation_optimum_value_column(ground_truth)
+    if value_column is None:
+        return {}
+    group_channels: dict[int, str] = {}
+    for raw_group_id, rows in frame.groupby("group_id", sort=False, dropna=True):
+        group_id_value = _finite_float(raw_group_id)
+        if group_id_value is None:
+            continue
+        group_id = int(group_id_value)
+        channel = None
+        if "ground_truth_channel" in rows.columns:
+            channels = rows["ground_truth_channel"].dropna().astype(str)
+            if not channels.empty:
+                channel = channels.iloc[0]
+        if channel is None:
+            group_metadata = (
+                (session.get("config") or {}).get("channel_groups")
+                or (session.get("state") or {}).get("channel_groups")
+                or []
+            )
+            for group in group_metadata:
+                if not isinstance(group, dict):
+                    continue
+                if _finite_float(group.get("id")) != group_id:
+                    continue
+                saved_channel = group.get("ground_truth_channel")
+                if saved_channel is not None:
+                    channel = str(saved_channel)
+                    break
+        if channel is not None:
+            group_channels[group_id] = str(channel)
+    if not group_channels:
+        return {}
+    references: dict[int, dict[str, float]] = {}
+    truth_channels = ground_truth["ground_truth_channel"].astype(str)
+    for group_id, channel in group_channels.items():
+        channel_truth = ground_truth.loc[truth_channels == channel]
+        reference = _simulation_optimum_reference_from_frame(
+            channel_truth,
+            value_column=value_column,
+        )
+        if reference:
+            references[group_id] = reference
+    return references
+
+
+def _add_global_optimum_marker(
+    fig: go.Figure,
+    reference: dict[str, float] | None,
+    x_name: str,
+    y_name: str,
+    z_name: str | None = None,
+    *,
+    label: str = "Global optimum",
+    slice_axis: str | None = None,
+    slice_value: float | None = None,
+) -> None:
+    if not reference:
+        return
+    if z_name is None and slice_axis is not None and slice_value is not None:
+        optimum_slice_value = _finite_float(reference.get(slice_axis))
+        if optimum_slice_value is None or not np.isclose(
+            optimum_slice_value,
+            float(slice_value),
+            rtol=1e-5,
+            atol=1e-8,
+        ):
+            return
+    x_value = _finite_float(reference.get(x_name))
+    y_value = _finite_float(reference.get(y_name))
+    z_value = _finite_float(reference.get(z_name)) if z_name is not None else None
+    if x_value is None or y_value is None or (z_name is not None and z_value is None):
+        return
+    q_value = _finite_float(reference.get("Q_run"))
+    hover_lines = [
+        label,
+        f"{x_name}: {x_value:.4g}",
+        f"{y_name}: {y_value:.4g}",
+    ]
+    if z_name is not None:
+        hover_lines.append(f"{z_name}: {z_value:.4g}")
+    if q_value is not None:
+        hover_lines.append(f"Q: {q_value:.4g}")
+    marker = {
+        "symbol": "diamond",
+        "size": 15,
+        "color": "#ff2d2d",
+        "line": {"color": "white", "width": 3},
+    }
+    kwargs = {
+        "x": [x_value],
+        "y": [y_value],
+        "mode": "markers",
+        "name": label,
+        "marker": marker,
+        "hovertemplate": "<br>".join(hover_lines) + "<extra></extra>",
+        "showlegend": True,
+    }
+    if z_name is not None:
+        kwargs["z"] = [z_value]
+        fig.add_trace(go.Scatter3d(**kwargs))
+    else:
+        fig.add_trace(go.Scatter(**kwargs))
+
+
 def _add_horizontal_reference_line(
     fig: go.Figure,
     y_value: float | None,
@@ -1272,6 +1614,36 @@ def _add_horizontal_reference_line(
         ))
 
 
+def _add_group_reference_line(
+    fig: go.Figure,
+    x_values,
+    y_value: float | None,
+    label: str,
+    *,
+    showlegend: bool = True,
+    row: int | None = None,
+    col: int | None = None,
+) -> None:
+    if y_value is None or not np.isfinite(float(y_value)):
+        return
+    numeric_x = pd.to_numeric(pd.Series(list(x_values)), errors="coerce").dropna()
+    if numeric_x.empty:
+        return
+    trace = go.Scatter(
+        x=[float(numeric_x.min()), float(numeric_x.max())],
+        y=[float(y_value), float(y_value)],
+        mode="lines",
+        name=label,
+        line={"dash": "dash", "color": "#d62728", "width": 1.5},
+        hovertemplate=f"{label}: %{{y:.4g}}<extra></extra>",
+        showlegend=showlegend,
+    )
+    if row is not None and col is not None:
+        fig.add_trace(trace, row=row, col=col)
+    else:
+        fig.add_trace(trace)
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_trend(
     frame: pd.DataFrame,
@@ -1283,6 +1655,8 @@ def _plot_trend(
     group_average_label: str | None = None,
     reference_value: float | None = None,
     reference_label: str | None = None,
+    reference_values_by_group: dict[int, float] | None = None,
+    trace_opacity: float = 1.0,
 ):
     if metric not in frame.columns:
         fig = go.Figure()
@@ -1296,7 +1670,9 @@ def _plot_trend(
     x = pd.to_numeric(frame.get("iteration", pd.Series(range(1, len(frame) + 1))), errors="coerce")
     valid = values.notna() & x.notna()
     fig = go.Figure()
+    trace_opacity = min(1.0, max(0.05, float(trace_opacity)))
     grouped = "group_id" in frame.columns and frame.loc[valid, "group_id"].nunique() > 1
+    reference_values_by_group = reference_values_by_group or {}
     if grouped and group_average_values:
         average_data = pd.DataFrame({
             "iteration": x[valid].astype(int),
@@ -1348,6 +1724,7 @@ def _plot_trend(
                     name=trace_name,
                     marker=marker,
                     line={"color": group_color} if group_color else None,
+                    opacity=trace_opacity,
                     customdata=rows["iteration"],
                     hovertemplate=(
                         f"{trace_name}<br>Iteration %{{x}}<br>"
@@ -1373,11 +1750,41 @@ def _plot_trend(
                 clickmode="event+select",
             )
             _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
-            _add_horizontal_reference_line(
-                fig,
-                reference_value,
-                reference_label or "Ground-truth optimum",
-            )
+            if reference_values_by_group:
+                reference_frame = average_data.copy()
+                reference_frame["reference_value"] = [
+                    reference_values_by_group.get(int(group_id))
+                    for group_id in reference_frame["group_id"]
+                ]
+                reference_frame = reference_frame.dropna(
+                    subset=["average_value", "reference_value"]
+                )
+                for reference_index, (average_value, rows) in enumerate(
+                    reference_frame.groupby("average_value", sort=True)
+                ):
+                    averaged_reference = pd.to_numeric(
+                        rows["reference_value"],
+                        errors="coerce",
+                    ).dropna()
+                    if averaged_reference.empty:
+                        continue
+                    value_label = _metadata_value_label(average_value)
+                    _add_group_reference_line(
+                        fig,
+                        rows["iteration"],
+                        float(averaged_reference.mean()),
+                        (
+                            f"{reference_label or 'Ground-truth optimum'} "
+                            f"({group_average_label or 'metadata'} {value_label})"
+                        ),
+                        showlegend=reference_index == 0,
+                    )
+            else:
+                _add_horizontal_reference_line(
+                    fig,
+                    reference_value,
+                    reference_label or "Ground-truth optimum",
+                )
             return fig
     if grouped and group_layout == "Average groups together":
         averaged = pd.DataFrame({
@@ -1390,6 +1797,7 @@ def _plot_trend(
             mode="lines+markers",
             name="Group average",
             marker={"size": 8},
+            opacity=trace_opacity,
             customdata=averaged["iteration"],
             hovertemplate=(
                 "Iteration %{x}<br>Group average: %{y:.4g}<extra></extra>"
@@ -1403,11 +1811,23 @@ def _plot_trend(
             margin={"l": 65, "r": 20, "t": 50, "b": 55},
             clickmode="event+select",
         )
-        _add_horizontal_reference_line(
-            fig,
-            reference_value,
-            reference_label or "Ground-truth optimum",
-        )
+        if reference_values_by_group:
+            reference_values = [
+                value for value in reference_values_by_group.values()
+                if _finite_float(value) is not None
+            ]
+            if reference_values:
+                _add_horizontal_reference_line(
+                    fig,
+                    float(np.mean(reference_values)),
+                    reference_label or "Average ground-truth optimum",
+                )
+        else:
+            _add_horizontal_reference_line(
+                fig,
+                reference_value,
+                reference_label or "Ground-truth optimum",
+            )
         return fig
     if grouped and group_layout == "Plot groups separately":
         grouped_rows = list(frame.loc[valid].groupby("group_id", sort=True))
@@ -1464,6 +1884,7 @@ def _plot_trend(
                     name=group_name,
                     marker=marker or None,
                     line={"color": group_color} if group_color else None,
+                    opacity=trace_opacity,
                     customdata=iterations,
                     hovertemplate=(
                         f"{group_name}<br>Iteration %{{x}}<br>"
@@ -1484,6 +1905,17 @@ def _plot_trend(
                 row=subplot_row + 1,
                 col=subplot_column + 1,
             )
+            group_reference = reference_values_by_group.get(int(group_id))
+            if group_reference is not None:
+                _add_group_reference_line(
+                    fig,
+                    iterations,
+                    group_reference,
+                    f"{reference_label or 'Ground-truth optimum'}: {group_name}",
+                    showlegend=False,
+                    row=subplot_row + 1,
+                    col=subplot_column + 1,
+                )
         _apply_metadata_coloraxis(
             fig,
             group_color_values,
@@ -1506,7 +1938,7 @@ def _plot_trend(
         )
         _add_horizontal_reference_line(
             fig,
-            reference_value,
+            None if reference_values_by_group else reference_value,
             reference_label or "Ground-truth optimum",
         )
         return fig
@@ -1548,12 +1980,26 @@ def _plot_trend(
             name=group_name,
             marker=marker,
             line={"color": group_color} if group_color else None,
+            opacity=trace_opacity,
             customdata=iterations,
             hovertemplate=(
                 f"{group_name}<br>Iteration %{{x}}<br>"
                 f"{metric}: %{{y:.4g}}<extra></extra>"
             ),
         ))
+        group_reference = (
+            reference_values_by_group.get(int(group_id))
+            if grouped and _finite_float(group_id) is not None
+            else None
+        )
+        if group_reference is not None:
+            _add_group_reference_line(
+                fig,
+                iterations,
+                group_reference,
+                f"{reference_label or 'Ground-truth optimum'}: {group_name}",
+                showlegend=True,
+            )
     if grouped:
         _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
     fig.update_layout(
@@ -1581,11 +2027,12 @@ def _plot_trend(
     )
     if grouped and not group_color_values:
         fig.update_traces(marker_showscale=False)
-    _add_horizontal_reference_line(
-        fig,
-        reference_value,
-        reference_label or "Ground-truth optimum",
-    )
+    if not reference_values_by_group:
+        _add_horizontal_reference_line(
+            fig,
+            reference_value,
+            reference_label or "Ground-truth optimum",
+        )
     return _apply_plotly_colorbar_height(fig)
 
 
@@ -1615,6 +2062,44 @@ def _hyperparameter_response_columns(frame: pd.DataFrame) -> list[str]:
     return columns
 
 
+def _hyperparameter_response_channel_label(rows: pd.DataFrame) -> str:
+    channel_values: list[str] = []
+    for column in ("ground_truth_channel", "channels"):
+        if column not in rows.columns:
+            continue
+        for value in rows[column].dropna().astype(str).unique():
+            for part in re.split(r"[,;|]", value):
+                text = part.strip().strip("[]()")
+                if not text or text.lower() in {"nan", "none"}:
+                    continue
+                if text.endswith(".0") and text[:-2].isdigit():
+                    text = text[:-2]
+                channel_values.append(text)
+    unique_channels = sorted(set(channel_values), key=_channel_sort_key)
+    if not unique_channels:
+        return "Unknown"
+    return ", ".join(f"Ch {channel}" for channel in unique_channels)
+
+
+def _join_hyperparameter_response_channels(values: pd.Series) -> str:
+    channels: list[str] = []
+    for value in values.dropna().astype(str):
+        for part in value.split(","):
+            text = part.strip()
+            if text and text != "Unknown":
+                channels.append(text)
+    if not channels:
+        return "Unknown"
+    return ", ".join(
+        sorted(
+            set(channels),
+            key=lambda value: _channel_sort_key(
+                str(value).removeprefix("Ch ").strip()
+            ),
+        )
+    )
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _hyperparameter_response_frame(
     frame: pd.DataFrame,
@@ -1623,14 +2108,30 @@ def _hyperparameter_response_frame(
     iteration: int | None = None,
     q_target: float | None = None,
     include_misses: bool = False,
+    at_best_q_parameter: str | None = None,
 ) -> pd.DataFrame:
-    if metric not in frame.columns or frame.empty:
+    if frame.empty:
+        return pd.DataFrame()
+    best_q_column = None
+    if at_best_q_parameter is not None:
+        if at_best_q_parameter not in frame.columns:
+            return pd.DataFrame()
+        for candidate in ("Q_run", "best_Q", "best_so_far", "observed_value"):
+            if candidate in frame.columns:
+                best_q_column = candidate
+                break
+        if best_q_column is None:
+            return pd.DataFrame()
+    elif metric not in frame.columns:
         return pd.DataFrame()
     hyper_columns = _hyperparameter_response_columns(frame)
     if len(hyper_columns) < 2:
         return pd.DataFrame()
     work = frame.copy()
-    work["_metric_value"] = pd.to_numeric(work[metric], errors="coerce")
+    source_metric = at_best_q_parameter or metric
+    work["_metric_value"] = pd.to_numeric(work[source_metric], errors="coerce")
+    if best_q_column is not None:
+        work["_best_q_value"] = pd.to_numeric(work[best_q_column], errors="coerce")
     work["_iteration_value"] = pd.to_numeric(
         work.get("iteration", pd.Series(range(1, len(work) + 1), index=work.index)),
         errors="coerce",
@@ -1638,6 +2139,8 @@ def _hyperparameter_response_frame(
     for column in hyper_columns:
         work[column] = pd.to_numeric(work[column], errors="coerce")
     valid = work["_metric_value"].notna() & work["_iteration_value"].notna()
+    if best_q_column is not None:
+        valid &= work["_best_q_value"].notna()
     for column in hyper_columns:
         valid &= work[column].notna()
     work = work.loc[valid].copy()
@@ -1660,7 +2163,17 @@ def _hyperparameter_response_frame(
     rows = []
     for key, rows_for_run in work.groupby(group_columns, dropna=False, sort=False):
         rows_for_run = rows_for_run.sort_values("_iteration_value")
-        if summary_mode == "Iterations to Q target":
+        if at_best_q_parameter is not None:
+            if iteration is not None:
+                rows_for_run = rows_for_run.loc[
+                    rows_for_run["_iteration_value"] <= int(iteration)
+                ]
+                if rows_for_run.empty:
+                    continue
+            idx = rows_for_run["_best_q_value"].idxmax()
+            metric_value = float(rows_for_run.loc[idx, "_metric_value"])
+            source_iteration = int(rows_for_run.loc[idx, "_iteration_value"])
+        elif summary_mode == "Iterations to Q target":
             if q_target is None or not np.isfinite(float(q_target)):
                 continue
             metric_series = rows_for_run["_metric_value"]
@@ -1701,6 +2214,9 @@ def _hyperparameter_response_frame(
         row.update({
             "metric_value": metric_value,
             "source_iteration": source_iteration,
+            "response_channels": _hyperparameter_response_channel_label(
+                rows_for_run
+            ),
         })
         rows.append(row)
     return pd.DataFrame(rows)
@@ -1722,12 +2238,19 @@ def _hyperparameter_response_grouped(
         "Minimum": "min",
     }[aggregate]
     group_axes = [x_axis, y_axis, *([z_axis] if z_axis else [])]
+    if "response_channels" not in response.columns:
+        response = response.copy()
+        response["response_channels"] = "Unknown"
     return (
         response.groupby(group_axes, as_index=False, dropna=False)
         .agg(
             metric_value=("metric_value", aggregate_func),
             repeats=("metric_value", "count"),
             std=("metric_value", "std"),
+            channels=(
+                "response_channels",
+                _join_hyperparameter_response_channels,
+            ),
         )
         .sort_values(group_axes)
     )
@@ -1831,7 +2354,7 @@ def _hyperparameter_response_voxel_interior_points(
     y_axis: str,
     z_axis: str,
     point_count: int = 27,
-) -> tuple[list[float], list[float], list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[float], list[list[Any]]]:
     x_bounds, y_bounds, z_bounds = _hyperparameter_response_voxel_bounds(
         grouped,
         x_axis=x_axis,
@@ -1864,6 +2387,7 @@ def _hyperparameter_response_voxel_interior_points(
     interior_y: list[float] = []
     interior_z: list[float] = []
     interior_values: list[float] = []
+    interior_customdata: list[list[Any]] = []
     for _row_index, row in grouped.iterrows():
         x0, x1 = x_bounds[float(row[x_axis])]
         y0, y1 = y_bounds[float(row[y_axis])]
@@ -1874,7 +2398,13 @@ def _hyperparameter_response_voxel_interior_points(
             interior_y.append(float(y0 + y_fraction * (y1 - y0)))
             interior_z.append(float(z0 + z_fraction * (z1 - z0)))
             interior_values.append(value)
-    return interior_x, interior_y, interior_z, interior_values
+            interior_customdata.append([
+                value,
+                float(row.get("repeats", np.nan)),
+                float(row.get("std", np.nan)),
+                str(row.get("channels", "Unknown")),
+            ])
+    return interior_x, interior_y, interior_z, interior_customdata
 
 
 def _add_hyperparameter_slice_plane(
@@ -2068,13 +2598,25 @@ def _plot_hyperparameter_response(
     z_axis: str | None = None,
     metric_label: str,
     aggregate: str,
-    voxel_face_opacity: float = 0.72,
-    voxel_internal_opacity: float = 0.0,
-    voxel_internal_point_size: int = 3,
-    voxel_internal_point_count: int = 27,
+    voxel_face_opacity: float = 0.1,
+    voxel_internal_opacity: float = 1.0,
+    voxel_internal_point_size: int = 20,
+    voxel_internal_point_count: int = 1,
     slice_axis: str | None = None,
     slice_value: float | None = None,
 ) -> go.Figure:
+    response_colorscale = "Plasma"
+
+    def response_colorbar() -> dict[str, Any]:
+        return {
+            "title": {"text": metric_label, "side": "right"},
+            "tickformat": ".4g",
+            "ticks": "outside",
+            "thickness": 18,
+            "x": 1.03,
+            "xpad": 8,
+        }
+
     if response.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -2095,6 +2637,23 @@ def _plot_hyperparameter_response(
         aggregate=aggregate,
     )
     if z_axis:
+        response_values = pd.to_numeric(grouped["metric_value"], errors="coerce")
+        finite_response_values = response_values[np.isfinite(response_values)]
+        response_min = (
+            float(finite_response_values.min())
+            if not finite_response_values.empty else None
+        )
+        response_max = (
+            float(finite_response_values.max())
+            if not finite_response_values.empty else None
+        )
+        if (
+            response_min is not None
+            and response_max is not None
+            and np.isclose(response_min, response_max)
+        ):
+            response_max = response_min + 1.0
+        show_internal_points = float(voxel_internal_opacity) > 0
         (
             vertices_x,
             vertices_y,
@@ -2110,8 +2669,8 @@ def _plot_hyperparameter_response(
             z_axis=z_axis,
         )
         fig = go.Figure()
-        if float(voxel_internal_opacity) > 0:
-            interior_x, interior_y, interior_z, interior_values = (
+        if show_internal_points:
+            interior_x, interior_y, interior_z, interior_customdata = (
                 _hyperparameter_response_voxel_interior_points(
                     grouped,
                     x_axis=x_axis,
@@ -2120,6 +2679,9 @@ def _plot_hyperparameter_response(
                     point_count=voxel_internal_point_count,
                 )
             )
+            interior_values = [
+                row[0] for row in interior_customdata
+            ]
             fig.add_trace(go.Scatter3d(
                 x=interior_x,
                 y=interior_y,
@@ -2128,13 +2690,23 @@ def _plot_hyperparameter_response(
                 marker={
                     "size": int(voxel_internal_point_size),
                     "color": interior_values,
-                    "colorscale": "Viridis",
+                    "colorscale": response_colorscale,
+                    "cmin": response_min,
+                    "cmax": response_max,
                     "opacity": float(voxel_internal_opacity),
-                    "showscale": False,
+                    "showscale": True,
+                    "colorbar": response_colorbar(),
                 },
                 name="Response voxel interior",
                 showlegend=False,
-                hoverinfo="skip",
+                customdata=interior_customdata,
+                hovertemplate=(
+                    f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>{z_axis}: %{{z}}<br>"
+                    f"{aggregate} {metric_label}: %{{customdata[0]:.4g}}<br>"
+                    "Runs: %{customdata[1]:.0f}<br>"
+                    "Std: %{customdata[2]:.4g}<br>"
+                    "Channels: %{customdata[3]}<extra></extra>"
+                ),
             ))
         if float(voxel_face_opacity) > 0:
             fig.add_trace(go.Mesh3d(
@@ -2145,9 +2717,11 @@ def _plot_hyperparameter_response(
                 j=j_faces,
                 k=k_faces,
                 intensity=intensities,
-                colorscale="Viridis",
-                showscale=True,
-                colorbar={"title": metric_label},
+                colorscale=response_colorscale,
+                cmin=response_min,
+                cmax=response_max,
+                showscale=not show_internal_points,
+                colorbar=response_colorbar() if not show_internal_points else None,
                 opacity=float(voxel_face_opacity),
                 flatshading=True,
                 name="Response voxels",
@@ -2166,12 +2740,13 @@ def _plot_hyperparameter_response(
             },
             name="Voxel hover points",
             showlegend=False,
-            customdata=grouped[["metric_value", "repeats", "std"]],
+            customdata=grouped[["metric_value", "repeats", "std", "channels"]],
             hovertemplate=(
                 f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>{z_axis}: %{{z}}<br>"
                 f"{aggregate} {metric_label}: %{{customdata[0]:.4g}}<br>"
                 "Runs: %{customdata[1]:.0f}<br>"
                 "Std: %{customdata[2]:.4g}<br>"
+                "Channels: %{customdata[3]}<br>"
                 "Click to set highlighted slice<extra></extra>"
             ),
         ))
@@ -2192,7 +2767,7 @@ def _plot_hyperparameter_response(
                 "zaxis_title": z_axis,
             },
             height=560,
-            margin={"l": 0, "r": 0, "t": 55, "b": 20},
+            margin={"l": 0, "r": 100, "t": 55, "b": 20},
         )
         return _apply_plotly_colorbar_height(fig)
     x_values = sorted(grouped[x_axis].dropna().unique())
@@ -2210,8 +2785,8 @@ def _plot_hyperparameter_response(
             x=x_values,
             y=y_values,
             z=value_grid.to_numpy(dtype=float),
-            colorscale="Viridis",
-            colorbar={"title": metric_label},
+            colorscale=response_colorscale,
+            colorbar=response_colorbar(),
             customdata=repeats_grid.to_numpy(dtype=float),
             hovertemplate=(
                 f"{x_axis}: %{{x}}<br>{y_axis}: %{{y}}<br>"
@@ -2224,7 +2799,7 @@ def _plot_hyperparameter_response(
             xaxis_title=x_axis,
             yaxis_title=y_axis,
             height=460,
-            margin={"l": 70, "r": 40, "t": 55, "b": 65},
+            margin={"l": 70, "r": 110, "t": 55, "b": 65},
         )
         return _apply_plotly_colorbar_height(fig)
     fig = go.Figure(go.Scatter(
@@ -2233,9 +2808,9 @@ def _plot_hyperparameter_response(
         mode="markers",
         marker={
             "color": grouped["metric_value"],
-            "colorscale": "Viridis",
+            "colorscale": response_colorscale,
             "showscale": True,
-            "colorbar": {"title": metric_label},
+            "colorbar": response_colorbar(),
             "size": np.maximum(8, np.minimum(26, 6 + grouped["repeats"] * 2)),
             "line": {"color": "white", "width": 0.7},
         },
@@ -2252,7 +2827,7 @@ def _plot_hyperparameter_response(
         xaxis_title=x_axis,
         yaxis_title=y_axis,
         height=420,
-        margin={"l": 70, "r": 40, "t": 55, "b": 65},
+        margin={"l": 70, "r": 110, "t": 55, "b": 65},
     )
     return _apply_plotly_colorbar_height(fig)
 
@@ -2269,12 +2844,16 @@ def _plot_channel_trend(
     group_color_label: str | None = None,
     group_average_values: dict[int, float] | None = None,
     group_average_label: str | None = None,
+    reference_values_by_group: dict[int, float] | None = None,
+    reference_label: str | None = None,
+    trace_opacity: float = 1.0,
 ):
     iterations = pd.to_numeric(
         frame.get("iteration", pd.Series(range(1, len(frame) + 1))),
         errors="coerce",
     )
     label = _metric_label(metric)
+    trace_opacity = min(1.0, max(0.05, float(trace_opacity)))
     group_ids = (
         frame["group_id"]
         if "group_id" in frame.columns
@@ -2286,9 +2865,16 @@ def _plot_channel_trend(
         else pd.Series("", index=frame.index)
     )
     records = []
+    frame_channels = (
+        frame["ground_truth_channel"].astype(str)
+        if "ground_truth_channel" in frame.columns
+        else None
+    )
     for channel in selected_channels:
         values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
         valid = iterations.notna() & values.notna()
+        if frame_channels is not None:
+            valid = valid & (frame_channels == str(channel))
         for index in frame.index[valid]:
             group_id = group_ids.loc[index]
             group_name = group_names.loc[index] or f"Group {group_id}"
@@ -2315,9 +2901,19 @@ def _plot_channel_trend(
         as_index=False,
         dropna=False,
     )["value"].mean()
+    reference_values_by_group = reference_values_by_group or {}
+    if reference_values_by_group:
+        data["reference_value"] = [
+            reference_values_by_group.get(int(group_id))
+            if _finite_float(group_id) is not None else None
+            for group_id in data["group_id"]
+        ]
     multiple_groups = data["group_id"].nunique(dropna=False) > 1
 
     if multiple_groups and group_average_values:
+        aggregation = {"value": "mean", "color_value": "mean"}
+        if "reference_value" in data.columns:
+            aggregation["reference_value"] = "mean"
         data["average_value"] = [
             group_average_values.get(int(group_id))
             if _finite_float(group_id) is not None else None
@@ -2340,7 +2936,7 @@ def _plot_channel_trend(
         data = data.groupby(
             ["average_value", "channel", "iteration"],
             as_index=False,
-        ).agg({"value": "mean", "color_value": "mean"})
+        ).agg(aggregation)
         data["group_id"] = [
             f"average::{_metadata_value_label(value)}"
             for value in data["average_value"]
@@ -2355,10 +2951,13 @@ def _plot_channel_trend(
         multiple_groups = data["group_id"].nunique(dropna=False) > 1
 
     if multiple_groups and group_layout == "Average groups together":
+        aggregation = {"value": "mean"}
+        if "reference_value" in data.columns:
+            aggregation["reference_value"] = "mean"
         data = data.groupby(
             ["channel", "iteration"],
             as_index=False,
-        )["value"].mean()
+        ).agg(aggregation)
         data["group_id"] = "__average__"
         data["group_name"] = "Group average"
 
@@ -2366,6 +2965,8 @@ def _plot_channel_trend(
         value_columns = {"value": "mean"}
         if "color_value" in data.columns:
             value_columns["color_value"] = "mean"
+        if "reference_value" in data.columns:
+            value_columns["reference_value"] = "mean"
         data = data.groupby(
             ["group_id", "group_name", "iteration"],
             as_index=False,
@@ -2410,6 +3011,7 @@ def _plot_channel_trend(
     else:
         fig = go.Figure()
 
+    reference_traces_added: set[tuple[int, str]] = set()
     for facet_index, (facet_key, _facet_title) in enumerate(facets):
         facet_data = data
         if separate_groups and separate_channels:
@@ -2484,6 +3086,7 @@ def _plot_channel_trend(
                 name=trace_name,
                 marker=marker or None,
                 line={"color": group_color} if group_color else None,
+                opacity=trace_opacity,
                 customdata=rows["iteration"],
                 hovertemplate=(
                     f"{trace_name}<br>Iteration %{{x}}<br>"
@@ -2499,6 +3102,42 @@ def _plot_channel_trend(
                 )
             else:
                 fig.add_trace(trace)
+            reference_value = None
+            if "reference_value" in rows.columns:
+                reference_value = _finite_float(rows["reference_value"].iloc[0])
+            elif (
+                reference_values_by_group
+                and _finite_float(rows["group_id"].iloc[0]) is not None
+            ):
+                reference_value = reference_values_by_group.get(
+                    int(rows["group_id"].iloc[0])
+                )
+            reference_value = _finite_float(reference_value)
+            reference_key = (facet_index, str(rows["group_id"].iloc[0]))
+            if reference_value is not None and reference_key not in reference_traces_added:
+                reference_traces_added.add(reference_key)
+                reference_name = reference_label or "Best possible Q"
+                if multiple_groups and group_name:
+                    reference_name = f"{reference_name}: {group_name}"
+                if faceted:
+                    subplot_row, subplot_column = divmod(facet_index, subplot_columns)
+                    _add_group_reference_line(
+                        fig,
+                        rows["iteration"],
+                        reference_value,
+                        reference_name,
+                        showlegend=False,
+                        row=subplot_row + 1,
+                        col=subplot_column + 1,
+                    )
+                else:
+                    _add_group_reference_line(
+                        fig,
+                        rows["iteration"],
+                        reference_value,
+                        reference_name,
+                        showlegend=True,
+                    )
 
     if multiple_groups:
         _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
@@ -3503,7 +4142,7 @@ def _plot_real_comparison_3d(
     fig.update_layout(
         title=f"{value_label} at cached parameter coordinates",
         scene={
-            "dragmode": "orbit",
+            "dragmode": "turntable",
             "xaxis": {"title": x_name},
             "yaxis": {"title": y_name},
             "zaxis": {"title": z_name},
@@ -6894,6 +7533,10 @@ def _simulation_ground_truth_grid(
 
 
 def _channel_color_with_opacity(color: str, fraction: float) -> str:
+    return _channel_color_with_alpha(color, 0.22 + 0.78 * min(1.0, max(0.0, float(fraction))))
+
+
+def _channel_color_with_alpha(color: str, alpha: float) -> str:
     if color.startswith("rgba(") or color.startswith("rgb("):
         numeric_parts = [
             _finite_float(part.strip())
@@ -6912,8 +7555,7 @@ def _channel_color_with_opacity(color: str, fraction: float) -> str:
             blue = int(base[4:6], 16)
         except ValueError:
             return color
-    fraction = min(1.0, max(0.0, float(fraction)))
-    alpha = 0.22 + 0.78 * fraction
+    alpha = min(1.0, max(0.0, float(alpha)))
     return f"rgba({red},{green},{blue},{alpha:.3f})"
 
 
@@ -6948,6 +7590,130 @@ def _simulation_path_trace_color(
     return _channel_color_with_opacity(color, fraction)
 
 
+def _add_real_channel_iteration_paths(
+    fig: go.Figure,
+    points: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    z_name: str | None = None,
+    *,
+    line_width: int = 4,
+    marker_size: int = 6,
+) -> None:
+    if points.empty or "channel" not in points.columns:
+        return
+    required = [x_name, y_name, "iteration", "channel", "value"]
+    if z_name is not None:
+        required.append(z_name)
+    if not set(required).issubset(points.columns):
+        return
+    plot_points = points.copy()
+    numeric_columns = [
+        x_name,
+        y_name,
+        "iteration",
+        "value",
+        *([z_name] if z_name else []),
+    ]
+    for column in numeric_columns:
+        plot_points[column] = pd.to_numeric(plot_points[column], errors="coerce")
+    plot_points = plot_points.dropna(subset=required)
+    if plot_points.empty:
+        return
+    channel_values = sorted(
+        plot_points["channel"].astype(str).unique(),
+        key=_channel_sort_key,
+    )
+    if len(channel_values) < 2:
+        return
+    channel_colors = {
+        channel: _slice_highlight_color(index, len(channel_values))[1]
+        for index, channel in enumerate(channel_values)
+    }
+    iteration_values = plot_points["iteration"].to_numpy(dtype=float)
+    iteration_min = float(np.nanmin(iteration_values))
+    iteration_max = float(np.nanmax(iteration_values))
+    if np.isclose(iteration_min, iteration_max):
+        iteration_max = iteration_min + 1.0
+
+    def iteration_fraction(iteration: Any) -> float:
+        numeric = _finite_float(iteration)
+        if numeric is None:
+            return 0.0
+        return (numeric - iteration_min) / (iteration_max - iteration_min)
+
+    is_3d = z_name is not None
+    scatter_type = go.Scatter3d if is_3d else go.Scatter
+    legend_channels_shown: set[str] = set()
+    for channel, channel_points in plot_points.groupby("channel", sort=False):
+        channel = str(channel)
+        ordered = channel_points.sort_values("iteration", kind="mergesort")
+        if ordered.empty:
+            continue
+        base_color = channel_colors.get(channel, "#1f77b4")
+        legendgroup = f"real_channel_path:{channel}"
+        show_channel_legend = channel not in legend_channels_shown
+        legend_channels_shown.add(channel)
+        for segment_index in range(1, len(ordered)):
+            segment_rows = ordered.iloc[segment_index - 1:segment_index + 1]
+            segment_kwargs = {
+                "x": segment_rows[x_name],
+                "y": segment_rows[y_name],
+                "mode": "lines",
+                "name": f"Ch {channel} path",
+                "legendgroup": legendgroup,
+                "line": {
+                    "color": _simulation_path_trace_color(
+                        base_color,
+                        iteration_fraction(segment_rows["iteration"].iloc[-1]),
+                    ),
+                    "width": int(line_width),
+                },
+                "hoverinfo": "skip",
+                "showlegend": False,
+            }
+            if is_3d:
+                segment_kwargs["z"] = segment_rows[z_name]
+            fig.add_trace(scatter_type(**segment_kwargs))
+        customdata = np.column_stack((
+            ordered["iteration"].to_numpy(dtype=float),
+            ordered["value"].to_numpy(dtype=float),
+            np.repeat(channel, len(ordered)),
+        ))
+        marker_colors = [
+            _simulation_path_trace_color(
+                base_color,
+                iteration_fraction(iteration),
+            )
+            for iteration in ordered["iteration"]
+        ]
+        marker_kwargs = {
+            "x": ordered[x_name],
+            "y": ordered[y_name],
+            "mode": "markers",
+            "name": f"Ch {channel} path",
+            "legendgroup": legendgroup,
+            "showlegend": show_channel_legend,
+            "marker": {
+                "color": marker_colors,
+                "size": int(marker_size),
+                "line": {"color": "white", "width": 1},
+                "showscale": False,
+            },
+            "customdata": customdata,
+            "hovertemplate": (
+                f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                + (f"{z_name}: %{{z:.4g}}<br>" if is_3d else "")
+                + "Iteration: %{customdata[0]:.0f}<br>"
+                + "Measured value: %{customdata[1]:.4g}<br>"
+                + "Channel: %{customdata[2]}<extra></extra>"
+            ),
+        }
+        if is_3d:
+            marker_kwargs["z"] = ordered[z_name]
+        fig.add_trace(scatter_type(**marker_kwargs))
+
+
 def _add_simulation_sweep_paths(
     fig: go.Figure,
     runs: Sequence[dict],
@@ -6959,6 +7725,8 @@ def _add_simulation_sweep_paths(
     slice_value: float | None = None,
     line_width: int = 4,
     marker_size: int = 6,
+    path_style: str = "full",
+    tail_length: int = 8,
 ) -> None:
     channel_values = sorted({
         str(run.get("channel") or run.get("label") or index)
@@ -7027,6 +7795,119 @@ def _add_simulation_sweep_paths(
             plot_history["observed_value"].to_numpy(dtype=float),
             np.repeat(channel, len(plot_history)),
         ))
+        if path_style == "start_end_tail":
+            if len(plot_history) >= 2:
+                full_kwargs = {
+                    "x": plot_history[x_name],
+                    "y": plot_history[y_name],
+                    "mode": "lines",
+                    "name": label,
+                    "legendgroup": legendgroup,
+                    "line": {
+                        "color": _channel_color_with_alpha(base_color, 0.12),
+                        "width": max(1, int(line_width) - 2),
+                    },
+                    "hoverinfo": "skip",
+                    "showlegend": False,
+                }
+                if is_3d:
+                    full_kwargs["z"] = plot_history[z_name]
+                fig.add_trace(scatter_type(**full_kwargs))
+            tail_count = max(2, int(tail_length))
+            tail_history = plot_history.tail(tail_count)
+            for segment_index in range(1, len(tail_history)):
+                segment_rows = tail_history.iloc[segment_index - 1:segment_index + 1]
+                fraction = segment_index / max(1, len(tail_history) - 1)
+                segment_kwargs = {
+                    "x": segment_rows[x_name],
+                    "y": segment_rows[y_name],
+                    "mode": "lines",
+                    "name": label,
+                    "legendgroup": legendgroup,
+                    "line": {
+                        "color": _channel_color_with_alpha(
+                            base_color,
+                            0.22 + 0.78 * fraction,
+                        ),
+                        "width": int(line_width),
+                    },
+                    "hoverinfo": "skip",
+                    "showlegend": False,
+                }
+                if is_3d:
+                    segment_kwargs["z"] = segment_rows[z_name]
+                fig.add_trace(scatter_type(**segment_kwargs))
+            tail_indices = list(tail_history.index)
+            for point_index, (row_index, point_row) in enumerate(
+                tail_history.iterrows()
+            ):
+                tail_fraction = point_index / max(1, len(tail_history) - 1)
+                trace_kwargs = {
+                    "x": [point_row[x_name]],
+                    "y": [point_row[y_name]],
+                    "mode": "markers",
+                    "name": legend_label,
+                    "legendgroup": legendgroup,
+                    "showlegend": (
+                        row_index == tail_indices[0] and show_channel_legend
+                    ),
+                    "marker": {
+                        "color": _channel_color_with_alpha(
+                            base_color,
+                            0.28 + 0.72 * tail_fraction,
+                        ),
+                        "size": int(marker_size + round(2 * tail_fraction)),
+                        "line": {"color": "white", "width": 1},
+                        "showscale": False,
+                    },
+                    "customdata": [customdata[plot_history.index.get_loc(row_index)]],
+                    "hovertemplate": (
+                        f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                        + (f"{z_name}: %{{z:.4g}}<br>" if is_3d else "")
+                        + "Iteration: %{customdata[0]:.0f}<br>"
+                        + "Observed value: %{customdata[1]:.4g}<br>"
+                        + "Channel: %{customdata[2]}<extra>"
+                        + label
+                        + "</extra>"
+                    ),
+                }
+                if is_3d:
+                    trace_kwargs["z"] = [point_row[z_name]]
+                fig.add_trace(scatter_type(**trace_kwargs))
+            endpoint_rows = [
+                ("Start", plot_history.iloc[0], 0, marker_size + 4, "white"),
+                ("Final", plot_history.iloc[-1], len(plot_history) - 1, marker_size + 7, "black"),
+            ]
+            for endpoint_name, point_row, point_index, size, outline in endpoint_rows:
+                trace_kwargs = {
+                    "x": [point_row[x_name]],
+                    "y": [point_row[y_name]],
+                    "mode": "markers",
+                    "name": f"{legend_label} {endpoint_name.lower()}",
+                    "legendgroup": legendgroup,
+                    "showlegend": False,
+                    "marker": {
+                        "color": _channel_color_with_alpha(base_color, 1.0),
+                        "size": int(size),
+                        "line": {"color": outline, "width": 3},
+                        "showscale": False,
+                    },
+                    "customdata": [customdata[point_index]],
+                    "hovertemplate": (
+                        f"{endpoint_name}<br>"
+                        f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
+                        + (f"{z_name}: %{{z:.4g}}<br>" if is_3d else "")
+                        + "Iteration: %{customdata[0]:.0f}<br>"
+                        + "Observed value: %{customdata[1]:.4g}<br>"
+                        + "Channel: %{customdata[2]}<extra>"
+                        + label
+                        + "</extra>"
+                    ),
+                }
+                if is_3d:
+                    trace_kwargs["z"] = [point_row[z_name]]
+                fig.add_trace(scatter_type(**trace_kwargs))
+            continue
         for segment_index in range(1, len(plot_history)):
             segment_rows = plot_history.iloc[segment_index - 1:segment_index + 1]
             segment_kwargs = {
@@ -7096,6 +7977,7 @@ def _plot_interpolated_simulated_trace(
     correction_label: str,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
     nearest_count: int = 4,
 ) -> tuple[plt.Figure, list[str]]:
     """Interpolate real SWV waveforms near a simulated parameter point."""
@@ -7170,6 +8052,8 @@ def _plot_interpolated_simulated_trace(
                     analysis,
                     corrected_trace_key,
                 )
+                if offset_to_baseline:
+                    y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
                 if normalize_to_peak:
                     y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
                 trace_rows.append({
@@ -7224,7 +8108,13 @@ def _plot_interpolated_simulated_trace(
                 f"(from iters {', '.join(map(str, sorted(set(source_iterations))))})"
             ),
         )
-    ax.set_title(f"Interpolated simulated SWV trace ({correction_label})")
+    trace_label = _swv_trace_kind_label(
+        corrected,
+        normalize_to_peak,
+        corrected_trace_key,
+        offset_to_baseline,
+    )
+    ax.set_title(f"Interpolated simulated {trace_label} SWV trace ({correction_label})")
     ax.set_xlabel("Voltage (V)")
     ax.set_ylabel("Current")
     ax.grid(True, alpha=.25)
@@ -7690,8 +8580,43 @@ def _simulation_channel_group_metadata(
         "gp_length_scales": falloffs,
         "simulation_replicate": replicate,
         "simulation_seed": seed,
+        "ground_truth_channel": (
+            str(settings.get("ground_truth_channel"))
+            if settings.get("ground_truth_channel") is not None else None
+        ),
         "simulated_session": True,
     }
+
+
+def _simulation_saved_channel_identity(
+    run: dict,
+    fallback_channel: int,
+) -> str:
+    channel = run.get("ground_truth_channel")
+    if channel is None:
+        history = run.get("history")
+        if (
+            isinstance(history, pd.DataFrame)
+            and not history.empty
+            and "ground_truth_channel" in history.columns
+            and not history["ground_truth_channel"].dropna().empty
+        ):
+            channel = history["ground_truth_channel"].dropna().astype(str).iloc[0]
+    if channel is None:
+        channel = fallback_channel
+    return str(channel)
+
+
+def _simulation_channel_list_value(channel: str) -> list[int | str]:
+    numeric = _finite_float(channel)
+    if numeric is not None and float(numeric).is_integer():
+        return [int(numeric)]
+    return [str(channel)]
+
+
+def _simulation_history_channel_column(channel: str) -> str:
+    safe_channel = re.sub(r"[^A-Za-z0-9]+", "_", str(channel)).strip("_")
+    return f"Q_ch{safe_channel or 'simulation'}"
 
 
 def _simulation_serializable_trace_metadata(metadata: dict) -> dict:
@@ -7814,12 +8739,19 @@ def _write_simulated_bo_session(
         )
     )
     group_name = str(run_label)
+    saved_channel = (
+        str(ground_truth_channel)
+        if ground_truth_channel is not None
+        else "1"
+    )
+    channel_values = _simulation_channel_list_value(saved_channel)
+    channel_column = _simulation_history_channel_column(saved_channel)
     first_params = _simulation_first_history_params(history, config, axes)
     config["initial_parameters"] = dict(first_params)
     group_metadata = _simulation_channel_group_metadata(
         group_id=1,
         name=group_name,
-        channels=[1],
+        channels=channel_values,
         first_params=first_params,
         settings=simulation_settings,
         exploration=exploration,
@@ -7827,7 +8759,7 @@ def _write_simulated_bo_session(
         seed=seed,
     )
     config["channel_groups"] = [group_metadata]
-    config["channels"] = [1]
+    config["channels"] = channel_values
 
     observations = []
     history_rows = []
@@ -7850,13 +8782,13 @@ def _write_simulated_bo_session(
             "status": "completed",
             "group_id": 1,
             "group_name": group_name,
-            "channels": [1],
+            "channels": channel_values,
             "objective": "simulation",
             "Q_run": q_run,
             "quality": {
                 "Q_run": q_run,
                 "channel_components": {
-                    "1": {
+                    saved_channel: {
                         "Q_channel": q_run,
                         "classic_Q": q_run,
                         "snr_score": q_run,
@@ -7891,7 +8823,7 @@ def _write_simulated_bo_session(
                 ),
             },
             "channel_metrics": {
-                "1": {
+                saved_channel: {
                     "Q_channel": q_run,
                     "classic_Q": q_run,
                     "snr": max(0.0, q_run),
@@ -7928,7 +8860,7 @@ def _write_simulated_bo_session(
         observation["analysis_record"] = _write_simulated_trace_record(
             session_root,
             observation,
-            channel=1,
+            channel=channel_values[0],
         )
         observation.pop("simulation_trace_measurements", None)
         observations.append(observation)
@@ -7936,7 +8868,7 @@ def _write_simulated_bo_session(
             "iteration": iteration,
             "group_id": 1,
             "group_name": group_name,
-            "channels": "1",
+            "channels": saved_channel,
             "Q_run": q_run,
             "objective": "simulation",
             "completed_at": timestamp,
@@ -7950,6 +8882,7 @@ def _write_simulated_bo_session(
             "run_label": run_label,
             "ground_truth_channel": ground_truth_channel,
             "best_so_far": float(row.get("best_so_far", q_run)),
+            channel_column: q_run,
             "predicted_mean_Q": row.get("predicted_mean"),
             "predicted_std_Q": row.get("predicted_std"),
             "acquisition_value": row.get("acquisition_value"),
@@ -8075,7 +9008,9 @@ def _write_simulated_bo_session_bundle(
     x_name, y_name, z_name = axes
     for run_index, run in enumerate(nonempty_runs, start=1):
         group_id = run_index
-        channel = run_index
+        channel = _simulation_saved_channel_identity(run, run_index)
+        channel_values = _simulation_channel_list_value(channel)
+        channel_column = _simulation_history_channel_column(channel)
         run_label = str(run.get("label") or f"Simulation {run_index}")
         exploration = run.get("exploration")
         replicate = run.get("replicate")
@@ -8098,7 +9033,7 @@ def _write_simulated_bo_session_bundle(
         group_metadata = _simulation_channel_group_metadata(
             group_id=group_id,
             name=run_label,
-            channels=[channel],
+            channels=channel_values,
             first_params=first_params,
             settings=run_settings,
             exploration=exploration,
@@ -8159,7 +9094,7 @@ def _write_simulated_bo_session_bundle(
                 "status": "completed",
                 "group_id": group_id,
                 "group_name": run_label,
-                "channels": [channel],
+                "channels": channel_values,
                 "objective": "simulation",
                 "Q_run": q_run,
                 "quality": quality,
@@ -8205,7 +9140,7 @@ def _write_simulated_bo_session_bundle(
             observation["analysis_record"] = _write_simulated_trace_record(
                 session_root,
                 observation,
-                channel=channel,
+                channel=channel_values[0],
             )
             observation.pop("simulation_trace_measurements", None)
             observations.append(observation)
@@ -8231,7 +9166,7 @@ def _write_simulated_bo_session_bundle(
                     else None
                 ),
                 "best_so_far": float(row.get("best_so_far", q_run)),
-                "Q_ch1": q_run,
+                channel_column: q_run,
             }
             for source_column, target_column in (
                 ("predicted_mean", "predicted_mean_Q"),
@@ -8245,7 +9180,10 @@ def _write_simulated_bo_session_bundle(
             history_rows.append(history_row)
 
     config["channel_groups"] = channel_groups
-    config["channels"] = [group["channels"][0] for group in channel_groups]
+    config["channels"] = sorted(
+        {channel for group in channel_groups for channel in group["channels"]},
+        key=lambda value: _channel_sort_key(str(value)),
+    )
     if channel_groups:
         config["initial_parameters"] = dict(channel_groups[0]["initial_parameters"])
     best_observation = max(
@@ -8399,7 +9337,9 @@ def _write_compact_simulated_sweep_session(
     x_name, y_name, z_name = axes
     for run_index, run in enumerate(nonempty_runs, start=1):
         group_id = run_index
-        channel = run_index
+        channel = _simulation_saved_channel_identity(run, run_index)
+        channel_values = _simulation_channel_list_value(channel)
+        channel_column = _simulation_history_channel_column(channel)
         run_label = str(run.get("label") or f"Simulation {run_index}")
         exploration = run.get("exploration")
         run_settings = dict(simulation_settings)
@@ -8415,7 +9355,7 @@ def _write_compact_simulated_sweep_session(
         channel_groups.append(_simulation_channel_group_metadata(
             group_id=group_id,
             name=run_label,
-            channels=[channel],
+            channels=channel_values,
             first_params=first_params,
             settings=run_settings,
             exploration=exploration,
@@ -8431,7 +9371,7 @@ def _write_compact_simulated_sweep_session(
                 "group_name": run_label,
                 "channels": str(channel),
                 "Q_run": q_run,
-                f"Q_ch{channel}": q_run,
+                channel_column: q_run,
                 "objective": "compact_simulation",
                 "completed_at": timestamp,
                 "selection_mode": row.get("selection_mode"),
@@ -8455,7 +9395,10 @@ def _write_compact_simulated_sweep_session(
             history_rows.append(history_row)
 
     config["channel_groups"] = channel_groups
-    config["channels"] = [group["channels"][0] for group in channel_groups]
+    config["channels"] = sorted(
+        {channel for group in channel_groups for channel in group["channels"]},
+        key=lambda value: _channel_sort_key(str(value)),
+    )
     if channel_groups:
         config["initial_parameters"] = dict(channel_groups[0]["initial_parameters"])
     summary = _simulation_run_summary_frame(nonempty_runs)
@@ -9250,12 +10193,19 @@ def _pdf_iteration_swv_overlays(
     group_name = str(observation.get("group_name") or f"Group {group_id}")
     selection_label = f"{group_name} — through iteration {iteration}"
     trace_specs = [
-        ("Raw", False, False, "smoothed_corrected_current"),
-        ("Corrected", True, False, "smoothed_corrected_current"),
-        ("Normalized corrected", True, True, "smoothed_corrected_current"),
-        ("Normalized raw", True, True, "corrected_current"),
+        ("Raw", False, False, "smoothed_corrected_current", False),
+        ("Offset raw", True, False, "corrected_current", True),
+        ("Corrected", True, False, "smoothed_corrected_current", False),
+        ("Normalized corrected", True, True, "smoothed_corrected_current", False),
+        ("Normalized raw", True, True, "corrected_current", False),
     ]
-    for label, corrected, normalize_to_peak, corrected_trace_key in trace_specs:
+    for (
+        label,
+        corrected,
+        normalize_to_peak,
+        corrected_trace_key,
+        offset_to_baseline,
+    ) in trace_specs:
         if status_callback is not None:
             status_callback(
                 f"Rendering SWV {label.lower()} traces for {group_name}, "
@@ -9270,6 +10220,7 @@ def _pdf_iteration_swv_overlays(
             selection_label,
             normalize_to_peak,
             corrected_trace_key,
+            offset_to_baseline,
         )
         if errors:
             fig.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
@@ -9489,8 +10440,8 @@ def build_bo_session_pdf(
             report_progress(f"Rendered surrogate group {group_id}, iteration {iteration}.")
 
         _pdf_text_page(pdf, "5. Per-Iteration SWV Traces", [
-            "For each completed iteration, cumulative SWV overlays include raw, corrected,",
-            "normalized corrected, and normalized raw traces through that iteration.",
+            "For each completed iteration, cumulative SWV overlays include raw,",
+            "offset raw, corrected, normalized corrected, and normalized raw traces.",
         ])
         if not observations_by_key:
             report_progress("No SWV iterations available.")
@@ -9871,6 +10822,35 @@ def _normalize_trace_to_peak(
     return y / peak_height
 
 
+def _offset_trace_to_minima_baseline(
+    y: np.ndarray,
+    left_idx: int | None = None,
+    right_idx: int | None = None,
+) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    if left_idx is None or right_idx is None:
+        raise ValueError("Trace has no detected left/right minima to offset.")
+    left = int(left_idx)
+    right = int(right_idx)
+    if left == right:
+        if 0 <= left < len(y) and np.isfinite(y[left]):
+            return y - float(y[left])
+        raise ValueError("Trace minima are outside the trace or non-finite.")
+    if not (
+        0 <= left < len(y)
+        and 0 <= right < len(y)
+        and np.isfinite(y[left])
+        and np.isfinite(y[right])
+    ):
+        raise ValueError("Trace minima are outside the trace or non-finite.")
+    baseline = np.interp(
+        np.arange(len(y), dtype=float),
+        [float(left), float(right)],
+        [float(y[left]), float(y[right])],
+    )
+    return y - baseline
+
+
 def _swv_global_y_limits(
     trace_observations: list[dict],
     session: dict,
@@ -9879,6 +10859,7 @@ def _swv_global_y_limits(
     analysis: dict,
     normalize_to_peak: bool,
     corrected_trace_key: str,
+    offset_to_baseline: bool = False,
     selected_phases: tuple[str, ...] | None = None,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
@@ -9910,6 +10891,11 @@ def _swv_global_y_limits(
                 )
             except Exception:
                 continue
+            if offset_to_baseline:
+                try:
+                    y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
+                except ValueError:
+                    continue
             voltage = np.asarray(voltage, dtype=float)
             y = np.asarray(y, dtype=float)
             if voltage_min is not None or voltage_max is not None:
@@ -9940,7 +10926,10 @@ def _swv_trace_kind_label(
     corrected: bool,
     normalize_to_peak: bool,
     corrected_trace_key: str,
+    offset_to_baseline: bool = False,
 ) -> str:
+    if offset_to_baseline and corrected_trace_key == "corrected_current":
+        return "offset raw"
     if not corrected:
         return "raw"
     if normalize_to_peak and corrected_trace_key == "corrected_current":
@@ -9963,6 +10952,7 @@ def _plot_traces(
     trace_items: list[dict] | None = None,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
 ):
@@ -9994,6 +10984,8 @@ def _plot_traces(
                 analysis,
                 corrected_trace_key,
             )
+            if offset_to_baseline:
+                y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
             voltage = np.asarray(voltage, dtype=float)
@@ -10058,7 +11050,7 @@ def _plot_traces(
             ylabel="Normalized current (peak = 1)" if normalize_to_peak else "Current (uA)",
             title=(
                 f"Iteration {observation.get('iteration')} "
-                f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key)} SWV traces"
+                f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline)} SWV traces"
                 f"{channel_title}"
                 f"{f' ({correction_label})' if corrected else ''}"
                 f"\n{parameter_text}"
@@ -10085,6 +11077,7 @@ def _plot_iteration_trace_overlay(
     selection_label: str,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
 ):
@@ -10148,6 +11141,8 @@ def _plot_iteration_trace_overlay(
                 analysis,
                 corrected_trace_key,
             )
+            if offset_to_baseline:
+                y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
             voltage = np.asarray(voltage, dtype=float)
@@ -10205,7 +11200,7 @@ def _plot_iteration_trace_overlay(
             ylabel="Normalized current (peak = 1)" if normalize_to_peak else "Current (µA)",
             title=(
                 f"{selection_label}\n"
-                f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key).capitalize()} SWV traces"
+                f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline).capitalize()} SWV traces"
                 f"{f' ({correction_label})' if corrected else ''}"
                 f" | {channel_text}"
             ),
@@ -10273,6 +11268,7 @@ def _chronological_swv_stack_entries(
     config: dict,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
     trace_height_scale: float = 1.0,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
@@ -10346,6 +11342,8 @@ def _chronological_swv_stack_entries(
                 analysis,
                 corrected_trace_key,
             )
+            if offset_to_baseline:
+                y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
             voltage = np.asarray(voltage, dtype=float)
@@ -10448,6 +11446,7 @@ def _plot_chronological_swv_stack(
     selection_label: str,
     normalize_to_peak: bool = False,
     corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
     x_offset_per_iteration: float | None = None,
     y_offset_per_iteration: float | None = None,
     trace_height_scale: float = 1.0,
@@ -10467,6 +11466,7 @@ def _plot_chronological_swv_stack(
         config,
         normalize_to_peak,
         corrected_trace_key,
+        offset_to_baseline,
         trace_height_scale,
         voltage_min,
         voltage_max,
@@ -10666,7 +11666,7 @@ def _plot_chronological_swv_stack(
         title=(
             f"{selection_label}\n"
             f"Chronological diagonal stack | "
-            f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key)}"
+            f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline)}"
             f"{f' ({correction_label})' if corrected else ''}"
         ),
     )
@@ -12705,7 +13705,27 @@ def _plotly_colorbar_height_fraction() -> float:
     return min(1.0, max(0.2, percent / 100.0))
 
 
+def _apply_plotly_3d_turntable_dragmode(fig: go.Figure) -> go.Figure:
+    scene_keys: set[str] = set()
+    for trace in fig.data:
+        if str(getattr(trace, "type", "")).lower() not in PLOTLY_3D_TRACE_TYPES:
+            continue
+        scene_ref = getattr(trace, "scene", None) or "scene"
+        if isinstance(scene_ref, str) and scene_ref.startswith("scene"):
+            scene_keys.add(scene_ref)
+    for key in fig.layout:
+        if str(key).startswith("scene"):
+            scene_keys.add(str(key))
+    if scene_keys:
+        fig.update_layout(**{
+            scene_key: {"dragmode": "turntable"}
+            for scene_key in scene_keys
+        })
+    return fig
+
+
 def _apply_plotly_colorbar_height(fig: go.Figure) -> go.Figure:
+    _apply_plotly_3d_turntable_dragmode(fig)
     uses_layout_coloraxis = False
     height_fraction = _plotly_colorbar_height_fraction()
     for trace in fig.data:
@@ -12926,6 +13946,7 @@ def _plotly_png_bytes(
     height: int = 800,
     scale: float = 2,
 ) -> bytes:
+    _apply_plotly_3d_turntable_dragmode(fig)
     try:
         return fig.to_image(
             format="png",
@@ -13164,7 +14185,7 @@ def _render_downloadable_plotly(
     plot_column = _sized_plot_container(container, width_percent)
     _apply_plotly_colorbar_height(fig)
     if camera_storage_key:
-        _render_camera_persistent_plotly(
+        rendered_camera = _render_camera_persistent_plotly(
             plot_column,
             fig,
             key=key,
@@ -13173,9 +14194,32 @@ def _render_downloadable_plotly(
             file_stem=file_stem,
             export_width=export_width,
             export_height=export_height,
+            show_download=False,
         )
         event = None
-        eager_png = True
+        download_camera = _stored_plotly_camera(camera_storage_key) or rendered_camera
+        download_fig = go.Figure(fig)
+        _apply_plotly_camera(download_fig, download_camera)
+        try:
+            png_bytes = _plotly_png_bytes(
+                download_fig,
+                width=export_width,
+                height=export_height or int(fig.layout.height or 800),
+            )
+            _render_browser_download_link(
+                plot_column,
+                "Download plot",
+                png_bytes,
+                file_name=f"{_safe_download_stem(file_stem)}.png",
+                mime="image/png",
+            )
+            if download_camera is None:
+                plot_column.caption(
+                    "Click Cache view after rotating to export the current perspective."
+                )
+        except RuntimeError as exc:
+            plot_column.caption(str(exc))
+        eager_png = False
     else:
         event = plot_column.plotly_chart(
             fig,
@@ -13479,6 +14523,7 @@ def _figures_to_gif(
         _stabilize_gif_figure_layout(figure)
         buffer = BytesIO()
         if isinstance(figure, go.Figure):
+            _apply_plotly_3d_turntable_dragmode(figure)
             _apply_plotly_camera(figure, plotly_camera)
             try:
                 png = figure.to_image(
@@ -14393,7 +15438,16 @@ def render_bo_session_app() -> None:
         metric_kind, metric = metric_choice.split("::", 1)
         plot_metric_kind = metric_kind
         plot_metric = metric
+        ground_truth_trend_channels = (
+            sorted(
+                trend_history["ground_truth_channel"].dropna().astype(str).unique(),
+                key=_channel_sort_key,
+            )
+            if "ground_truth_channel" in trend_history.columns
+            else []
+        )
         q_run_channel_view = None
+        global_channel_view = None
         if (
             metric_kind == "global"
             and metric == "Q_run"
@@ -14412,14 +15466,55 @@ def render_bo_session_app() -> None:
                 q_display_options[0],
             )
             q_run_channel_view = st.radio(
-                "Q display",
+                "Q series",
                 q_display_options,
                 horizontal=True,
                 key=q_display_key,
+                help=(
+                    "Chooses whether Q run is shown as the saved run-level "
+                    "objective or expanded into channel Q traces."
+                ),
             )
             if q_run_channel_view != "Run-level Q":
                 plot_metric_kind = "channel"
                 plot_metric = "Q_channel"
+        elif (
+            metric_kind == "global"
+            and metric in trend_history.columns
+            and len(ground_truth_trend_channels) > 1
+        ):
+            metric_display_label = _metric_label(metric)
+            global_display_options = [
+                f"Run-level {metric_display_label}",
+                f"Average channel {metric_display_label}",
+                f"Overlay channel {metric_display_label}",
+                f"Separate channel {metric_display_label} plots",
+            ]
+            global_display_key = (
+                f"bo_global_channel_display_{trend_scope_key}_{metric}"
+            )
+            _preserve_valid_widget_value(
+                global_display_key,
+                global_display_options,
+                global_display_options[0],
+            )
+            global_channel_view = st.radio(
+                f"{metric_display_label} series",
+                global_display_options,
+                horizontal=True,
+                key=global_display_key,
+                help=(
+                    "Chooses whether this parameter trend is shown as saved "
+                    "simulation-run rows or expanded into real-channel traces."
+                ),
+            )
+            if global_channel_view != global_display_options[0]:
+                plot_metric_kind = "channel"
+                plot_metric = metric
+                channel_metrics[plot_metric] = {
+                    channel: metric
+                    for channel in ground_truth_trend_channels
+                }
         group_layout = "Plot groups overlaid"
         group_color_values = None
         group_color_label = None
@@ -14436,6 +15531,23 @@ def render_bo_session_app() -> None:
                 full_session,
                 groups,
             )
+            is_simulated_trend_session = bool(
+                ((full_session.get("config") or {}).get("records") or {}).get(
+                    "simulated_session"
+                )
+            )
+
+            def group_layout_display_label(option: str) -> str:
+                if not is_simulated_trend_session:
+                    return option
+                return (
+                    option
+                    .replace("groups", "simulation runs")
+                    .replace("Groups", "Simulation runs")
+                    .replace("group", "simulation run")
+                    .replace("Group", "Simulation run")
+                )
+
             group_layout_options = [
                 "Plot groups overlaid",
                 "Plot groups separately",
@@ -14487,9 +15599,17 @@ def render_bo_session_app() -> None:
                 group_layout_options[0],
             )
             group_layout = st.selectbox(
-                "Group display",
+                "Simulation run display" if is_simulated_trend_session else "Group display",
                 group_layout_options,
+                format_func=group_layout_display_label,
                 key=group_layout_key,
+                help=(
+                    "Controls how repeated simulation runs are arranged. "
+                    "For per-channel sweeps, each exploration-rate/channel "
+                    "combination is one simulation run."
+                    if is_simulated_trend_session
+                    else None
+                ),
             )
             if group_layout in metadata_group_options:
                 group_average_values, group_average_label = metadata_group_options[
@@ -14559,9 +15679,16 @@ def render_bo_session_app() -> None:
                 ]
         chart_key_suffix = metric
         simulation_optimum_reference = _session_simulation_optimum_reference(full_session)
+        simulation_group_optimum_references = (
+            _session_simulation_group_optimum_references(
+                full_session,
+                trend_history,
+            )
+        )
         trend_reference_value = None
         trend_reference_label = None
-        if simulation_optimum_reference and plot_metric_kind == "global":
+        trend_reference_values_by_group: dict[int, float] = {}
+        if plot_metric_kind == "global":
             reference_metric = "Q_run" if metric == "Q_run" else metric
             if reference_metric in {
                 "Q_run",
@@ -14569,15 +15696,99 @@ def render_bo_session_app() -> None:
                 "amplitude",
                 "step_potential",
             }:
-                trend_reference_value = simulation_optimum_reference.get(
-                    reference_metric
+                trend_reference_label = (
+                    "Best possible Q"
+                    if reference_metric == "Q_run"
+                    else f"Best-Q {_metric_label(reference_metric)}"
                 )
-                if trend_reference_value is not None:
-                    trend_reference_label = (
-                        "Best possible Q"
-                        if reference_metric == "Q_run"
-                        else f"Best-Q {_metric_label(reference_metric)}"
+                trend_reference_values_by_group = {
+                    group_id: float(reference[reference_metric])
+                    for group_id, reference
+                    in simulation_group_optimum_references.items()
+                    if _finite_float(reference.get(reference_metric)) is not None
+                }
+                displayed_group_ids = set()
+                if "group_id" in trend_history.columns:
+                    displayed_group_ids = {
+                        int(group_id)
+                        for group_id in pd.to_numeric(
+                            trend_history["group_id"],
+                            errors="coerce",
+                        ).dropna().unique()
+                    }
+                if (
+                    trend_reference_values_by_group
+                    and displayed_group_ids
+                    and len(displayed_group_ids) == 1
+                ):
+                    only_group_id = next(iter(displayed_group_ids))
+                    trend_reference_value = trend_reference_values_by_group.get(
+                        only_group_id
                     )
+                    trend_reference_values_by_group = {}
+                elif not trend_reference_values_by_group:
+                    trend_reference_value = (
+                        simulation_optimum_reference or {}
+                    ).get(reference_metric)
+        elif plot_metric_kind == "channel" and plot_metric in {
+            "Q_channel",
+            "classic_Q",
+            "frequency",
+            "amplitude",
+            "step_potential",
+        }:
+            reference_metric = (
+                "Q_run"
+                if plot_metric in {"Q_channel", "classic_Q"}
+                else plot_metric
+            )
+            trend_reference_label = (
+                "Best possible Q"
+                if reference_metric == "Q_run"
+                else f"Best-Q {_metric_label(reference_metric)}"
+            )
+            trend_reference_values_by_group = {
+                group_id: float(reference[reference_metric])
+                for group_id, reference
+                in simulation_group_optimum_references.items()
+                if _finite_float(reference.get(reference_metric)) is not None
+            }
+            displayed_group_ids = set()
+            if "group_id" in trend_history.columns:
+                displayed_group_ids = {
+                    int(group_id)
+                    for group_id in pd.to_numeric(
+                        trend_history["group_id"],
+                        errors="coerce",
+                    ).dropna().unique()
+                }
+            if (
+                trend_reference_values_by_group
+                and displayed_group_ids
+                and len(displayed_group_ids) == 1
+            ):
+                only_group_id = next(iter(displayed_group_ids))
+                trend_reference_value = trend_reference_values_by_group.get(
+                    only_group_id
+                )
+                trend_reference_values_by_group = {}
+            elif not trend_reference_values_by_group:
+                trend_reference_value = (
+                    simulation_optimum_reference or {}
+                ).get(reference_metric)
+        trend_trace_opacity = float(st.slider(
+            "Trend plot opacity",
+            min_value=0.05,
+            max_value=1.0,
+            value=1.0,
+            step=0.05,
+            format="%.2f",
+            key=f"bo_trend_trace_opacity_{trend_scope_key}_{plot_metric_kind}_{plot_metric}",
+            help=(
+                "Transparency for the metric-vs-iteration trend traces. "
+                "Reference lines remain fully opaque."
+            ),
+        ))
         if plot_metric_kind == "channel":
             available_metric_channels = sorted(
                 channel_metrics[plot_metric],
@@ -14605,7 +15816,20 @@ def render_bo_session_app() -> None:
                 trend_channels_valid,
                 trend_channels_display,
             )
-            if q_run_channel_view is None:
+            if global_channel_view is not None:
+                metric_display_label = _metric_label(plot_metric)
+                channel_layout = {
+                    f"Average channel {metric_display_label}": (
+                        "Average selected channels"
+                    ),
+                    f"Overlay channel {metric_display_label}": (
+                        "Overlay selected channels"
+                    ),
+                    f"Separate channel {metric_display_label} plots": (
+                        "Separate plots"
+                    ),
+                }[global_channel_view]
+            elif q_run_channel_view is None:
                 channel_layout_options = [
                     "Overlay selected channels",
                     "Separate plots",
@@ -14641,6 +15865,9 @@ def render_bo_session_app() -> None:
                     group_color_label,
                     group_average_values,
                     group_average_label,
+                    reference_values_by_group=trend_reference_values_by_group,
+                    reference_label=trend_reference_label,
+                    trace_opacity=trend_trace_opacity,
                 )
             else:
                 trend_figure = go.Figure()
@@ -14666,6 +15893,8 @@ def render_bo_session_app() -> None:
                 group_average_label,
                 reference_value=trend_reference_value,
                 reference_label=trend_reference_label,
+                reference_values_by_group=trend_reference_values_by_group,
+                trace_opacity=trend_trace_opacity,
             )
             chart_key_suffix = (
                 f"{metric}_{group_layout}_{group_color_label or 'categorical'}_"
@@ -14687,14 +15916,18 @@ def render_bo_session_app() -> None:
             chart_key_suffix = (
                 f"{chart_key_suffix}_ylim_{trend_y_limits[0]:g}_{trend_y_limits[1]:g}"
             )
-        trend_events = [_plotly_chart_with_colorbars(
-            _sized_plot_container(st, plot_width_percent),
-            trend_figure,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="points",
-            key=f"bo_trend_{chart_key_suffix}",
-        )]
+        trend_events = [
+            _render_downloadable_plotly(
+                st,
+                trend_figure,
+                key=f"bo_trend_{chart_key_suffix}",
+                file_stem=f"history_scores_trend_{chart_key_suffix}",
+                width_percent=plot_width_percent,
+                export_height=int(trend_figure.layout.height or 520),
+                on_select="rerun",
+                selection_mode="points",
+            )
+        ]
         trend_q_kind = _metric_q_kind(metric, paired_objective)
         if trend_q_kind:
             _render_q_equation(session["config"], trend_q_kind)
@@ -14703,6 +15936,16 @@ def render_bo_session_app() -> None:
         def _render_hyperparameter_response_fragment() -> None:
             hyperparameter_columns = _hyperparameter_response_columns(trend_history)
             hyper_metric_options = list(metric_options)
+            has_best_q_source = any(
+                column in trend_history.columns
+                for column in ("Q_run", "best_Q", "best_so_far", "observed_value")
+            )
+            if has_best_q_source:
+                for parameter in ("frequency", "amplitude", "step_potential"):
+                    if parameter in trend_history.columns:
+                        hyper_metric_options.append(
+                            f"derived::{parameter}_at_best_q"
+                        )
             if len(hyperparameter_columns) >= 2 and hyper_metric_options:
                 st.divider()
                 st.subheader("Hyperparameter response")
@@ -14726,6 +15969,12 @@ def render_bo_session_app() -> None:
                 hp_metric_kind, hp_metric_name = hp_metric.split("::", 1)
                 hp_metric_key = hp_metric.split("::", 1)[1]
                 hp_metric_label = _metric_label(hp_metric_name)
+                hp_at_best_q_parameter = (
+                    hp_metric_name.removesuffix("_at_best_q")
+                    if hp_metric_kind == "derived"
+                    and hp_metric_name.endswith("_at_best_q")
+                    else None
+                )
                 hp_view_options = (
                     ["2D heatmap", "3D heatmap"]
                     if len(hyperparameter_columns) >= 3
@@ -14782,10 +16031,10 @@ def render_bo_session_app() -> None:
                 hp_3d_slice_value_key = None
                 hp_3d_slice_values = []
                 hp_3d_mouse_mode = "Rotate/view 3D plot"
-                hp_voxel_face_opacity = 0.72
-                hp_voxel_internal_opacity = 0.0
-                hp_voxel_internal_point_size = 3
-                hp_voxel_internal_point_count = 27
+                hp_voxel_face_opacity = 0.1
+                hp_voxel_internal_opacity = 1.0
+                hp_voxel_internal_point_size = 20
+                hp_voxel_internal_point_count = 1
                 if hp_view == "3D heatmap":
                     hp_z_options = [
                         column for column in hyperparameter_columns
@@ -14886,16 +16135,19 @@ def render_bo_session_app() -> None:
                     st.session_state.setdefault(
                         render_settings_key,
                         {
-                            "face_opacity": 0.72,
-                            "internal_opacity": 0.2,
-                            "point_size": 3,
-                            "point_count": 27,
+                            "face_opacity": 0.1,
+                            "internal_opacity": 1.0,
+                            "point_size": 20,
+                            "point_count": 1,
                         },
                     )
                     applied_render_settings = dict(
                         st.session_state[render_settings_key]
                     )
-                    applied_render_settings.setdefault("point_count", 27)
+                    applied_render_settings.setdefault("face_opacity", 0.1)
+                    applied_render_settings.setdefault("internal_opacity", 1.0)
+                    applied_render_settings.setdefault("point_size", 20)
+                    applied_render_settings.setdefault("point_count", 1)
                     opacity_columns = st.columns(4)
                     draft_face_opacity = float(opacity_columns[0].slider(
                         "Voxel face alpha",
@@ -14916,7 +16168,7 @@ def render_bo_session_app() -> None:
                     draft_point_size = int(opacity_columns[2].slider(
                         "Internal point size",
                         min_value=1,
-                        max_value=25,
+                        max_value=50,
                         value=int(applied_render_settings["point_size"]),
                         step=1,
                         key="bo_hp_response_voxel_internal_point_size_draft",
@@ -15067,15 +16319,19 @@ def render_bo_session_app() -> None:
                             if crop_min > crop_max:
                                 crop_min, crop_max = crop_max, crop_min
                             hp_crop_ranges[axis_name] = (crop_min, crop_max)
-                hp_summary_options = [
-                    "Final iteration",
-                    "Best over iterations",
-                    "Mean over iterations",
-                    "Specific iteration",
-                ]
-                hp_threshold_metric = "q" in hp_metric_name.lower()
-                if hp_threshold_metric:
-                    hp_summary_options.append("Iterations to Q target")
+                if hp_at_best_q_parameter is not None:
+                    hp_summary_options = ["At best Q"]
+                    hp_threshold_metric = False
+                else:
+                    hp_summary_options = [
+                        "Final iteration",
+                        "Best over iterations",
+                        "Mean over iterations",
+                        "Specific iteration",
+                    ]
+                    hp_threshold_metric = "q" in hp_metric_name.lower()
+                    if hp_threshold_metric:
+                        hp_summary_options.append("Iterations to Q target")
                 _preserve_valid_widget_value(
                     "bo_hp_response_summary",
                     hp_summary_options,
@@ -15165,7 +16421,7 @@ def render_bo_session_app() -> None:
                         applied_render_settings["point_size"]
                     )
                     hp_voxel_internal_point_count = int(
-                        applied_render_settings.get("point_count", 27)
+                        applied_render_settings.get("point_count", 1)
                     )
                 hp_render_cache_key = (
                     f"bo_hp_response_render_cache_{trend_scope_key}"
@@ -15231,6 +16487,7 @@ def render_bo_session_app() -> None:
                         iteration=hp_iteration,
                         q_target=hp_q_target,
                         include_misses=hp_include_misses,
+                        at_best_q_parameter=hp_at_best_q_parameter,
                     )
                     if response_frame.empty:
                         st.info(
@@ -15431,19 +16688,79 @@ def render_bo_session_app() -> None:
                                         key=hp_plot_key,
                                     )
                             elif hp_view == "3D heatmap":
-                                _render_downloadable_plotly(
+                                hp_file_stem = (
+                                    f"hyperparameter_response_{hp_metric_label}_"
+                                    f"{hp_x}_{hp_y}_{hp_z or 'none'}"
+                                )
+                                hp_camera_storage_key = (
+                                    f"hyperparameter_response_3d_{trend_scope_key}_"
+                                    f"{rendered_key_suffix}"
+                                )
+                                hp_shared_camera_storage_key = (
+                                    f"bo_viewer_camera:shared:{hp_camera_storage_key}"
+                                )
+                                hp_cached_camera = _valid_plotly_camera(
+                                    st.session_state.get(
+                                        _plotly_camera_state_key(
+                                            hp_shared_camera_storage_key
+                                        )
+                                    )
+                                )
+                                hp_rendered_camera = _render_camera_persistent_plotly(
                                     hp_plot_column,
                                     hp_figure,
                                     key=hp_plot_key,
-                                    camera_storage_key=hp_plot_key,
-                                    file_stem=(
-                                        f"hyperparameter_response_{hp_metric_label}_"
-                                        f"{hp_x}_{hp_y}_{hp_z or 'none'}"
+                                    camera_storage_key=hp_camera_storage_key,
+                                    shared_camera_storage_key=(
+                                        hp_shared_camera_storage_key
                                     ),
-                                    width_percent=100,
+                                    height=plot_3d_height,
+                                    file_stem=hp_file_stem,
                                     export_width=1200,
                                     export_height=plot_3d_height,
+                                    show_download=False,
                                 )
+                                hp_download_camera = (
+                                    hp_cached_camera
+                                    if hp_cached_camera is not None
+                                    else hp_rendered_camera
+                                )
+                                hp_download_figure = go.Figure(hp_figure)
+                                _apply_plotly_camera(
+                                    hp_download_figure,
+                                    hp_download_camera,
+                                )
+                                try:
+                                    hp_png_bytes = _plotly_png_bytes(
+                                        hp_download_figure,
+                                        width=1200,
+                                        height=plot_3d_height,
+                                        scale=2,
+                                    )
+                                    _render_browser_download_link(
+                                        hp_plot_column,
+                                        "Download plot",
+                                        hp_png_bytes,
+                                        file_name=(
+                                            f"{_safe_download_stem(hp_file_stem)}.png"
+                                        ),
+                                        mime="image/png",
+                                    )
+                                    if hp_download_camera is None:
+                                        hp_plot_column.caption(
+                                            "Click Cache view after rotating to export "
+                                            "the current perspective."
+                                        )
+                                    else:
+                                        eye = hp_download_camera.get("eye", {})
+                                        hp_plot_column.caption(
+                                            "Download uses cached 3D view "
+                                            f"(eye x={float(eye.get('x', 0.0)):.3g}, "
+                                            f"y={float(eye.get('y', 0.0)):.3g}, "
+                                            f"z={float(eye.get('z', 0.0)):.3g})."
+                                        )
+                                except RuntimeError as exc:
+                                    hp_plot_column.caption(str(exc))
                             else:
                                 hp_plot_event = _plotly_chart_with_colorbars(
                                     hp_plot_column,
@@ -15688,6 +17005,9 @@ def render_bo_session_app() -> None:
                                                 hp_metric_key,
                                                 "Specific iteration",
                                                 iteration=frame_iteration,
+                                                at_best_q_parameter=(
+                                                    hp_at_best_q_parameter
+                                                ),
                                             )
                                             if frame_response.empty:
                                                 continue
@@ -16494,7 +17814,13 @@ def render_bo_session_app() -> None:
             )
             selected_trace_type = st.radio(
                 "Trace type",
-                ["Raw", "Corrected", "Normalized corrected", "Normalized raw"],
+                [
+                    "Raw",
+                    "Offset raw",
+                    "Corrected",
+                    "Normalized corrected",
+                    "Normalized raw",
+                ],
                 horizontal=True,
                 key=(
                     f"bo_trace_type_{selected_observation_group_scope}_"
@@ -16502,15 +17828,17 @@ def render_bo_session_app() -> None:
                 ),
             )
             corrected = selected_trace_type != "Raw"
+            offset_to_baseline = selected_trace_type == "Offset raw"
             normalize_to_peak = selected_trace_type in {
                 "Normalized corrected",
                 "Normalized raw",
             }
             corrected_trace_key = (
                 "corrected_current"
-                if selected_trace_type == "Normalized raw"
+                if selected_trace_type in {"Offset raw", "Normalized raw"}
                 else "smoothed_corrected_current"
             )
+            trace_transform_key = _safe_download_stem(selected_trace_type)
             analysis_settings = _bo_analysis_settings(session["config"])
             trace_voltage_columns = st.columns(2)
             trace_voltage_min = float(trace_voltage_columns[0].number_input(
@@ -16585,7 +17913,7 @@ def render_bo_session_app() -> None:
                     key=(
                         f"bo_trace_stack_y_offset_"
                         f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{normalize_to_peak}"
+                        f"{trace_transform_key}"
                     ),
                     help="Positive values shift newer traces upward; negative values shift them downward.",
                 )
@@ -16598,7 +17926,7 @@ def render_bo_session_app() -> None:
                     key=(
                         f"bo_trace_stack_height_"
                         f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{normalize_to_peak}"
+                        f"{trace_transform_key}"
                     ),
                     help="Scales each SWV vertically before applying the chronological offset.",
                 )
@@ -16607,7 +17935,7 @@ def render_bo_session_app() -> None:
                     key=(
                         f"bo_trace_stack_manual_y_limits_"
                         f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{normalize_to_peak}"
+                        f"{trace_transform_key}"
                     ),
                 )
                 if manual_stack_y_limits:
@@ -16622,6 +17950,7 @@ def render_bo_session_app() -> None:
                             session["config"],
                             normalize_to_peak,
                             corrected_trace_key,
+                            offset_to_baseline,
                             stack_trace_height,
                             stack_voltage_min,
                             stack_voltage_max,
@@ -16644,12 +17973,12 @@ def render_bo_session_app() -> None:
                     stack_y_min_key = (
                         f"bo_trace_stack_trace_y_min_"
                         f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{normalize_to_peak}"
+                        f"{trace_transform_key}"
                     )
                     stack_y_max_key = (
                         f"bo_trace_stack_trace_y_max_"
                         f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{normalize_to_peak}"
+                        f"{trace_transform_key}"
                     )
                     st.session_state.setdefault(
                         stack_y_min_key,
@@ -16740,6 +18069,7 @@ def render_bo_session_app() -> None:
                                 trace_selection_label,
                                 normalize_to_peak,
                                 corrected_trace_key,
+                                offset_to_baseline,
                                 stack_x_offset,
                                 stack_y_offset,
                                 stack_trace_height,
@@ -16759,6 +18089,7 @@ def render_bo_session_app() -> None:
                                 trace_selection_label,
                                 normalize_to_peak,
                                 corrected_trace_key,
+                                offset_to_baseline,
                                 trace_voltage_min,
                                 trace_voltage_max,
                             )
@@ -16774,6 +18105,7 @@ def render_bo_session_app() -> None:
                                 display_available_traces,
                                 normalize_to_peak,
                                 corrected_trace_key,
+                                offset_to_baseline,
                                 trace_voltage_min,
                                 trace_voltage_max,
                             )
@@ -16847,6 +18179,7 @@ def render_bo_session_app() -> None:
                                 trace_analysis,
                                 normalize_to_peak,
                                 corrected_trace_key,
+                                offset_to_baseline,
                                 selected_trace_phases,
                                 trace_voltage_min,
                                 trace_voltage_max,
@@ -16895,6 +18228,7 @@ def render_bo_session_app() -> None:
                                                 trace_items=frame_traces,
                                                 normalize_to_peak=normalize_to_peak,
                                                 corrected_trace_key=corrected_trace_key,
+                                                offset_to_baseline=offset_to_baseline,
                                                 voltage_min=trace_voltage_min,
                                                 voltage_max=trace_voltage_max,
                                             )
@@ -16958,6 +18292,7 @@ def render_bo_session_app() -> None:
                                             trace_items=frame_traces,
                                             normalize_to_peak=normalize_to_peak,
                                             corrected_trace_key=corrected_trace_key,
+                                            offset_to_baseline=offset_to_baseline,
                                             voltage_min=trace_voltage_min,
                                             voltage_max=trace_voltage_max,
                                         )
@@ -17020,7 +18355,86 @@ def render_bo_session_app() -> None:
         st.caption(
             "These plots use completed experimental observations only; no surrogate predictions are shown."
         )
-        all_real_observations = group_scoped_observations
+        show_real_observation_group_filter = (
+            bool(
+                ((full_session.get("config") or {}).get("records") or {}).get(
+                    "simulated_session"
+                )
+            )
+            and len(observation_group_ids) > 1
+        )
+        real_selected_observation_group_ids = set(selected_observation_group_ids)
+        real_scope_key = str(selected_observation_group_scope)
+        if show_real_observation_group_filter:
+            real_group_filter_options = [
+                "all",
+                *observation_group_family_options.keys(),
+                *observation_group_ids,
+            ]
+            real_group_filter_default = (
+                [selected_observation_group_scope]
+                if selected_observation_group_scope in real_group_filter_options
+                else ["all"]
+            )
+            real_group_filter_key = "bo_real_observation_group_filters"
+            real_group_filter_valid, real_group_filter_display = (
+                _prepare_preferred_multiselect_value(
+                    real_group_filter_key,
+                    f"{real_group_filter_key}__preferred",
+                    real_group_filter_options,
+                    real_group_filter_default,
+                )
+            )
+            selected_real_group_filters = st.multiselect(
+                "Real-data observation groups",
+                real_group_filter_options,
+                default=real_group_filter_display,
+                format_func=observation_group_scope_label,
+                key=real_group_filter_key,
+                help=(
+                    "Filters the observation groups used only in this Real Data "
+                    "Landscapes tab. This is useful for multi-parameter "
+                    "simulation sweeps with many saved simulation runs."
+                ),
+            )
+            _sync_preferred_widget_value(
+                real_group_filter_key,
+                f"{real_group_filter_key}__preferred",
+                real_group_filter_valid,
+                selected_real_group_filters,
+            )
+            if not selected_real_group_filters or "all" in selected_real_group_filters:
+                real_selected_observation_group_ids = set(observation_group_ids)
+                real_scope_key = "all"
+            else:
+                real_selected_observation_group_ids = set()
+                for group_filter in selected_real_group_filters:
+                    if (
+                        isinstance(group_filter, str)
+                        and group_filter in observation_group_family_options
+                    ):
+                        real_selected_observation_group_ids.update(
+                            observation_group_family_options[group_filter]["ids"]
+                        )
+                    else:
+                        real_selected_observation_group_ids.add(int(group_filter))
+                real_group_token = "_".join(
+                    str(group_id)
+                    for group_id in sorted(real_selected_observation_group_ids)
+                )
+                real_scope_key = (
+                    f"groups_{real_group_token}"
+                    if len(real_selected_observation_group_ids) <= 8
+                    else "groups_" + hashlib.sha1(
+                        real_group_token.encode("utf-8")
+                    ).hexdigest()[:12]
+                )
+            if not real_selected_observation_group_ids:
+                st.info("Select at least one observation group for Real Data Landscapes.")
+        all_real_observations = [
+            obs for obs in observations
+            if int(obs.get("group_id", 1)) in real_selected_observation_group_ids
+        ] if show_real_observation_group_filter else group_scoped_observations
         real_observations = [
             observation
             for observation in all_real_observations
@@ -17030,20 +18444,24 @@ def render_bo_session_app() -> None:
                 <= int(selected_iteration_scope)
             )
         ]
-        real_iteration_path = pd.DataFrame([
-            {
-                "iteration": int(observation.get("iteration", 0)),
-                "group_id": int(observation.get("group_id", 1)),
-                **{
-                    parameter: float(value)
-                    for parameter, value in (
-                        observation.get("params") or {}
-                    ).items()
-                    if parameter in PARAMETERS and value is not None
-                },
-            }
-            for observation in real_observations
-        ])
+
+        def real_iteration_path_frame(observations: list[dict]) -> pd.DataFrame:
+            return pd.DataFrame([
+                {
+                    "iteration": int(observation.get("iteration", 0)),
+                    "group_id": int(observation.get("group_id", 1)),
+                    **{
+                        parameter: float(value)
+                        for parameter, value in (
+                            observation.get("params") or {}
+                        ).items()
+                        if parameter in PARAMETERS and value is not None
+                    },
+                }
+                for observation in observations
+            ])
+
+        real_iteration_path = real_iteration_path_frame(real_observations)
         real_axis_ranges = {}
         for parameter in PARAMETERS:
             parameter_values = [
@@ -17056,7 +18474,6 @@ def render_bo_session_app() -> None:
                     min(parameter_values),
                     max(parameter_values),
                 )
-        real_scope_key = str(selected_observation_group_scope)
         real_metric_options = [
             metric for metric in _q_relevant_metrics(
                 REAL_DATA_METRICS,
@@ -17229,6 +18646,86 @@ def render_bo_session_app() -> None:
                 real_channels_valid,
                 real_channels_display,
             )
+        selected_real_run_group_ids: set[int] | None = None
+        show_real_simulation_run_selector = (
+            _is_loaded_simulated_sweep_session(full_session)
+            and real_channel_mode != "Plot channel groups"
+            and bool(selected_real_channels)
+        )
+        if show_real_simulation_run_selector:
+            selected_channel_set = set(map(str, selected_real_channels))
+            run_options = [
+                group["id"]
+                for group in real_groups
+                if selected_channel_set.intersection(
+                    str(channel) for channel in group.get("channels", [])
+                )
+            ]
+            run_options = sorted(dict.fromkeys(run_options))
+            if run_options:
+                real_run_default = (
+                    run_options[:1]
+                    if len(selected_channel_set) == 1 and len(run_options) > 1
+                    else run_options
+                )
+                selected_channel_token = "_".join(
+                    re.sub(r"[^0-9A-Za-z]+", "-", str(channel)).strip("-")
+                    or "channel"
+                    for channel in sorted(
+                        selected_channel_set,
+                        key=_channel_sort_key,
+                    )
+                )
+                real_run_key = (
+                    f"bo_real_simulation_runs_{real_scope_key}_"
+                    f"{real_metric}_{real_phase}_{real_channel_mode}_"
+                    f"{selected_channel_token}"
+                )
+                real_run_valid, real_run_display = (
+                    _prepare_preferred_multiselect_value(
+                        real_run_key,
+                        f"{real_run_key}__preferred",
+                        run_options,
+                        real_run_default,
+                    )
+                )
+                selected_real_run_ids = st.multiselect(
+                    "Simulation runs",
+                    run_options,
+                    default=real_run_display,
+                    format_func=lambda group_id: next(
+                        (
+                            group["name"]
+                            for group in real_groups
+                            if int(group["id"]) == int(group_id)
+                        ),
+                        f"Simulation run {group_id}",
+                    ),
+                    key=real_run_key,
+                    help=(
+                        "Filters repeated simulation traces within the selected "
+                        "real channel(s). For example, Ch 1 with three "
+                        "exploration settings appears as three simulation runs."
+                    ),
+                )
+                _sync_preferred_widget_value(
+                    real_run_key,
+                    f"{real_run_key}__preferred",
+                    real_run_valid,
+                    selected_real_run_ids,
+                )
+                selected_real_run_group_ids = {
+                    int(group_id) for group_id in selected_real_run_ids
+                }
+                real_observations = [
+                    observation
+                    for observation in real_observations
+                    if int(observation.get("group_id", 1))
+                    in selected_real_run_group_ids
+                ]
+                real_iteration_path = real_iteration_path_frame(real_observations)
+                if not selected_real_run_group_ids:
+                    st.info("Select at least one simulation run to plot.")
         real_color_by = "Measured value"
         real_group_color_values = None
         real_group_color_label = None
@@ -18574,8 +20071,15 @@ def render_bo_session_app() -> None:
                                 selected_real_channels,
                             )
                         )
+                        if selected_real_run_group_ids is not None:
+                            loaded_real_sweep_runs = [
+                                run for run in loaded_real_sweep_runs
+                                if _finite_float(run.get("group_id")) is not None
+                                and int(_finite_float(run.get("group_id")))
+                                in selected_real_run_group_ids
+                            ]
                 if loaded_real_sweep_runs:
-                    real_path_controls = st.columns(3)
+                    real_path_controls = st.columns(5)
                     real_show_selected_channel_paths = real_path_controls[0].checkbox(
                         "Show selected channel iteration paths",
                         value=True,
@@ -18590,7 +20094,20 @@ def render_bo_session_app() -> None:
                             "iterations."
                         ),
                     )
-                    real_selected_path_line_width = int(real_path_controls[1].slider(
+                    real_selected_path_style_label = real_path_controls[1].selectbox(
+                        "Path display",
+                        ["Start/end + fading tail", "Full paths"],
+                        key=(
+                            f"bo_real_selected_channel_path_style_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                    )
+                    real_selected_path_style = (
+                        "start_end_tail"
+                        if real_selected_path_style_label == "Start/end + fading tail"
+                        else "full"
+                    )
+                    real_selected_path_line_width = int(real_path_controls[2].slider(
                         "Path line width",
                         min_value=1,
                         max_value=10,
@@ -18601,7 +20118,7 @@ def render_bo_session_app() -> None:
                             f"{real_metric}_{real_phase}_{real_view}"
                         ),
                     ))
-                    real_selected_path_marker_size = int(real_path_controls[2].slider(
+                    real_selected_path_marker_size = int(real_path_controls[3].slider(
                         "Path marker size",
                         min_value=3,
                         max_value=14,
@@ -18612,13 +20129,68 @@ def render_bo_session_app() -> None:
                             f"{real_metric}_{real_phase}_{real_view}"
                         ),
                     ))
+                    real_selected_path_tail_length = int(real_path_controls[4].slider(
+                        "Tail points",
+                        min_value=2,
+                        max_value=20,
+                        value=8,
+                        step=1,
+                        disabled=real_selected_path_style != "start_end_tail",
+                        key=(
+                            f"bo_real_selected_channel_path_tail_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                    ))
                 else:
+                    real_selected_path_style = "full"
                     real_selected_path_line_width = 4
                     real_selected_path_marker_size = 6
+                    real_selected_path_tail_length = 8
+                real_global_optimum_reference = (
+                    _session_simulation_optimum_reference(full_session)
+                )
+                real_can_show_global_optimum = (
+                    real_global_optimum_reference is not None
+                    and real_view in {"2D map", "3D tensor"}
+                    and real_x is not None
+                    and real_y is not None
+                    and (real_view != "3D tensor" or real_z is not None)
+                )
+                real_show_global_optimum = (
+                    st.checkbox(
+                        "Show global optimum",
+                        value=True,
+                        key=(
+                            f"bo_real_show_global_optimum_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_view}"
+                        ),
+                        help=(
+                            "Marks the saved ground-truth optimum "
+                            "(best frequency, amplitude, and step size)."
+                        ),
+                    )
+                    if real_can_show_global_optimum else False
+                )
 
+                real_show_channel_iteration_paths = (
+                    real_show_iteration_path
+                    and not loaded_real_sweep_runs
+                    and not bool(
+                        (
+                            ((full_session.get("config") or {}).get("records") or {})
+                            .get("simulated_session")
+                        )
+                    )
+                    and real_channel_mode == "Overlay selected channels"
+                    and len(selected_real_channels) > 1
+                    and real_view == "3D tensor"
+                    and real_z is not None
+                    and not count_mode
+                )
                 real_effective_show_iteration_path = (
                     real_show_iteration_path
                     and not real_show_selected_channel_paths
+                    and not real_show_channel_iteration_paths
                 )
 
                 def add_real_selected_channel_paths(
@@ -18648,6 +20220,8 @@ def render_bo_session_app() -> None:
                             path_z,
                             line_width=real_selected_path_line_width,
                             marker_size=real_selected_path_marker_size,
+                            path_style=real_selected_path_style,
+                            tail_length=real_selected_path_tail_length,
                         )
                     elif path_view == "2D map":
                         _add_simulation_sweep_paths(
@@ -18668,13 +20242,52 @@ def render_bo_session_app() -> None:
                             ),
                             line_width=real_selected_path_line_width,
                             marker_size=real_selected_path_marker_size,
+                            path_style=real_selected_path_style,
+                            tail_length=real_selected_path_tail_length,
                         )
+
+                def add_real_channel_iteration_paths(
+                    fig: go.Figure,
+                    points: pd.DataFrame,
+                ) -> None:
+                    if not real_show_channel_iteration_paths:
+                        return
+                    _add_real_channel_iteration_paths(
+                        fig,
+                        points,
+                        real_x,
+                        real_y,
+                        real_z,
+                        line_width=real_selected_path_line_width,
+                        marker_size=real_selected_path_marker_size,
+                    )
+
+                def add_real_global_optimum_marker(fig: go.Figure) -> None:
+                    if not real_show_global_optimum:
+                        return
+                    _add_global_optimum_marker(
+                        fig,
+                        real_global_optimum_reference,
+                        real_x,
+                        real_y,
+                        real_z if real_view == "3D tensor" else None,
+                        slice_axis=(
+                            real_2d_slice_column
+                            if real_view == "2D map" else None
+                        ),
+                        slice_value=(
+                            real_2d_slice_value
+                            if real_view == "2D map" else None
+                        ),
+                    )
 
                 real_plot_state_key = (
                     f"v3_{real_color_by}_{real_group_color_label or 'categorical'}_"
                     f"log{int(bool(real_log_frequency))}_"
                     f"path{int(bool(real_show_iteration_path))}_"
                     f"selectedpaths{int(bool(real_show_selected_channel_paths))}_"
+                    f"channelpaths{int(bool(real_show_channel_iteration_paths))}_"
+                    f"globalopt{int(bool(real_show_global_optimum))}_"
                     f"{real_3d_slice_token}_{real_3d_slice_sweep_token}"
                 )
 
@@ -18977,6 +20590,11 @@ def render_bo_session_app() -> None:
                                     f"{real_2d_slice_token}"
                                 )
                                 add_real_selected_channel_paths(real_figure)
+                                add_real_channel_iteration_paths(
+                                    real_figure,
+                                    series_points,
+                                )
+                                add_real_global_optimum_marker(real_figure)
                                 if real_view == "3D tensor":
                                     camera_storage_key = (
                                         f"real_3d_{real_scope_key}_{phase}_"
@@ -19110,6 +20728,11 @@ def render_bo_session_app() -> None:
                             f"{real_2d_slice_token}"
                         )
                         add_real_selected_channel_paths(real_figure)
+                        add_real_channel_iteration_paths(
+                            real_figure,
+                            series_points,
+                        )
+                        add_real_global_optimum_marker(real_figure)
                         if real_view == "3D tensor":
                             camera_storage_key = (
                                 f"real_3d_{real_scope_key}_{real_phase}_"
@@ -20286,6 +21909,12 @@ def render_bo_session_app() -> None:
                                                     marker_size=(
                                                         real_selected_path_marker_size
                                                     ),
+                                                    path_style=(
+                                                        real_selected_path_style
+                                                    ),
+                                                    tail_length=(
+                                                        real_selected_path_tail_length
+                                                    ),
                                                 )
                                             elif real_view == "2D map":
                                                 _add_simulation_sweep_paths(
@@ -20302,7 +21931,28 @@ def render_bo_session_app() -> None:
                                                     marker_size=(
                                                         real_selected_path_marker_size
                                                     ),
+                                                    path_style=(
+                                                        real_selected_path_style
+                                                    ),
+                                                    tail_length=(
+                                                        real_selected_path_tail_length
+                                                    ),
                                                 )
+                                        elif real_show_channel_iteration_paths:
+                                            _add_real_channel_iteration_paths(
+                                                frame_figure,
+                                                frame_path,
+                                                real_x,
+                                                real_y,
+                                                real_z,
+                                                line_width=(
+                                                    real_selected_path_line_width
+                                                ),
+                                                marker_size=(
+                                                    real_selected_path_marker_size
+                                                ),
+                                            )
+                                        add_real_global_optimum_marker(frame_figure)
                                         yield frame_figure
 
                                 generated_gifs[target_name] = _figures_to_gif(
@@ -21983,7 +23633,17 @@ def render_bo_session_app() -> None:
                     sweep_view_columns[1].caption(
                         "Tensor background: saved ground truth"
                     )
-                loaded_sweep_line_width = int(sweep_view_columns[2].slider(
+                loaded_sweep_path_style_label = sweep_view_columns[2].selectbox(
+                    "Path display",
+                    ["Start/end + fading tail", "Full paths"],
+                    key="bo_loaded_sim_sweep_path_style",
+                )
+                loaded_sweep_path_style = (
+                    "start_end_tail"
+                    if loaded_sweep_path_style_label == "Start/end + fading tail"
+                    else "full"
+                )
+                loaded_sweep_line_width = int(sweep_view_columns[3].slider(
                     "Path line width",
                     min_value=1,
                     max_value=10,
@@ -21991,7 +23651,7 @@ def render_bo_session_app() -> None:
                     step=1,
                     key="bo_loaded_sim_sweep_line_width",
                 ))
-                loaded_sweep_marker_size = int(sweep_view_columns[3].slider(
+                loaded_sweep_marker_size = int(sweep_view_columns[4].slider(
                     "Path marker size",
                     min_value=3,
                     max_value=14,
@@ -21999,6 +23659,30 @@ def render_bo_session_app() -> None:
                     step=1,
                     key="bo_loaded_sim_sweep_marker_size",
                 ))
+                loaded_sweep_tail_length = int(st.slider(
+                    "Tail points",
+                    min_value=2,
+                    max_value=20,
+                    value=8,
+                    step=1,
+                    disabled=loaded_sweep_path_style != "start_end_tail",
+                    key="bo_loaded_sim_sweep_tail_length",
+                ))
+                loaded_sweep_optimum_reference = (
+                    _session_simulation_optimum_reference(full_session)
+                )
+                loaded_sweep_show_global_optimum = (
+                    st.checkbox(
+                        "Show global optimum",
+                        value=True,
+                        key="bo_loaded_sim_sweep_show_global_optimum",
+                        help=(
+                            "Marks the saved ground-truth optimum "
+                            "(best frequency, amplitude, and step size)."
+                        ),
+                    )
+                    if loaded_sweep_optimum_reference is not None else False
+                )
                 loaded_sweep_value_label = str(
                     loaded_sweep_metadata.get("value_label")
                     or loaded_sweep_value_column
@@ -22044,7 +23728,17 @@ def render_bo_session_app() -> None:
                             loaded_sim_z,
                             line_width=loaded_sweep_line_width,
                             marker_size=loaded_sweep_marker_size,
+                            path_style=loaded_sweep_path_style,
+                            tail_length=loaded_sweep_tail_length,
                         )
+                        if loaded_sweep_show_global_optimum:
+                            _add_global_optimum_marker(
+                                loaded_sweep_figure,
+                                loaded_sweep_optimum_reference,
+                                loaded_sim_x,
+                                loaded_sim_y,
+                                loaded_sim_z,
+                            )
                         loaded_sweep_figure.update_layout(
                             title=(
                                 "Loaded simulated sweep paths"
@@ -22138,7 +23832,19 @@ def render_bo_session_app() -> None:
                                 slice_value=slice_value,
                                 line_width=loaded_sweep_line_width,
                                 marker_size=loaded_sweep_marker_size,
+                                path_style=loaded_sweep_path_style,
+                                tail_length=loaded_sweep_tail_length,
                             )
+                            if loaded_sweep_show_global_optimum:
+                                _add_global_optimum_marker(
+                                    loaded_sweep_figure,
+                                    loaded_sweep_optimum_reference,
+                                    slice_plot_axes[0],
+                                    slice_plot_axes[1],
+                                    None,
+                                    slice_axis=slice_axis,
+                                    slice_value=slice_value,
+                                )
                             loaded_sweep_figure.update_layout(
                                 title=(
                                     "Loaded simulated sweep paths"
@@ -22266,7 +23972,17 @@ def render_bo_session_app() -> None:
                                     loaded_sim_z,
                                     line_width=loaded_sweep_line_width,
                                     marker_size=loaded_sweep_marker_size,
+                                    path_style=loaded_sweep_path_style,
+                                    tail_length=loaded_sweep_tail_length,
                                 )
+                                if loaded_sweep_show_global_optimum:
+                                    _add_global_optimum_marker(
+                                        frame_figure,
+                                        loaded_sweep_optimum_reference,
+                                        loaded_sim_x,
+                                        loaded_sim_y,
+                                        loaded_sim_z,
+                                    )
                             else:
                                 frame_figure = _plot_interpolated_2d_slice(
                                     empty_observed,
@@ -22287,7 +24003,23 @@ def render_bo_session_app() -> None:
                                     slice_value=loaded_sweep_gif_context["slice_value"],
                                     line_width=loaded_sweep_line_width,
                                     marker_size=loaded_sweep_marker_size,
+                                    path_style=loaded_sweep_path_style,
+                                    tail_length=loaded_sweep_tail_length,
                                 )
+                                if loaded_sweep_show_global_optimum:
+                                    _add_global_optimum_marker(
+                                        frame_figure,
+                                        loaded_sweep_optimum_reference,
+                                        loaded_sweep_gif_context["plot_axes"][0],
+                                        loaded_sweep_gif_context["plot_axes"][1],
+                                        None,
+                                        slice_axis=loaded_sweep_gif_context[
+                                            "slice_axis"
+                                        ],
+                                        slice_value=loaded_sweep_gif_context[
+                                            "slice_value"
+                                        ],
+                                    )
                                 _apply_plotly_2d_slice_aspect(
                                     frame_figure,
                                     width=loaded_sweep_gif_context["export_width"],
@@ -24571,6 +26303,7 @@ def render_bo_session_app() -> None:
                                 "Trace type",
                                 [
                                     "Raw",
+                                    "Offset raw",
                                     "Corrected",
                                     "Normalized corrected",
                                     "Normalized raw",
@@ -24589,13 +26322,14 @@ def render_bo_session_app() -> None:
                                 selected_path_history["iteration"] == sim_trace_iteration
                             ].iloc[0]
                             corrected = sim_trace_type != "Raw"
+                            offset_to_baseline = sim_trace_type == "Offset raw"
                             normalize_to_peak = sim_trace_type in {
                                 "Normalized corrected",
                                 "Normalized raw",
                             }
                             corrected_trace_key = (
                                 "corrected_current"
-                                if sim_trace_type == "Normalized raw"
+                                if sim_trace_type in {"Offset raw", "Normalized raw"}
                                 else "smoothed_corrected_current"
                             )
                             if sim_trace_channels:
@@ -24613,6 +26347,7 @@ def render_bo_session_app() -> None:
                                     correction_label=correction_label,
                                     normalize_to_peak=normalize_to_peak,
                                     corrected_trace_key=corrected_trace_key,
+                                    offset_to_baseline=offset_to_baseline,
                                     nearest_count=sim_nearest,
                                 )
                                 st.pyplot(fig)
