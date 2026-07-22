@@ -27,6 +27,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
 from plotly.utils import PlotlyJSONEncoder
 from scipy.interpolate import Rbf, RegularGridInterpolator, griddata
@@ -178,6 +179,66 @@ def _apply_plotly_slice_perimeter_style(
         "layer": "above",
     })
     fig.update_layout(shapes=existing_shapes)
+
+
+def _add_plotly_slice_fill_mesh(
+    fig: go.Figure,
+    plane_x,
+    plane_y,
+    plane_z,
+    *,
+    color: str,
+    opacity: float,
+    name: str,
+    hovertemplate: str,
+) -> None:
+    """Add a clean two-triangle 3D slice fill for static Plotly exports."""
+    x_values = np.asarray(plane_x, dtype=float)
+    y_values = np.asarray(plane_y, dtype=float)
+    z_values = np.asarray(plane_z, dtype=float)
+    if (
+        x_values.shape != (2, 2)
+        or y_values.shape != (2, 2)
+        or z_values.shape != (2, 2)
+    ):
+        return
+    fig.add_trace(go.Mesh3d(
+        x=[
+            float(x_values[0, 0]),
+            float(x_values[0, 1]),
+            float(x_values[1, 1]),
+            float(x_values[1, 0]),
+        ],
+        y=[
+            float(y_values[0, 0]),
+            float(y_values[0, 1]),
+            float(y_values[1, 1]),
+            float(y_values[1, 0]),
+        ],
+        z=[
+            float(z_values[0, 0]),
+            float(z_values[0, 1]),
+            float(z_values[1, 1]),
+            float(z_values[1, 0]),
+        ],
+        i=[0, 0],
+        j=[1, 2],
+        k=[2, 3],
+        color=color,
+        opacity=float(opacity),
+        flatshading=True,
+        lighting={
+            "ambient": 1.0,
+            "diffuse": 0.0,
+            "specular": 0.0,
+            "roughness": 1.0,
+            "fresnel": 0.0,
+        },
+        showscale=False,
+        showlegend=False,
+        name=name,
+        hovertemplate=hovertemplate,
+    ))
 
 
 def _apply_plotly_2d_slice_aspect(
@@ -2560,20 +2621,18 @@ def _add_plotly_slice_plane(
             if len(valid_slice_values) > 1
             else "Highlighted slice"
         )
-        fig.add_trace(go.Surface(
-            x=plane_x,
-            y=plane_y,
-            z=plane_z,
-            surfacecolor=[[1, 1], [1, 1]],
-            colorscale=[[0, color], [1, color]],
+        _add_plotly_slice_fill_mesh(
+            fig,
+            plane_x,
+            plane_y,
+            plane_z,
+            color=color,
             opacity=0.34 if len(valid_slice_values) > 1 else 0.23,
-            showscale=False,
-            showlegend=False,
             name=trace_name,
             hovertemplate=(
                 f"{slice_axis}: {value:.4g}<extra>Highlighted slice</extra>"
             ),
-        ))
+        )
         fig.add_trace(go.Scatter3d(
             x=outline_x,
             y=outline_y,
@@ -2828,6 +2887,265 @@ def _plot_hyperparameter_response(
         yaxis_title=y_axis,
         height=420,
         margin={"l": 70, "r": 110, "t": 55, "b": 65},
+    )
+    return _apply_plotly_colorbar_height(fig)
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _plot_hyperparameter_parallel_coordinates(
+    response: pd.DataFrame,
+    *,
+    hyperparameter_columns: Sequence[str],
+    metric_label: str,
+    aggregate: str,
+    line_width: float = 1.5,
+    line_opacity: float = 0.55,
+    line_draw_order: str = "Low response on top",
+) -> go.Figure:
+    response_colorscale = "Plasma"
+    if response.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No hyperparameter response values are available.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=430)
+        return fig
+
+    dimensions = [
+        column for column in hyperparameter_columns
+        if column in response.columns
+        and pd.to_numeric(response[column], errors="coerce").notna().any()
+    ]
+    if len(dimensions) < 2:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="At least two numeric hyperparameters are required.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=430)
+        return fig
+
+    aggregate_func = {
+        "Mean": "mean",
+        "Median": "median",
+        "Maximum": "max",
+        "Minimum": "min",
+    }[aggregate]
+    work = response.copy()
+    for column in [*dimensions, "metric_value"]:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=[*dimensions, "metric_value"])
+    if work.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No complete hyperparameter response rows are available.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=430)
+        return fig
+
+    grouped = (
+        work.groupby(dimensions, as_index=False, dropna=False)
+        .agg(metric_value=("metric_value", aggregate_func))
+        .sort_values(dimensions)
+    )
+    metric_values = pd.to_numeric(grouped["metric_value"], errors="coerce")
+    finite_metric_values = metric_values[np.isfinite(metric_values)]
+    color_min = (
+        float(finite_metric_values.min())
+        if not finite_metric_values.empty else None
+    )
+    color_max = (
+        float(finite_metric_values.max())
+        if not finite_metric_values.empty else None
+    )
+    if (
+        color_min is not None
+        and color_max is not None
+        and np.isclose(color_min, color_max)
+    ):
+        color_max = color_min + 1.0
+
+    plot_columns = [*dimensions, "__metric_value"]
+    plot_labels = [_metric_label(column) for column in dimensions] + [metric_label]
+    plot_data = grouped.rename(columns={"metric_value": "__metric_value"})
+    if line_draw_order == "Low response on top":
+        plot_data = plot_data.sort_values(
+            "__metric_value",
+            ascending=False,
+            kind="mergesort",
+        )
+    elif line_draw_order == "High response on top":
+        plot_data = plot_data.sort_values(
+            "__metric_value",
+            ascending=True,
+            kind="mergesort",
+        )
+    axis_ranges: dict[str, tuple[float, float]] = {}
+    for column in plot_columns:
+        values = pd.to_numeric(plot_data[column], errors="coerce")
+        axis_min = float(values.min())
+        axis_max = float(values.max())
+        if np.isclose(axis_min, axis_max):
+            padding = max(abs(axis_min) * 0.05, 1e-9)
+            axis_min -= padding
+            axis_max += padding
+        axis_ranges[column] = (axis_min, axis_max)
+
+    def normalize_value(column: str, value: Any) -> float:
+        axis_min, axis_max = axis_ranges[column]
+        return float((float(value) - axis_min) / (axis_max - axis_min))
+
+    fig = go.Figure()
+    x_positions = list(range(len(plot_columns)))
+    line_width = max(0.5, min(10.0, float(line_width)))
+    line_opacity = max(0.05, min(1.0, float(line_opacity)))
+    metric_denominator = (
+        color_max - color_min
+        if color_min is not None and color_max is not None
+        else 1.0
+    )
+    def color_with_alpha(color: str, alpha: float) -> str:
+        match = re.fullmatch(
+            r"rgba?\(([^,]+),([^,]+),([^,\)]+)(?:,[^\)]*)?\)",
+            str(color).strip(),
+        )
+        if match:
+            red, green, blue = (
+                float(match.group(1)),
+                float(match.group(2)),
+                float(match.group(3)),
+            )
+            return f"rgba({red:.0f},{green:.0f},{blue:.0f},{alpha:.4g})"
+        return str(color)
+
+    for _row_index, row in plot_data.iterrows():
+        current_metric = float(row["__metric_value"])
+        color_fraction = (
+            (current_metric - float(color_min)) / metric_denominator
+            if color_min is not None
+            and color_max is not None
+            and metric_denominator
+            else 0.5
+        )
+        color = sample_colorscale(
+            response_colorscale,
+            [max(0.0, min(1.0, color_fraction))],
+        )[0]
+        line_color = color_with_alpha(color, line_opacity)
+        y_values = [
+            normalize_value(column, row[column])
+            for column in plot_columns
+        ]
+        hover_lines = [
+            f"{label}: {float(row[column]):.4g}"
+            for label, column in zip(plot_labels, plot_columns)
+        ]
+        fig.add_trace(go.Scatter(
+            x=x_positions,
+            y=y_values,
+            mode="lines",
+            line={"color": line_color, "width": line_width},
+            opacity=1.0,
+            showlegend=False,
+            hovertemplate="<br>".join(hover_lines) + "<extra></extra>",
+        ))
+
+    for axis_index, (column, label) in enumerate(zip(plot_columns, plot_labels)):
+        fig.add_shape(
+            type="line",
+            x0=axis_index,
+            x1=axis_index,
+            y0=0,
+            y1=1,
+            line={"color": "rgba(50,50,50,0.55)", "width": 1},
+        )
+        axis_min, axis_max = axis_ranges[column]
+        tick_values = np.linspace(axis_min, axis_max, 5)
+        for tick_value in tick_values:
+            tick_y = normalize_value(column, tick_value)
+            fig.add_shape(
+                type="line",
+                x0=axis_index - 0.035,
+                x1=axis_index + 0.035,
+                y0=tick_y,
+                y1=tick_y,
+                line={"color": "rgba(50,50,50,0.45)", "width": 1},
+            )
+            fig.add_annotation(
+                x=axis_index - 0.045,
+                y=tick_y,
+                text=f"{float(tick_value):.3g}",
+                showarrow=False,
+                xanchor="right",
+                yanchor="middle",
+                font={"size": 10, "color": "rgba(30,30,30,0.72)"},
+            )
+        fig.add_annotation(
+            x=axis_index,
+            y=1.08,
+            text=label,
+            showarrow=False,
+            xanchor="center",
+            yanchor="bottom",
+            font={"size": 12},
+        )
+
+    colorbar_marker: dict[str, Any] = {
+        "color": metric_values.to_numpy(dtype=float),
+        "colorscale": response_colorscale,
+        "showscale": True,
+        "colorbar": {
+            "title": {"text": metric_label, "side": "right"},
+            "tickformat": ".4g",
+            "ticks": "outside",
+            "thickness": 18,
+            "x": 1.03,
+            "xpad": 8,
+        },
+        "opacity": 0,
+    }
+    if color_min is not None and color_max is not None:
+        colorbar_marker["cmin"] = color_min
+        colorbar_marker["cmax"] = color_max
+    fig.add_trace(go.Scatter(
+        x=[None] * len(metric_values),
+        y=[None] * len(metric_values),
+        mode="markers",
+        marker=colorbar_marker,
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        title=f"{aggregate} {metric_label} by hyperparameters",
+        height=500,
+        margin={"l": 70, "r": 120, "t": 55, "b": 45},
+        xaxis={
+            "range": [-0.25, len(plot_columns) - 0.75],
+            "showgrid": False,
+            "showticklabels": False,
+            "zeroline": False,
+        },
+        yaxis={
+            "range": [-0.05, 1.12],
+            "showgrid": False,
+            "showticklabels": False,
+            "zeroline": False,
+        },
+        plot_bgcolor="white",
     )
     return _apply_plotly_colorbar_height(fig)
 
@@ -3856,8 +4174,10 @@ def _real_comparison_payload(
     phase: str,
     channel_mode: str,
     session_path: Path,
+    current_points: pd.DataFrame | None = None,
+    label: str | None = None,
 ) -> dict:
-    return {
+    payload = {
         "points": points.copy(),
         "metric": metric,
         "phase": phase,
@@ -3865,6 +4185,12 @@ def _real_comparison_payload(
         "session_path": str(session_path),
         "row_count": int(len(points)),
     }
+    if current_points is not None:
+        payload["current_points"] = current_points.copy()
+        payload["current_row_count"] = int(len(current_points))
+    if label:
+        payload["label"] = str(label)
+    return payload
 
 
 def _real_comparison_join_columns(
@@ -3936,17 +4262,67 @@ def _real_comparison_delta_points(
             current_series = current_join
             series_label = "all rows"
 
+        exact_output = pd.DataFrame()
+        exact_current = (
+            current_series
+            .dropna(subset=[*parameter_columns, "value"])
+            .groupby(parameter_columns, as_index=False, dropna=False)["value"]
+            .mean()
+            .rename(columns={"value": "exact_current_value"})
+        )
+        if not exact_current.empty:
+            cached_exact = cached_series.dropna(
+                subset=[*parameter_columns, "value"]
+            ).reset_index(drop=True)
+            if not cached_exact.empty:
+                exact_matches = cached_exact.merge(
+                    exact_current,
+                    on=parameter_columns,
+                    how="left",
+                    sort=False,
+                )
+                exact_values = pd.to_numeric(
+                    exact_matches["exact_current_value"],
+                    errors="coerce",
+                )
+                exact_mask = exact_values.notna()
+                if exact_mask.any():
+                    exact_output = cached_exact.loc[exact_mask.to_numpy()].copy()
+                    exact_output["cached_value"] = pd.to_numeric(
+                        exact_output["value"],
+                        errors="coerce",
+                    ).to_numpy(dtype=float)
+                    exact_output["current_value"] = exact_values.loc[
+                        exact_mask
+                    ].to_numpy(dtype=float)
+                    exact_output = exact_output[
+                        np.isfinite(exact_output["cached_value"])
+                        & np.isfinite(exact_output["current_value"])
+                    ]
+                    if not exact_output.empty:
+                        exact_output["value"] = (
+                            exact_output["current_value"]
+                            - exact_output["cached_value"]
+                        )
+                        exact_output["comparison_delta"] = exact_output["value"]
+
         active_parameters = [
             column for column in parameter_columns
             if pd.to_numeric(current_series[column], errors="coerce").nunique(dropna=True) > 1
         ]
         if not active_parameters:
-            skipped_series.append(series_label)
+            if not exact_output.empty:
+                output_frames.append(exact_output)
+            else:
+                skipped_series.append(series_label)
             continue
         current_valid = current_series.dropna(subset=[*active_parameters, "value"])
         cached_valid = cached_series.dropna(subset=active_parameters)
         if len(current_valid) < len(active_parameters) + 1 or cached_valid.empty:
-            skipped_series.append(series_label)
+            if not exact_output.empty:
+                output_frames.append(exact_output)
+            else:
+                skipped_series.append(series_label)
             continue
         coordinates = np.column_stack([
             pd.to_numeric(current_valid[column], errors="coerce").to_numpy(dtype=float)
@@ -4007,6 +4383,12 @@ def _real_comparison_delta_points(
             continue
         compared["value"] = compared["current_value"] - compared["cached_value"]
         compared["comparison_delta"] = compared["value"]
+        if not exact_output.empty:
+            compared = pd.concat([exact_output, compared], ignore_index=True)
+            compared = compared.drop_duplicates(
+                subset=[*parameter_columns, *series_columns],
+                keep="first",
+            )
         output_frames.append(compared)
 
     if not output_frames:
@@ -4487,6 +4869,581 @@ def _add_plotly_iteration_path(
         if is_3d:
             invisible_kwargs["z"] = [None, None]
         fig.add_trace(scatter_type(**invisible_kwargs))
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _plot_real_channel_iteration_heatmap(
+    points: pd.DataFrame,
+    *,
+    metric_label: str,
+    phase: str,
+    color_value_column: str = "value",
+    color_value_label: str | None = None,
+    value_range: tuple[float, float] | None = None,
+    value_colorscale: str = "Viridis",
+) -> go.Figure:
+    color_value_label = color_value_label or metric_label
+    required_columns = {"channel", "iteration", "value", color_value_column}
+    if points.empty or not required_columns.issubset(points.columns):
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Channel, iteration, metric, and color values are required.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    work = points.copy()
+    work["__channel_label"] = work["channel"].astype(str)
+    work["iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work["__color_value"] = pd.to_numeric(
+        work[color_value_column],
+        errors="coerce",
+    )
+    work = work.dropna(
+        subset=["__channel_label", "iteration", "value", "__color_value"]
+    )
+    if work.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No complete channel-iteration values are available.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    channel_labels = sorted(
+        work["__channel_label"].dropna().unique().tolist(),
+        key=_channel_sort_key,
+    )
+    iteration_values = sorted(
+        float(value)
+        for value in pd.to_numeric(work["iteration"], errors="coerce")
+        .dropna()
+        .unique()
+    )
+    if not channel_labels or not iteration_values:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No channel-iteration grid can be formed.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    aggregated = (
+        work.groupby(["__channel_label", "iteration"], dropna=False)
+        .agg(
+            color_value=("__color_value", "mean"),
+            metric_value=("value", "mean"),
+            observations=("value", "size"),
+        )
+        .reset_index()
+    )
+    value_lookup = {
+        (str(row["__channel_label"]), float(row["iteration"])): float(
+            row["color_value"]
+        )
+        for _, row in aggregated.iterrows()
+    }
+    metric_lookup = {
+        (str(row["__channel_label"]), float(row["iteration"])): float(
+            row["metric_value"]
+        )
+        for _, row in aggregated.iterrows()
+    }
+    count_lookup = {
+        (str(row["__channel_label"]), float(row["iteration"])): int(row["observations"])
+        for _, row in aggregated.iterrows()
+    }
+    z_values = [
+        [
+            value_lookup.get((channel_label, iteration_value), np.nan)
+            for iteration_value in iteration_values
+        ]
+        for channel_label in channel_labels
+    ]
+    metric_values_grid = [
+        [
+            metric_lookup.get((channel_label, iteration_value), np.nan)
+            for iteration_value in iteration_values
+        ]
+        for channel_label in channel_labels
+    ]
+    count_values = [
+        [
+            count_lookup.get((channel_label, iteration_value), 0)
+            for iteration_value in iteration_values
+        ]
+        for channel_label in channel_labels
+    ]
+
+    finite_values = pd.to_numeric(work["__color_value"], errors="coerce")
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if value_range is not None:
+        color_min, color_max = map(float, value_range)
+    elif not finite_values.empty:
+        color_min, color_max = float(finite_values.min()), float(finite_values.max())
+    else:
+        color_min, color_max = 0.0, 1.0
+    if np.isclose(color_min, color_max):
+        color_max = color_min + 1.0
+
+    display_iterations = [
+        int(value) if float(value).is_integer() else value
+        for value in iteration_values
+    ]
+    display_channels = [
+        f"Ch {label}" if str(label).isdigit() else str(label)
+        for label in channel_labels
+    ]
+    custom_values = np.dstack((
+        np.asarray(count_values, dtype=float),
+        np.asarray(metric_values_grid, dtype=float),
+    ))
+    hovertemplate = (
+        "Channel: %{y}<br>"
+        "Iteration: %{x}<br>"
+        f"{color_value_label}: " + "%{z:.4g}<br>"
+    )
+    if color_value_column != "value":
+        hovertemplate += f"{metric_label}: " + "%{customdata[1]:.4g}<br>"
+    hovertemplate += "Rows averaged: %{customdata[0]:.0f}<extra></extra>"
+    fig = go.Figure(data=[go.Heatmap(
+        x=display_iterations,
+        y=display_channels,
+        z=z_values,
+        customdata=custom_values,
+        colorscale=value_colorscale,
+        zmin=color_min,
+        zmax=color_max,
+        colorbar={
+            "title": {"text": color_value_label, "side": "right"},
+            "tickformat": ".4g",
+            "ticks": "outside",
+            "thickness": 18,
+            "len": 0.78,
+        },
+        hovertemplate=hovertemplate,
+    )])
+    fig.update_layout(
+        title=(
+            f"Measured {phase} {metric_label} | "
+            f"Channel x iteration heatmap colored by {color_value_label}"
+        ),
+        height=max(360, min(900, 240 + 28 * len(channel_labels))),
+        margin={"l": 90, "r": 120, "t": 60, "b": 65},
+        xaxis={"title": "Iteration", "dtick": 1 if len(iteration_values) <= 60 else None},
+        yaxis={"title": "Channel", "autorange": "reversed"},
+        plot_bgcolor="white",
+    )
+    return _apply_plotly_colorbar_height(fig)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _plot_real_data_parallel_coordinates(
+    points: pd.DataFrame,
+    *,
+    metric_label: str,
+    phase: str,
+    parameter_columns: Sequence[str],
+    line_width: float = 2.0,
+    line_opacity: float = 0.76,
+    value_range: tuple[float, float] | None = None,
+    log_frequency: bool = False,
+    value_colorscale: str = "Viridis",
+    optimum_reference: dict[str, float] | None = None,
+) -> go.Figure:
+    if points.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No real-data values are available.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    def parameter_varies(column: str) -> bool:
+        if column not in points.columns:
+            return False
+        values = pd.to_numeric(points[column], errors="coerce").dropna()
+        if values.nunique(dropna=True) <= 1:
+            return False
+        return not np.isclose(float(values.min()), float(values.max()))
+
+    channel_labels: list[str] = []
+    channel_index_by_label: dict[str, int] = {}
+    include_channel_axis = (
+        "channel" in points.columns
+        and points["channel"].nunique(dropna=True) > 1
+    )
+    if include_channel_axis:
+        channel_labels = sorted(
+            points["channel"].dropna().astype(str).unique().tolist(),
+            key=_channel_sort_key,
+        )
+        channel_index_by_label = {
+            label: index for index, label in enumerate(channel_labels)
+        }
+
+    dimensions = [
+        "iteration",
+        *(["__channel_value"] if include_channel_axis else []),
+        *[
+            column for column in parameter_columns
+            if parameter_varies(column)
+        ],
+        "__metric_value",
+    ]
+    if len(dimensions) < 2 or "value" not in points.columns:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Iteration and at least one parameter axis are required.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    work = points.copy()
+    if include_channel_axis:
+        work["__channel_value"] = [
+            channel_index_by_label.get(str(value), np.nan)
+            for value in work["channel"]
+        ]
+    work["__metric_value"] = pd.to_numeric(work["value"], errors="coerce")
+    for column in [*dimensions, "value"]:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=[*dimensions, "value"]).sort_values("iteration")
+    if work.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No complete real-data rows are available for this view.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    plot_values = work.copy()
+    dimension_labels: dict[str, str] = {}
+    for column in dimensions:
+        if column == "iteration":
+            dimension_labels[column] = "Iteration"
+        elif column == "__channel_value":
+            dimension_labels[column] = "Channel"
+        elif column == "__metric_value":
+            dimension_labels[column] = metric_label
+        elif column == "frequency" and log_frequency:
+            safe_values = pd.to_numeric(plot_values[column], errors="coerce")
+            safe_values = safe_values.where(safe_values > 0)
+            plot_values[column] = np.log10(safe_values)
+            dimension_labels[column] = f"{_metric_label(column)} (log10)"
+        else:
+            dimension_labels[column] = _metric_label(column)
+
+    axis_ranges: dict[str, tuple[float, float]] = {}
+    for column in dimensions:
+        values = pd.to_numeric(plot_values[column], errors="coerce")
+        values = values[np.isfinite(values)]
+        if values.empty:
+            continue
+        axis_min = float(values.min())
+        axis_max = float(values.max())
+        if np.isclose(axis_min, axis_max):
+            padding = max(abs(axis_min) * 0.05, 1e-9)
+            axis_min -= padding
+            axis_max += padding
+        axis_ranges[column] = (axis_min, axis_max)
+    dimensions = [column for column in dimensions if column in axis_ranges]
+    if len(dimensions) < 2:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough finite values are available for this view.",
+            x=.5,
+            y=.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_layout(height=440)
+        return fig
+
+    metric_values = pd.to_numeric(work["value"], errors="coerce")
+    metric_values = metric_values[np.isfinite(metric_values)]
+    if value_range is not None:
+        color_min, color_max = map(float, value_range)
+    elif not metric_values.empty:
+        color_min, color_max = float(metric_values.min()), float(metric_values.max())
+    else:
+        color_min, color_max = 0.0, 1.0
+    if np.isclose(color_min, color_max):
+        color_max = color_min + 1.0
+    color_denominator = color_max - color_min
+
+    def normalize_value(column: str, value: Any) -> float:
+        axis_min, axis_max = axis_ranges[column]
+        return float((float(value) - axis_min) / (axis_max - axis_min))
+
+    series_columns = [
+        column for column in ("phase", "group_id", "group_name", "channel")
+        if column in work.columns
+    ]
+    if series_columns:
+        grouped_series = work.groupby(series_columns, sort=True, dropna=False)
+    else:
+        grouped_series = [((), work)]
+
+    fig = go.Figure()
+    x_positions = list(range(len(dimensions)))
+    line_width = max(0.5, min(12.0, float(line_width)))
+    line_opacity = max(0.05, min(1.0, float(line_opacity)))
+
+    def color_with_alpha(color: str, alpha: float) -> str:
+        match = re.fullmatch(
+            r"rgba?\(([^,]+),([^,]+),([^,\)]+)(?:,[^\)]*)?\)",
+            str(color).strip(),
+        )
+        if match:
+            red, green, blue = (
+                float(match.group(1)),
+                float(match.group(2)),
+                float(match.group(3)),
+            )
+            return f"rgba({red:.0f},{green:.0f},{blue:.0f},{alpha:.4g})"
+        return str(color)
+
+    for series_key, series in grouped_series:
+        series_plot = plot_values.loc[series.index].dropna(
+            subset=[*dimensions, "value"]
+        ).sort_values("iteration")
+        if series_plot.empty:
+            continue
+        if not isinstance(series_key, tuple):
+            series_key = (series_key,)
+        series_parts = [
+            str(value) for value in series_key
+            if pd.notna(value) and str(value).strip()
+        ]
+        series_label = " | ".join(series_parts) if series_parts else phase
+        for row_index, row in series_plot.iterrows():
+            current_metric = float(work.loc[row_index, "value"])
+            color_fraction = (current_metric - color_min) / color_denominator
+            color = sample_colorscale(
+                value_colorscale,
+                [max(0.0, min(1.0, color_fraction))],
+            )[0]
+            line_color = color_with_alpha(color, line_opacity)
+            y_values = [
+                normalize_value(column, row[column])
+                for column in dimensions
+            ]
+            hover_lines = [
+                (
+                    f"{metric_label}: {current_metric:.4g}"
+                    if column == "__metric_value"
+                    else (
+                        f"Channel: "
+                        f"{channel_labels[int(round(float(row[column])))]}"
+                    )
+                    if column == "__channel_value"
+                    else (
+                        f"{dimension_labels[column]}: "
+                        f"{float(work.loc[row_index, column]):.4g}"
+                    )
+                    if column != "frequency" or not log_frequency
+                    else (
+                        f"{_metric_label(column)}: "
+                        f"{float(work.loc[row_index, column]):.4g}"
+                    )
+                )
+                for column in dimensions
+            ]
+            hover_lines.append(f"Series: {series_label}")
+            fig.add_trace(go.Scatter(
+                x=x_positions,
+                y=y_values,
+                mode="lines",
+                line={"color": line_color, "width": line_width},
+                opacity=1.0,
+                showlegend=False,
+                hovertemplate="<br>".join(hover_lines) + "<extra></extra>",
+            ))
+
+    for axis_index, column in enumerate(dimensions):
+        fig.add_shape(
+            type="line",
+            x0=axis_index,
+            x1=axis_index,
+            y0=0,
+            y1=1,
+            line={"color": "rgba(50,50,50,0.55)", "width": 1},
+        )
+        axis_min, axis_max = axis_ranges[column]
+        for tick_value in np.linspace(axis_min, axis_max, 5):
+            tick_y = normalize_value(column, tick_value)
+            fig.add_shape(
+                type="line",
+                x0=axis_index - 0.035,
+                x1=axis_index + 0.035,
+                y0=tick_y,
+                y1=tick_y,
+                line={"color": "rgba(50,50,50,0.45)", "width": 1},
+            )
+            if column == "__channel_value":
+                channel_index = int(round(float(tick_value)))
+                if (
+                    not np.isclose(tick_value, channel_index)
+                    or channel_index < 0
+                    or channel_index >= len(channel_labels)
+                ):
+                    continue
+                tick_label_value = (
+                    f"Ch {channel_labels[channel_index]}"
+                    if str(channel_labels[channel_index]).isdigit()
+                    else str(channel_labels[channel_index])
+                )
+            else:
+                tick_label_value = (
+                    10 ** float(tick_value)
+                    if column == "frequency" and log_frequency
+                    else f"{float(tick_value):.3g}"
+                )
+            fig.add_annotation(
+                x=axis_index - 0.045,
+                y=tick_y,
+                text=str(tick_label_value),
+                showarrow=False,
+                xanchor="right",
+                yanchor="middle",
+                font={"size": 10, "color": "rgba(30,30,30,0.72)"},
+            )
+        fig.add_annotation(
+            x=axis_index,
+            y=1.08,
+            text=dimension_labels[column],
+            showarrow=False,
+            xanchor="center",
+            yanchor="bottom",
+            font={"size": 12},
+        )
+
+    fig.add_trace(go.Scatter(
+        x=[None, None],
+        y=[None, None],
+        mode="markers",
+        marker={
+            "color": [color_min, color_max],
+            "colorscale": value_colorscale,
+            "cmin": color_min,
+            "cmax": color_max,
+            "showscale": True,
+            "colorbar": {
+                "title": {"text": metric_label, "side": "right"},
+                "tickformat": ".4g",
+                "ticks": "outside",
+                "thickness": 18,
+                "x": 1.08,
+                "xpad": 8,
+                "len": 0.78,
+            },
+            "size": 0,
+            "opacity": 0,
+        },
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    if optimum_reference:
+        optimum_x: list[int] = []
+        optimum_y: list[float] = []
+        optimum_hover: list[str] = []
+        for axis_index, column in enumerate(dimensions):
+            if column in {"iteration", "__metric_value"}:
+                continue
+            reference_value = _finite_float(optimum_reference.get(column))
+            if reference_value is None:
+                continue
+            display_value = (
+                float(np.log10(max(reference_value, 1e-12)))
+                if column == "frequency" and log_frequency
+                else float(reference_value)
+            )
+            axis_min, axis_max = axis_ranges[column]
+            if display_value < axis_min or display_value > axis_max:
+                continue
+            optimum_x.append(axis_index)
+            optimum_y.append(normalize_value(column, display_value))
+            optimum_hover.append(
+                "Global optimum<br>"
+                f"{_metric_label(column)}: {reference_value:.4g}"
+            )
+        if optimum_x:
+            fig.add_trace(go.Scatter(
+                x=optimum_x,
+                y=optimum_y,
+                mode="markers",
+                name="Global optimum",
+                marker={
+                    "symbol": "diamond",
+                    "size": 13,
+                    "color": "#ff2d2d",
+                    "showscale": False,
+                    "line": {"color": "white", "width": 2.5},
+                },
+                text=optimum_hover,
+                hovertemplate="%{text}<extra></extra>",
+                showlegend=True,
+                cliponaxis=False,
+            ))
+    fig.update_layout(
+        title=f"Measured {phase} {metric_label} | Parallel coordinates",
+        height=500,
+        margin={"l": 80, "r": 165, "t": 60, "b": 45},
+        legend={
+            "x": 1.16,
+            "xanchor": "left",
+            "y": 1.0,
+            "yanchor": "top",
+        },
+        xaxis={
+            "range": [-0.25, len(dimensions) - 0.75],
+            "showgrid": False,
+            "showticklabels": False,
+            "zeroline": False,
+        },
+        yaxis={
+            "range": [-0.05, 1.12],
+            "showgrid": False,
+            "showticklabels": False,
+            "zeroline": False,
+        },
+        plot_bgcolor="white",
+    )
+    return _apply_plotly_colorbar_height(fig)
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -13409,21 +14366,19 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
                     trace_name = f"Slice {slice_index + 1}: {slice_axis}={current_slice_value:g}"
                 else:
                     trace_name = "Highlighted slice"
-                fig.add_trace(go.Surface(
-                    x=plane_x,
-                    y=plane_y,
-                    z=plane_z,
-                    surfacecolor=np.zeros_like(plane_x),
-                    colorscale=[[0, color], [1, color]],
+                _add_plotly_slice_fill_mesh(
+                    fig,
+                    plane_x,
+                    plane_y,
+                    plane_z,
+                    color=color,
                     opacity=0.34 if len(valid_slice_values) > 1 else 0.28,
-                    showscale=False,
-                    showlegend=False,
                     name=trace_name,
                     hovertemplate=(
                         f"{slice_axis}: {float(current_slice_value):.4g}"
                         "<extra>Highlighted slice</extra>"
                     ),
-                ))
+                )
                 fig.add_trace(go.Scatter3d(
                     x=outline_x,
                     y=outline_y,
@@ -13739,7 +14694,7 @@ def _apply_plotly_colorbar_height(fig: go.Figure) -> go.Figure:
         if getattr(marker, "coloraxis", None):
             uses_layout_coloraxis = True
         marker_colorbar = getattr(marker, "colorbar", None)
-        if marker_colorbar is not None:
+        if marker_colorbar is not None and getattr(marker, "showscale", None) is True:
             marker_colorbar.len = height_fraction
             marker_colorbar.y = 0.5
     if not uses_layout_coloraxis:
@@ -15043,7 +15998,6 @@ def render_bo_session_app() -> None:
             "PDF Export",
         ]
     )
-
     with metadata_tab:
         st.subheader("Channel-group optimization metadata")
         optimization_metadata = _channel_group_optimization_metadata(
@@ -15976,9 +16930,9 @@ def render_bo_session_app() -> None:
                     else None
                 )
                 hp_view_options = (
-                    ["2D heatmap", "3D heatmap"]
+                    ["2D heatmap", "3D heatmap", "Parallel coordinates"]
                     if len(hyperparameter_columns) >= 3
-                    else ["2D heatmap"]
+                    else ["2D heatmap", "Parallel coordinates"]
                 )
                 _preserve_valid_widget_value(
                     "bo_hp_response_view",
@@ -16004,6 +16958,7 @@ def render_bo_session_app() -> None:
                     hyperparameter_columns,
                     format_func=_metric_label,
                     key="bo_hp_response_x",
+                    disabled=hp_view == "Parallel coordinates",
                 )
                 hp_y_options = [
                     column for column in hyperparameter_columns if column != hp_x
@@ -16022,6 +16977,7 @@ def render_bo_session_app() -> None:
                     hp_y_options,
                     format_func=_metric_label,
                     key="bo_hp_response_y",
+                    disabled=hp_view == "Parallel coordinates",
                 )
                 hp_z = None
                 hp_2d_slice_column = None
@@ -16035,6 +16991,9 @@ def render_bo_session_app() -> None:
                 hp_voxel_internal_opacity = 1.0
                 hp_voxel_internal_point_size = 20
                 hp_voxel_internal_point_count = 1
+                hp_parallel_line_width = 1.5
+                hp_parallel_line_opacity = 0.55
+                hp_parallel_draw_order = "Low response on top"
                 if hp_view == "3D heatmap":
                     hp_z_options = [
                         column for column in hyperparameter_columns
@@ -16261,12 +17220,63 @@ def render_bo_session_app() -> None:
                                         key=hp_2d_slice_value_key,
                                     )
                                 )
+                if hp_view == "Parallel coordinates":
+                    parallel_columns = st.columns([1, 1, 1, 2])
+                    hp_parallel_line_width = float(parallel_columns[0].slider(
+                        "Line thickness",
+                        min_value=0.5,
+                        max_value=10.0,
+                        value=1.5,
+                        step=0.5,
+                        key="bo_hp_response_parallel_line_width",
+                    ))
+                    hp_parallel_line_opacity = float(parallel_columns[1].slider(
+                        "Line transparency",
+                        min_value=0.05,
+                        max_value=1.0,
+                        value=0.55,
+                        step=0.05,
+                        key="bo_hp_response_parallel_line_opacity",
+                        help=(
+                            "Lower values make overlapping paths easier to see. "
+                            "At 1.0, later lines can fully cover earlier lines "
+                            "when runs share the same coordinates."
+                        ),
+                    ))
+                    hp_parallel_draw_order = parallel_columns[2].selectbox(
+                        "Line layering",
+                        [
+                            "Low response on top",
+                            "High response on top",
+                            "Input order",
+                        ],
+                        key="bo_hp_response_parallel_draw_order",
+                        help=(
+                            "Plotly draws later lines above earlier lines. "
+                            "Use this to keep low- or high-response paths from "
+                            "being hidden by overlapping coordinates."
+                        ),
+                    )
+                    parallel_columns[3].caption(
+                        "Parallel coordinates include every varying hyperparameter "
+                        "axis and color each run-level line by the selected response "
+                        "metric."
+                    )
                 hp_crop_ranges: dict[str, tuple[float, float]] = {}
-                hp_crop_axes = [
-                    axis for axis in [hp_x, hp_y, hp_z]
-                    if axis is not None
-                ]
-                with st.expander("Crop heatmap/tensor by parameter", expanded=False):
+                hp_crop_axes = (
+                    list(hyperparameter_columns)
+                    if hp_view == "Parallel coordinates"
+                    else [
+                        axis for axis in [hp_x, hp_y, hp_z]
+                        if axis is not None
+                    ]
+                )
+                crop_label = (
+                    "Crop parallel coordinates by parameter"
+                    if hp_view == "Parallel coordinates"
+                    else "Crop heatmap/tensor by parameter"
+                )
+                with st.expander(crop_label, expanded=False):
                     hp_crop_enabled = st.checkbox(
                         "Enable parameter crop",
                         key=(
@@ -16552,6 +17562,7 @@ def render_bo_session_app() -> None:
                                 iteration_end,
                                 hp_metric_key,
                                 hp_view,
+                                tuple(hyperparameter_columns),
                                 hp_x,
                                 hp_y,
                                 hp_z,
@@ -16566,6 +17577,9 @@ def render_bo_session_app() -> None:
                                 hp_voxel_internal_opacity,
                                 hp_voxel_internal_point_size,
                                 hp_voxel_internal_point_count,
+                                hp_parallel_line_width,
+                                hp_parallel_line_opacity,
+                                hp_parallel_draw_order,
                                 tuple(hp_crop_tokens),
                                 tuple(hp_slice_tokens),
                             )
@@ -16586,26 +17600,38 @@ def render_bo_session_app() -> None:
                                 rendered_response_frame = cached_render["response_frame"]
                                 rendered_sort_columns = cached_render["sort_columns"]
                                 rendered_key_suffix = cached_render["key_suffix"]
+                                rendered_gif_key = cached_render["gif_key"]
                             else:
                                 hp_plot_metric_label = (
                                     "Iterations to target Q"
                                     if hp_summary == "Iterations to Q target"
                                     else hp_metric_label
                                 )
-                                hp_figure = _plot_hyperparameter_response(
-                                    plot_response_frame,
-                                    x_axis=hp_x,
-                                    y_axis=hp_y,
-                                    z_axis=hp_z,
-                                    metric_label=hp_plot_metric_label,
-                                    aggregate=hp_aggregate,
-                                    voxel_face_opacity=hp_voxel_face_opacity,
-                                    voxel_internal_opacity=hp_voxel_internal_opacity,
-                                    voxel_internal_point_size=hp_voxel_internal_point_size,
-                                    voxel_internal_point_count=hp_voxel_internal_point_count,
-                                    slice_axis=hp_3d_slice_axis,
-                                    slice_value=hp_3d_slice_value,
-                                )
+                                if hp_view == "Parallel coordinates":
+                                    hp_figure = _plot_hyperparameter_parallel_coordinates(
+                                        plot_response_frame,
+                                        hyperparameter_columns=hyperparameter_columns,
+                                        metric_label=hp_plot_metric_label,
+                                        aggregate=hp_aggregate,
+                                        line_width=hp_parallel_line_width,
+                                        line_opacity=hp_parallel_line_opacity,
+                                        line_draw_order=hp_parallel_draw_order,
+                                    )
+                                else:
+                                    hp_figure = _plot_hyperparameter_response(
+                                        plot_response_frame,
+                                        x_axis=hp_x,
+                                        y_axis=hp_y,
+                                        z_axis=hp_z,
+                                        metric_label=hp_plot_metric_label,
+                                        aggregate=hp_aggregate,
+                                        voxel_face_opacity=hp_voxel_face_opacity,
+                                        voxel_internal_opacity=hp_voxel_internal_opacity,
+                                        voxel_internal_point_size=hp_voxel_internal_point_size,
+                                        voxel_internal_point_count=hp_voxel_internal_point_count,
+                                        slice_axis=hp_3d_slice_axis,
+                                        slice_value=hp_3d_slice_value,
+                                    )
                                 if hp_summary == "Iterations to Q target":
                                     hp_figure.update_layout(
                                         title=(
@@ -16615,11 +17641,17 @@ def render_bo_session_app() -> None:
                                         )
                                     )
                                 rendered_response_frame = plot_response_frame
-                                rendered_sort_columns = [
-                                    column for column in [hp_z, hp_y, hp_x]
-                                    if column is not None
-                                    and column in rendered_response_frame.columns
-                                ]
+                                if hp_view == "Parallel coordinates":
+                                    rendered_sort_columns = [
+                                        column for column in hyperparameter_columns
+                                        if column in rendered_response_frame.columns
+                                    ]
+                                else:
+                                    rendered_sort_columns = [
+                                        column for column in [hp_z, hp_y, hp_x]
+                                        if column is not None
+                                        and column in rendered_response_frame.columns
+                                    ]
                                 rendered_key_suffix = (
                                     f"{iteration_end}_{hp_metric_key}_{hp_view}_{hp_x}_{hp_y}_"
                                     f"{hp_z or 'none'}_{hp_summary}_{hp_aggregate}_"
@@ -16629,6 +17661,9 @@ def render_bo_session_app() -> None:
                                     f"{hp_voxel_internal_opacity:g}_"
                                     f"{hp_voxel_internal_point_size}_"
                                     f"{hp_voxel_internal_point_count}_"
+                                    f"{hp_parallel_line_width:g}_"
+                                    f"{hp_parallel_line_opacity:g}_"
+                                    f"{hp_parallel_draw_order}_"
                                     f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
                                     f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
                                 )
@@ -16643,6 +17678,9 @@ def render_bo_session_app() -> None:
                                     f"{hp_voxel_internal_opacity:g}_"
                                     f"{hp_voxel_internal_point_size}_"
                                     f"{hp_voxel_internal_point_count}_"
+                                    f"{hp_parallel_line_width:g}_"
+                                    f"{hp_parallel_line_opacity:g}_"
+                                    f"{hp_parallel_draw_order}_"
                                     f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
                                     f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
                                 )
@@ -17054,24 +18092,41 @@ def render_bo_session_app() -> None:
                                                         f"figure {frame_index}/{total}..."
                                                     ),
                                                 )
-                                                figure = _plot_hyperparameter_response(
-                                                    frame_response,
-                                                    x_axis=hp_x,
-                                                    y_axis=hp_y,
-                                                    z_axis=hp_z,
-                                                    metric_label=hp_metric_label,
-                                                    aggregate=hp_aggregate,
-                                                    voxel_face_opacity=hp_voxel_face_opacity,
-                                                    voxel_internal_opacity=(
-                                                        hp_voxel_internal_opacity
-                                                    ),
-                                                    voxel_internal_point_size=(
-                                                        hp_voxel_internal_point_size
-                                                    ),
-                                                    voxel_internal_point_count=(
-                                                        hp_voxel_internal_point_count
-                                                    ),
-                                                )
+                                                if hp_view == "Parallel coordinates":
+                                                    figure = _plot_hyperparameter_parallel_coordinates(
+                                                        frame_response,
+                                                        hyperparameter_columns=(
+                                                            hyperparameter_columns
+                                                        ),
+                                                        metric_label=hp_metric_label,
+                                                        aggregate=hp_aggregate,
+                                                        line_width=hp_parallel_line_width,
+                                                        line_opacity=(
+                                                            hp_parallel_line_opacity
+                                                        ),
+                                                        line_draw_order=(
+                                                            hp_parallel_draw_order
+                                                        ),
+                                                    )
+                                                else:
+                                                    figure = _plot_hyperparameter_response(
+                                                        frame_response,
+                                                        x_axis=hp_x,
+                                                        y_axis=hp_y,
+                                                        z_axis=hp_z,
+                                                        metric_label=hp_metric_label,
+                                                        aggregate=hp_aggregate,
+                                                        voxel_face_opacity=hp_voxel_face_opacity,
+                                                        voxel_internal_opacity=(
+                                                            hp_voxel_internal_opacity
+                                                        ),
+                                                        voxel_internal_point_size=(
+                                                            hp_voxel_internal_point_size
+                                                        ),
+                                                        voxel_internal_point_count=(
+                                                            hp_voxel_internal_point_count
+                                                        ),
+                                                    )
                                                 figure.update_layout(
                                                     title=(
                                                         f"{hp_aggregate} {hp_metric_label} "
@@ -17290,38 +18345,46 @@ def render_bo_session_app() -> None:
                 and selected_paired_channels
             ):
                 average_column, overlay_column = st.columns(2)
-                paired_events.append(_plotly_chart_with_colorbars(
-                    _sized_plot_container(average_column, plot_width_percent),
+                paired_events.append(_render_downloadable_plotly(
+                    average_column,
                     paired_figure,
-                    use_container_width=True,
-                    on_select="rerun",
-                    selection_mode="points",
                     key=f"bo_paired_trend_{paired_chart_suffix}_average",
+                    file_stem=f"buffer_target_trend_{paired_chart_suffix}_average",
+                    width_percent=plot_width_percent,
+                    export_height=int(paired_figure.layout.height or 400),
+                    on_select="rerun",
+                    selection_mode="points",
                 ))
-                paired_events.append(_plotly_chart_with_colorbars(
-                    _sized_plot_container(overlay_column, plot_width_percent),
+                paired_events.append(_render_downloadable_plotly(
+                    overlay_column,
                     paired_overlay_figure,
-                    use_container_width=True,
-                    on_select="rerun",
-                    selection_mode="points",
                     key=f"bo_paired_trend_{paired_chart_suffix}_overlay",
-                ))
-                paired_events.append(_plotly_chart_with_colorbars(
-                    _sized_plot_container(st, plot_width_percent),
-                    paired_separate_figure,
-                    use_container_width=True,
+                    file_stem=f"buffer_target_trend_{paired_chart_suffix}_overlay",
+                    width_percent=plot_width_percent,
+                    export_height=int(paired_overlay_figure.layout.height or 400),
                     on_select="rerun",
                     selection_mode="points",
+                ))
+                paired_events.append(_render_downloadable_plotly(
+                    st,
+                    paired_separate_figure,
                     key=f"bo_paired_trend_{paired_chart_suffix}_separate",
+                    file_stem=f"buffer_target_trend_{paired_chart_suffix}_separate",
+                    width_percent=plot_width_percent,
+                    export_height=int(paired_separate_figure.layout.height or 520),
+                    on_select="rerun",
+                    selection_mode="points",
                 ))
             else:
-                paired_events.append(_plotly_chart_with_colorbars(
-                    _sized_plot_container(st, plot_width_percent),
+                paired_events.append(_render_downloadable_plotly(
+                    st,
                     paired_figure,
-                    use_container_width=True,
+                    key=f"bo_paired_trend_{paired_chart_suffix}",
+                    file_stem=f"buffer_target_trend_{paired_chart_suffix}",
+                    width_percent=plot_width_percent,
+                    export_height=int(paired_figure.layout.height or 400),
                     on_select="rerun",
                     selection_mode="points",
-                    key=f"bo_paired_trend_{paired_chart_suffix}",
                 ))
             if paired_metric == "Classic Q":
                 _render_q_equation(session["config"], "classic")
@@ -17491,38 +18554,52 @@ def render_bo_session_app() -> None:
                 chronological_events = []
                 if chronological_raw_points is not None:
                     average_column, overlay_column = st.columns(2)
-                    chronological_events.append(_plotly_chart_with_colorbars(
-                        _sized_plot_container(average_column, plot_width_percent),
+                    chronological_events.append(_render_downloadable_plotly(
+                        average_column,
                         chronological_average_figure,
-                        use_container_width=True,
-                        on_select="rerun",
-                        selection_mode="points",
                         key=f"bo_chronological_{chronological_suffix}_average",
+                        file_stem=f"chronological_buffer_target_{chronological_suffix}_average",
+                        width_percent=plot_width_percent,
+                        export_height=int(
+                            chronological_average_figure.layout.height or 420
+                        ),
+                        on_select="rerun",
+                        selection_mode="points",
                     ))
-                    chronological_events.append(_plotly_chart_with_colorbars(
-                        _sized_plot_container(overlay_column, plot_width_percent),
+                    chronological_events.append(_render_downloadable_plotly(
+                        overlay_column,
                         chronological_overlay_figure,
-                        use_container_width=True,
-                        on_select="rerun",
-                        selection_mode="points",
                         key=f"bo_chronological_{chronological_suffix}_overlay",
-                    ))
-                    chronological_events.append(_plotly_chart_with_colorbars(
-                        _sized_plot_container(st, plot_width_percent),
-                        chronological_separate_figure,
-                        use_container_width=True,
+                        file_stem=f"chronological_buffer_target_{chronological_suffix}_overlay",
+                        width_percent=plot_width_percent,
+                        export_height=int(
+                            chronological_overlay_figure.layout.height or 420
+                        ),
                         on_select="rerun",
                         selection_mode="points",
+                    ))
+                    chronological_events.append(_render_downloadable_plotly(
+                        st,
+                        chronological_separate_figure,
                         key=f"bo_chronological_{chronological_suffix}_separate",
+                        file_stem=f"chronological_buffer_target_{chronological_suffix}_separate",
+                        width_percent=plot_width_percent,
+                        export_height=int(
+                            chronological_separate_figure.layout.height or 560
+                        ),
+                        on_select="rerun",
+                        selection_mode="points",
                     ))
                 else:
-                    chronological_events.append(_plotly_chart_with_colorbars(
-                        _sized_plot_container(st, plot_width_percent),
+                    chronological_events.append(_render_downloadable_plotly(
+                        st,
                         chronological_figure,
-                        use_container_width=True,
+                        key=f"bo_chronological_{chronological_suffix}",
+                        file_stem=f"chronological_buffer_target_{chronological_suffix}",
+                        width_percent=plot_width_percent,
+                        export_height=int(chronological_figure.layout.height or 420),
                         on_select="rerun",
                         selection_mode="points",
-                        key=f"bo_chronological_{chronological_suffix}",
                     ))
                 if chronological_metric == "Classic Q":
                     _render_q_equation(session["config"], "classic")
@@ -18855,6 +19932,16 @@ def render_bo_session_app() -> None:
             "Cache the current real-data metric table, load another BO session, "
             "then load the cached values to plot current minus cached values."
         )
+        paired_classic_comparison_available = (
+            paired_objective
+            and real_metric == "Classic Q"
+            and not count_mode
+        )
+        if paired_classic_comparison_available:
+            st.caption(
+                "For paired BO sessions, you can also compare target Classic Q "
+                "against buffer Classic Q within this loaded session."
+            )
         comparison_controls = st.columns([1, 1, 1])
         if comparison_controls[0].button(
             "Cache comparison values",
@@ -18892,6 +19979,75 @@ def render_bo_session_app() -> None:
         ):
             st.session_state.pop("bo_real_comparison_active", None)
             st.rerun()
+        if paired_classic_comparison_available:
+            if real_channel_mode == "Plot channel groups":
+                local_buffer_points = _real_group_metric_points(
+                    real_observations,
+                    "Classic Q",
+                    "buffer",
+                    selected_real_groups,
+                )
+                local_target_points = _real_group_metric_points(
+                    real_observations,
+                    "Classic Q",
+                    "target",
+                    selected_real_groups,
+                )
+            else:
+                local_buffer_points = _real_metric_points(
+                    real_observations,
+                    "Classic Q",
+                    "buffer",
+                    selected_real_channels,
+                    average_channels=(
+                        real_channel_mode == "Average selected channels"
+                    ),
+                )
+                local_target_points = _real_metric_points(
+                    real_observations,
+                    "Classic Q",
+                    "target",
+                    selected_real_channels,
+                    average_channels=(
+                        real_channel_mode == "Average selected channels"
+                    ),
+                )
+            local_pair_columns = st.columns([1, 2])
+            if local_pair_columns[0].button(
+                "Compare target vs buffer Classic Q",
+                disabled=local_buffer_points.empty or local_target_points.empty,
+                use_container_width=True,
+                key="bo_real_compare_paired_classic_q",
+                help=(
+                    "Uses buffer Classic Q as the cached/reference table and "
+                    "target Classic Q as the current table."
+                ),
+            ):
+                st.session_state["bo_real_comparison_active"] = (
+                    _real_comparison_payload(
+                        local_buffer_points,
+                        metric="Classic Q",
+                        phase="target_minus_buffer",
+                        channel_mode=real_channel_mode,
+                        session_path=selected_session_folder,
+                        current_points=local_target_points,
+                        label="Target Classic Q - buffer Classic Q",
+                    )
+                )
+                st.session_state["bo_real_comparison_cached"] = (
+                    st.session_state["bo_real_comparison_active"]
+                )
+                st.success(
+                    "Prepared local paired comparison: target Classic Q minus "
+                    f"buffer Classic Q ({len(local_target_points):,} target row(s), "
+                    f"{len(local_buffer_points):,} buffer row(s))."
+                )
+            if local_buffer_points.empty or local_target_points.empty:
+                local_pair_columns[1].caption(
+                    "Local paired comparison is available after the current "
+                    "channel/group selection produces both buffer and target "
+                    "Classic Q rows."
+                )
         if combined_real_points.empty:
             st.caption(
                 "Cache comparison values is disabled until the current metric, "
@@ -18905,7 +20061,18 @@ def render_bo_session_app() -> None:
         active_comparison_payload = st.session_state.get(
             "bo_real_comparison_active"
         )
-        if active_comparison_payload and not combined_real_points.empty:
+        active_comparison_current_points = (
+            active_comparison_payload.get("current_points")
+            if isinstance(active_comparison_payload, dict)
+            else None
+        )
+        if active_comparison_current_points is None:
+            active_comparison_current_points = combined_real_points
+        if (
+            active_comparison_payload
+            and isinstance(active_comparison_current_points, pd.DataFrame)
+            and not active_comparison_current_points.empty
+        ):
             cached_metric = active_comparison_payload.get("metric")
             if cached_metric != real_metric:
                 st.warning(
@@ -18914,17 +20081,20 @@ def render_bo_session_app() -> None:
                 )
             else:
                 comparison_points, comparison_error = _real_comparison_delta_points(
-                    combined_real_points,
+                    active_comparison_current_points,
                     active_comparison_payload["points"],
                 )
                 if comparison_error:
                     st.warning(comparison_error)
                 if not comparison_points.empty:
                     comparison_overview_points = comparison_points
+                    comparison_label = active_comparison_payload.get("label")
                     st.success(
                         f"Loaded comparison values: {len(comparison_points):,} "
                         "cached coordinate(s) evaluated with current-session RBF interpolation."
                     )
+                    if comparison_label:
+                        st.caption(str(comparison_label))
         real_value_colorscale = "Viridis"
         unsliced_real_points_by_phase = {
             phase: points.copy()
@@ -19425,6 +20595,40 @@ def render_bo_session_app() -> None:
                     real_view_options.append("2D map")
                 if len(real_dimensions) >= 3:
                     real_view_options.append("3D tensor")
+                if (
+                    not count_mode
+                    and {"channel", "iteration", "value"}.issubset(
+                        combined_real_points.columns
+                    )
+                ):
+                    real_view_options.append("Channel x iteration heatmap")
+                def real_parallel_parameter_varies(parameter: str) -> bool:
+                    if parameter not in combined_real_points.columns:
+                        return False
+                    values = pd.to_numeric(
+                        combined_real_points[parameter],
+                        errors="coerce",
+                    ).dropna()
+                    if values.nunique(dropna=True) <= 1:
+                        return False
+                    return not np.isclose(float(values.min()), float(values.max()))
+
+                real_parallel_parameters = [
+                    parameter for parameter in (
+                        "frequency",
+                        "amplitude",
+                        "step_potential",
+                    )
+                    if real_parallel_parameter_varies(parameter)
+                ]
+                for parameter in PARAMETERS:
+                    if (
+                        parameter not in real_parallel_parameters
+                        and real_parallel_parameter_varies(parameter)
+                    ):
+                        real_parallel_parameters.append(parameter)
+                if real_parallel_parameters and not count_mode:
+                    real_view_options.append("Parallel coordinates")
                 _preserve_valid_widget_value(
                     "bo_real_view",
                     real_view_options,
@@ -19441,9 +20645,17 @@ def render_bo_session_app() -> None:
                     real_dimensions,
                     real_dimensions[0],
                 )
-                real_x = st.selectbox("Real-data X", real_dimensions, key="bo_real_x")
+                real_x = st.selectbox(
+                    "Real-data X",
+                    real_dimensions,
+                    key="bo_real_x",
+                    disabled=real_view in {
+                        "Parallel coordinates",
+                        "Channel x iteration heatmap",
+                    },
+                )
                 real_y_options = [name for name in real_dimensions if name != real_x]
-                if real_view != "1D slice":
+                if real_view in {"2D map", "3D tensor"}:
                     _preserve_valid_widget_value(
                         "bo_real_y",
                         real_y_options,
@@ -19451,7 +20663,7 @@ def render_bo_session_app() -> None:
                     )
                 real_y = (
                     st.selectbox("Real-data Y", real_y_options, key="bo_real_y")
-                    if real_view != "1D slice" else None
+                    if real_view in {"2D map", "3D tensor"} else None
                 )
                 real_z_options = [
                     name for name in real_dimensions if name not in (real_x, real_y)
@@ -19826,7 +21038,14 @@ def render_bo_session_app() -> None:
                             full_value_frames.append(full_points.assign(phase=phase))
                 real_crop_axes = [
                     dimension
-                    for dimension in (real_x, real_y, real_z)
+                    for dimension in (
+                        real_parallel_parameters
+                        if real_view in {
+                            "Parallel coordinates",
+                            "Channel x iteration heatmap",
+                        }
+                        else (real_x, real_y, real_z)
+                    )
                     if dimension is not None
                 ]
                 real_crop_ranges = _parameter_crop_ranges(
@@ -19943,6 +21162,57 @@ def render_bo_session_app() -> None:
                                 "Measured metric range minimum must be less "
                                 "than the maximum; using per-plot autoscaling."
                             )
+                real_heatmap_color_value_column = "value"
+                real_heatmap_color_value_label = display_real_metric
+                if real_view == "Channel x iteration heatmap":
+                    heatmap_color_options: list[tuple[str, str]] = [
+                        ("value", display_real_metric)
+                    ]
+                    for parameter in (
+                        "frequency",
+                        "amplitude",
+                        "step_potential",
+                    ):
+                        if parameter in combined_real_points.columns:
+                            numeric_values = pd.to_numeric(
+                                combined_real_points[parameter],
+                                errors="coerce",
+                            )
+                            if numeric_values.notna().any():
+                                heatmap_color_options.append(
+                                    (parameter, _metric_label(parameter))
+                                )
+                    heatmap_color_columns = [
+                        column for column, _label in heatmap_color_options
+                    ]
+                    heatmap_color_labels = {
+                        column: label for column, label in heatmap_color_options
+                    }
+                    heatmap_color_key = (
+                        f"bo_real_channel_iteration_heatmap_color_"
+                        f"{real_scope_key}_{real_metric}_{real_phase}_"
+                        f"{real_channel_mode}"
+                    )
+                    _preserve_valid_widget_value(
+                        heatmap_color_key,
+                        heatmap_color_columns,
+                        "value",
+                    )
+                    real_heatmap_color_value_column = st.selectbox(
+                        "Heatmap color",
+                        heatmap_color_columns,
+                        format_func=lambda column: heatmap_color_labels[column],
+                        key=heatmap_color_key,
+                    )
+                    real_heatmap_color_value_label = heatmap_color_labels[
+                        real_heatmap_color_value_column
+                    ]
+                    if real_heatmap_color_value_column != "value":
+                        st.caption(
+                            "Parameter-colored heatmaps use automatic color "
+                            "scaling for the selected parameter; hover still "
+                            "shows the measured metric."
+                        )
                 real_log_frequency_key = "bo_real_log_frequency"
                 real_log_frequency_preference_key = (
                     f"{real_log_frequency_key}__preferred"
@@ -19962,7 +21232,16 @@ def render_bo_session_app() -> None:
                 real_log_frequency = st.checkbox(
                     "Log-scale frequency axis",
                     value=False,
-                    disabled="frequency" not in (real_x, real_y, real_z),
+                    disabled=(
+                        real_view == "Channel x iteration heatmap"
+                        or (
+                            "frequency" not in (
+                                real_parallel_parameters
+                                if real_view == "Parallel coordinates"
+                                else (real_x, real_y, real_z)
+                            )
+                        )
+                    ),
                     help="Uses a logarithmic axis whenever frequency is a displayed dimension.",
                     key=real_log_frequency_key,
                 )
@@ -19994,6 +21273,44 @@ def render_bo_session_app() -> None:
                 st.session_state[real_iteration_path_preference_key] = (
                     real_show_iteration_path
                 )
+                real_parallel_line_width = 2.0
+                real_parallel_line_opacity = 0.76
+                if real_view == "Parallel coordinates":
+                    real_parallel_columns = st.columns([1, 1, 2])
+                    real_parallel_line_width = float(real_parallel_columns[0].slider(
+                        "Parallel line thickness",
+                        min_value=0.5,
+                        max_value=12.0,
+                        value=2.0,
+                        step=0.5,
+                        key=(
+                            f"bo_real_parallel_line_width_{real_scope_key}_"
+                            f"{real_metric}_{real_phase}_{real_channel_mode}"
+                        ),
+                    ))
+                    real_parallel_line_opacity = float(
+                        real_parallel_columns[1].slider(
+                            "Parallel line transparency",
+                            min_value=0.05,
+                            max_value=1.0,
+                            value=0.76,
+                            step=0.05,
+                            key=(
+                                f"bo_real_parallel_line_opacity_{real_scope_key}_"
+                                f"{real_metric}_{real_phase}_{real_channel_mode}"
+                            ),
+                            help=(
+                                "Lower values make overlapping channel paths "
+                                "easier to see."
+                            ),
+                        )
+                    )
+                    real_parallel_columns[2].caption(
+                        "This view plots iteration as the leftmost coordinate, "
+                        "then channel when overlaid, frequency, amplitude, "
+                        "step size, and the selected measured metric. Line color "
+                        "follows the measured metric."
+                    )
                 def real_2d_tensor_source(
                     phase: str,
                     series_name: Any = None,
@@ -20151,10 +21468,21 @@ def render_bo_session_app() -> None:
                 )
                 real_can_show_global_optimum = (
                     real_global_optimum_reference is not None
-                    and real_view in {"2D map", "3D tensor"}
-                    and real_x is not None
-                    and real_y is not None
-                    and (real_view != "3D tensor" or real_z is not None)
+                    and (
+                        (
+                            real_view in {"2D map", "3D tensor"}
+                            and real_x is not None
+                            and real_y is not None
+                            and (real_view != "3D tensor" or real_z is not None)
+                        )
+                        or (
+                            real_view == "Parallel coordinates"
+                            and any(
+                                parameter in real_global_optimum_reference
+                                for parameter in real_parallel_parameters
+                            )
+                        )
+                    )
                 )
                 real_show_global_optimum = (
                     st.checkbox(
@@ -20411,7 +21739,133 @@ def render_bo_session_app() -> None:
                             hide_index=True,
                         )
 
-                if real_phase == "both" and real_view == "1D slice":
+                if real_view == "Channel x iteration heatmap":
+                    heatmap_plot_items = (
+                        [
+                            (column, phase, real_points_by_phase[phase])
+                            for column, phase in zip(
+                                st.columns(2),
+                                ("buffer", "target"),
+                            )
+                        ]
+                        if real_phase == "both"
+                        else [(st, real_phase, real_points_by_phase[real_phase])]
+                    )
+                    for plot_container, phase, phase_points in heatmap_plot_items:
+                        if real_phase == "both":
+                            plot_container.subheader(phase.title())
+                        if phase_points.empty:
+                            plot_container.info(
+                                f"No {phase} values are available."
+                            )
+                            continue
+                        real_figure = _plot_real_channel_iteration_heatmap(
+                            phase_points.assign(phase=phase),
+                            metric_label=display_real_metric,
+                            phase=phase,
+                            color_value_column=real_heatmap_color_value_column,
+                            color_value_label=real_heatmap_color_value_label,
+                            value_range=(
+                                real_value_range
+                                if real_heatmap_color_value_column == "value"
+                                else None
+                            ),
+                            value_colorscale=real_value_colorscale,
+                        )
+                        _render_downloadable_plotly(
+                            plot_container,
+                            real_figure,
+                            key=(
+                                f"bo_real_channel_iteration_heatmap_"
+                                f"{real_plot_state_key}_{phase}_{real_metric}_"
+                                f"{real_channel_mode}_{real_scope_key}_"
+                                f"{real_heatmap_color_value_column}"
+                            ),
+                            file_stem=(
+                                f"real_data_{phase}_{real_metric}_"
+                                "channel_iteration_heatmap_colored_by_"
+                                f"{_safe_download_stem(real_heatmap_color_value_column)}"
+                            ),
+                            width_percent=plot_width_percent,
+                            export_height=int(real_figure.layout.height or 500),
+                        )
+                elif real_view == "Parallel coordinates":
+                    parallel_plot_items = (
+                        [
+                            (column, phase, real_points_by_phase[phase])
+                            for column, phase in zip(
+                                st.columns(2),
+                                ("buffer", "target"),
+                            )
+                        ]
+                        if real_phase == "both"
+                        else [(st, real_phase, real_points_by_phase[real_phase])]
+                    )
+                    for plot_container, phase, phase_points in parallel_plot_items:
+                        if real_phase == "both":
+                            plot_container.subheader(phase.title())
+                        if phase_points.empty:
+                            plot_container.info(
+                                f"No {phase} values are available."
+                            )
+                            continue
+                        parallel_series = (
+                            list(phase_points.groupby("channel", sort=False))
+                            if real_channel_mode in (
+                                "Plot channels individually",
+                                "Plot channel groups",
+                            )
+                            else [(None, phase_points)]
+                        )
+                        for series_name, series_points in parallel_series:
+                            if series_points.empty:
+                                continue
+                            if series_name is not None:
+                                series_heading = (
+                                    f"Ch {series_name}"
+                                    if real_channel_mode
+                                    == "Plot channels individually"
+                                    else str(series_name)
+                                )
+                                plot_container.markdown(f"#### {series_heading}")
+                            real_figure = _plot_real_data_parallel_coordinates(
+                                series_points.assign(phase=phase),
+                                metric_label=display_real_metric,
+                                phase=phase,
+                                parameter_columns=real_parallel_parameters,
+                                line_width=real_parallel_line_width,
+                                line_opacity=real_parallel_line_opacity,
+                                value_range=real_value_range,
+                                log_frequency=real_log_frequency,
+                                value_colorscale=real_value_colorscale,
+                                optimum_reference=(
+                                    real_global_optimum_reference
+                                    if real_show_global_optimum else None
+                                ),
+                            )
+                            series_token = (
+                                "all"
+                                if series_name is None
+                                else _safe_download_stem(str(series_name))
+                            )
+                            _render_downloadable_plotly(
+                                plot_container,
+                                real_figure,
+                                key=(
+                                    f"bo_real_parallel_{real_plot_state_key}_"
+                                    f"{phase}_{series_token}_{real_metric}_"
+                                    f"{real_channel_mode}_{real_scope_key}_"
+                                    f"{real_parallel_line_width:g}_"
+                                    f"{real_parallel_line_opacity:g}"
+                                ),
+                                file_stem=(
+                                    f"real_data_{phase}_{series_token}_"
+                                    f"{real_metric}_parallel_coordinates"
+                                ),
+                                width_percent=plot_width_percent,
+                                export_height=int(real_figure.layout.height or 500),
+                            )
+                elif real_phase == "both" and real_view == "1D slice":
                     if real_channel_mode == "Plot channels individually":
                         individual_channels = sorted(
                             set(real_points_by_phase["buffer"].get("channel", []))
@@ -21764,6 +23218,18 @@ def render_bo_session_app() -> None:
                 if st.button(
                     "Generate real-data GIF",
                     key=f"{real_gif_key}_button",
+                    disabled=real_view in {
+                        "Parallel coordinates",
+                        "Channel x iteration heatmap",
+                    },
+                    help=(
+                        "Real-data GIF generation is available for 1D, 2D, "
+                        "and 3D landscape views."
+                        if real_view in {
+                            "Parallel coordinates",
+                            "Channel x iteration heatmap",
+                        } else None
+                    ),
                 ):
                     with st.spinner("Rendering cumulative real-data frames..."):
                         try:
