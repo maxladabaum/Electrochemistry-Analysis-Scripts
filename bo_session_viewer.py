@@ -476,6 +476,53 @@ def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list
     return observations
 
 
+def _merge_compact_simulation_summary_into_history(
+    root: Path,
+    history: pd.DataFrame,
+) -> pd.DataFrame:
+    if history is None or history.empty or "group_id" not in history.columns:
+        return history
+    summary_path = root / "simulation_run_summary.csv"
+    if not summary_path.is_file():
+        return history
+    try:
+        summary = pd.read_csv(summary_path)
+    except Exception:
+        return history
+    if summary.empty or "group_id" not in history.columns:
+        return history
+    summary = summary.copy()
+    if "group_id" not in summary.columns:
+        summary["group_id"] = range(1, len(summary) + 1)
+    optimum_columns = [
+        column for column in summary.columns
+        if str(column).startswith("ground_truth_optimum_")
+    ]
+    if not optimum_columns:
+        return history
+    summary["group_id"] = pd.to_numeric(summary["group_id"], errors="coerce")
+    summary = summary.dropna(subset=["group_id"])
+    if summary.empty:
+        return history
+    summary["group_id"] = summary["group_id"].astype(int)
+    merged = history.copy()
+    merged["__group_id_for_summary"] = pd.to_numeric(
+        merged["group_id"],
+        errors="coerce",
+    )
+    merged = merged.merge(
+        summary[["group_id", *optimum_columns]],
+        how="left",
+        left_on="__group_id_for_summary",
+        right_on="group_id",
+        suffixes=("", "__summary"),
+    )
+    if "group_id__summary" in merged.columns:
+        merged = merged.drop(columns=["group_id__summary"])
+    merged = merged.drop(columns=["__group_id_for_summary"])
+    return merged
+
+
 def _normalize_simulated_channel_identities(
     observations: list[dict],
     history: pd.DataFrame,
@@ -608,9 +655,17 @@ def load_bo_session(folder: str | Path) -> dict:
     history = pd.read_csv(history_path) if history_path.is_file() else pd.DataFrame()
     config_path = root / "bo_config_snapshot.json"
     config = _read_json(config_path) if config_path.is_file() else {}
+    metadata = state.get("simulation_metadata") or {}
+    records = config.get("records") if isinstance(config, dict) else {}
+    if (
+        not history.empty
+        and (
+            metadata.get("compact_export")
+            or records.get("compact_simulation_export")
+        )
+    ):
+        history = _merge_compact_simulation_summary_into_history(root, history)
     if not observations and not history.empty:
-        metadata = state.get("simulation_metadata") or {}
-        records = config.get("records") if isinstance(config, dict) else {}
         if metadata.get("compact_export") or records.get("compact_simulation_export"):
             observations = _compact_simulation_observations_from_history(history)
     simulation_ground_truth = (
@@ -978,6 +1033,151 @@ def _observation_group_family_options(
     return options
 
 
+def _real_metadata_overlay_options(
+    metadata: list[dict],
+    parameter_config: Mapping[str, Any] | None = None,
+) -> dict[str, dict]:
+    parameter_config = parameter_config or {}
+
+    def finite_values(values_by_group: dict[int, float]) -> dict[int, float]:
+        return {
+            int(group_id): float(value)
+            for group_id, value in values_by_group.items()
+            if _finite_float(value) is not None
+        }
+
+    options: dict[str, dict] = {}
+    exploration_values = finite_values({
+        item["id"]: item.get("exploration")
+        for item in metadata
+    })
+    if len(set(exploration_values.values())) > 1:
+        options["Exploration weight"] = {
+            "label": "Exploration weight",
+            "values": exploration_values,
+        }
+    initial_values = finite_values({
+        item["id"]: item.get("n_initial_points")
+        for item in metadata
+    })
+    if len(set(initial_values.values())) > 1:
+        options["Initial maximin points"] = {
+            "label": "Initial maximin points",
+            "values": initial_values,
+        }
+    for parameter in PARAMETERS:
+        falloff_values = finite_values({
+            item["id"]: (item.get("gp_falloff_fractions") or {}).get(parameter)
+            for item in metadata
+        })
+        if len(set(falloff_values.values())) <= 1:
+            continue
+        parameter_label = (
+            (parameter_config.get(parameter) or {}).get("label")
+            if isinstance(parameter_config.get(parameter), Mapping)
+            else None
+        ) or parameter
+        option_label = f"GP falloff - {parameter_label}"
+        options[option_label] = {
+            "label": f"{parameter_label} GP falloff",
+            "values": falloff_values,
+        }
+    return options
+
+
+def _add_real_metadata_overlay_column(
+    points_by_phase: dict[str, pd.DataFrame],
+    *,
+    group_values: Mapping[int, float],
+    label: str,
+    split_by_channel: bool = False,
+) -> dict[str, pd.DataFrame]:
+    result = {}
+    for phase, points in points_by_phase.items():
+        if points.empty or "group_id" not in points.columns:
+            result[phase] = points
+            continue
+        enriched = points.copy()
+        enriched["metadata_overlay_value"] = [
+            group_values.get(int(group_id))
+            if _finite_float(group_id) is not None else None
+            for group_id in enriched["group_id"]
+        ]
+        enriched = enriched.dropna(subset=["metadata_overlay_value"])
+        metadata_labels = [
+            f"{label} = {_metadata_family_value_label(value)}"
+            for value in enriched["metadata_overlay_value"]
+        ]
+        if split_by_channel and "channel" in enriched.columns:
+            enriched["metadata_overlay_channel"] = enriched["channel"].astype(str)
+            enriched["metadata_overlay_group"] = [
+                f"Ch {channel} | {metadata_label}"
+                for channel, metadata_label
+                in zip(enriched["metadata_overlay_channel"], metadata_labels)
+            ]
+        else:
+            enriched["metadata_overlay_group"] = metadata_labels
+        result[phase] = enriched
+    return result
+
+
+def _real_metadata_plot_series(points: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    if points.empty or "metadata_overlay_group" not in points.columns:
+        return []
+    sort_columns = ["metadata_overlay_value", "metadata_overlay_group"]
+    if "metadata_overlay_channel" in points.columns:
+        sort_columns.append("metadata_overlay_channel")
+    values = points[sort_columns].drop_duplicates()
+    value_records = values.to_dict("records")
+    value_records = sorted(
+        value_records,
+        key=lambda row: (
+            float(row.get("metadata_overlay_value", 0.0)),
+            _channel_sort_key(str(row.get("metadata_overlay_channel", ""))),
+            str(row.get("metadata_overlay_group", "")),
+        ),
+    )
+    return [
+        (
+            str(row["metadata_overlay_group"]),
+            points.loc[
+                points["metadata_overlay_group"].astype(str)
+                == str(row["metadata_overlay_group"])
+            ].copy(),
+        )
+        for row in value_records
+    ]
+
+
+def _real_simulation_run_plot_series(
+    points: pd.DataFrame,
+) -> list[tuple[tuple[int, str], pd.DataFrame]]:
+    if points.empty or "group_id" not in points.columns:
+        return []
+    work = points.copy()
+    work["__group_id_for_series"] = pd.to_numeric(
+        work["group_id"],
+        errors="coerce",
+    )
+    work = work.dropna(subset=["__group_id_for_series"])
+    if work.empty:
+        return []
+    work["__group_id_for_series"] = work["__group_id_for_series"].astype(int)
+    series: list[tuple[tuple[int, str], pd.DataFrame]] = []
+    for group_id, group_points in work.groupby("__group_id_for_series", sort=True):
+        group_name = None
+        if "group_name" in group_points.columns:
+            names = group_points["group_name"].dropna().astype(str)
+            if not names.empty:
+                group_name = names.iloc[0]
+        label = group_name or f"Simulation run {int(group_id)}"
+        series.append((
+            (int(group_id), str(label)),
+            group_points.drop(columns=["__group_id_for_series"]),
+        ))
+    return series
+
+
 def _observation_table(session: dict) -> pd.DataFrame:
     def add_best_q_column(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty or "Q_run" not in frame.columns:
@@ -1120,6 +1320,7 @@ def _metric_label(metric: str) -> str:
         "best_Q": "Best Q",
         "Q_channel": "Channel Q",
         "Q_run": "Q run",
+        "ground_truth_channel_run": "Ground-truth channel run",
         "frequency_at_best_q": "Frequency at best Q",
         "amplitude_at_best_q": "Amplitude at best Q",
         "step_potential_at_best_q": "Step size at best Q",
@@ -1535,6 +1736,33 @@ def _session_simulation_group_optimum_references(
 ) -> dict[int, dict[str, float]]:
     ground_truth = session.get("simulation_ground_truth")
     if (
+        (not isinstance(ground_truth, pd.DataFrame) or ground_truth.empty)
+        and frame is not None
+        and not frame.empty
+        and "group_id" in frame.columns
+    ):
+        references: dict[int, dict[str, float]] = {}
+        for raw_group_id, rows in frame.groupby("group_id", sort=False, dropna=True):
+            group_id_value = _finite_float(raw_group_id)
+            if group_id_value is None or rows.empty:
+                continue
+            group_id = int(group_id_value)
+            reference: dict[str, float] = {}
+            for column, key in (
+                ("ground_truth_optimum_Q_run", "Q_run"),
+                ("ground_truth_optimum_frequency", "frequency"),
+                ("ground_truth_optimum_amplitude", "amplitude"),
+                ("ground_truth_optimum_step_potential", "step_potential"),
+            ):
+                if column in rows.columns:
+                    values = pd.to_numeric(rows[column], errors="coerce").dropna()
+                    if not values.empty:
+                        reference[key] = float(values.iloc[0])
+            if reference:
+                references[group_id] = reference
+        if references:
+            return references
+    if (
         not isinstance(ground_truth, pd.DataFrame)
         or ground_truth.empty
         or "ground_truth_channel" not in ground_truth.columns
@@ -1684,6 +1912,7 @@ def _add_group_reference_line(
     showlegend: bool = True,
     row: int | None = None,
     col: int | None = None,
+    annotate: bool = False,
 ) -> None:
     if y_value is None or not np.isfinite(float(y_value)):
         return
@@ -1703,6 +1932,24 @@ def _add_group_reference_line(
         fig.add_trace(trace, row=row, col=col)
     else:
         fig.add_trace(trace)
+    if annotate:
+        annotation = {
+            "x": float(numeric_x.max()),
+            "y": float(y_value),
+            "text": f"{label}: {float(y_value):.4g}",
+            "showarrow": False,
+            "xanchor": "right",
+            "yanchor": "bottom",
+            "font": {"size": 10, "color": "#d62728"},
+            "bgcolor": "rgba(255,255,255,0.72)",
+            "bordercolor": "rgba(214,39,40,0.38)",
+            "borderwidth": 1,
+            "borderpad": 2,
+        }
+        if row is not None and col is not None:
+            fig.add_annotation(annotation, row=row, col=col)
+        else:
+            fig.add_annotation(annotation)
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
@@ -1976,6 +2223,7 @@ def _plot_trend(
                     showlegend=False,
                     row=subplot_row + 1,
                     col=subplot_column + 1,
+                    annotate=True,
                 )
         _apply_metadata_coloraxis(
             fig,
@@ -2099,6 +2347,7 @@ def _plot_trend(
 
 def _hyperparameter_response_columns(frame: pd.DataFrame) -> list[str]:
     preferred = [
+        "ground_truth_channel_run",
         "exploration",
         "initial_random_points",
         "gp_falloff_value",
@@ -2142,6 +2391,76 @@ def _hyperparameter_response_channel_label(rows: pd.DataFrame) -> str:
     return ", ".join(f"Ch {channel}" for channel in unique_channels)
 
 
+def _format_ground_truth_channel_run_label(
+    channel: Any,
+    repeat_index: Any = None,
+    repeat_count: Any = None,
+) -> str:
+    channel_text = str(channel).strip()
+    if channel_text.endswith(".0") and channel_text[:-2].isdigit():
+        channel_text = channel_text[:-2]
+    label = f"Ch {channel_text}" if channel_text else "Unknown channel"
+    repeat_value = _finite_float(repeat_index)
+    repeat_total = _finite_float(repeat_count)
+    if (
+        repeat_value is not None
+        and repeat_total is not None
+        and int(repeat_total) > 1
+    ):
+        label = f"{label} rep {int(repeat_value)}/{int(repeat_total)}"
+    return label
+
+
+def _add_ground_truth_channel_run_axis(frame: pd.DataFrame) -> pd.DataFrame:
+    if (
+        frame.empty
+        or "ground_truth_channel" not in frame.columns
+        or "ground_truth_channel_run" in frame.columns
+    ):
+        return frame
+    channels = frame["ground_truth_channel"].dropna()
+    if channels.empty:
+        return frame
+    channel_order = {
+        str(channel): index + 1
+        for index, channel in enumerate(
+            sorted(channels.astype(str).unique(), key=_channel_sort_key)
+        )
+    }
+    repeat_values = (
+        pd.to_numeric(frame["channel_repeat_index"], errors="coerce")
+        if "channel_repeat_index" in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    repeat_count_values = (
+        pd.to_numeric(frame["channel_repeat_count"], errors="coerce")
+        if "channel_repeat_count" in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    work = frame.copy()
+    max_repeat_count = int(
+        max(1, repeat_count_values.dropna().max())
+        if not repeat_count_values.dropna().empty else 1
+    )
+    work["ground_truth_channel_run"] = [
+        (
+            float(channel_order.get(str(channel), len(channel_order) + 1))
+            + (
+                (float(repeat) - 1.0) / max_repeat_count
+                if pd.notna(repeat) and max_repeat_count > 1
+                else 0.0
+            )
+        )
+        for channel, repeat in zip(work["ground_truth_channel"], repeat_values)
+    ]
+    work["ground_truth_channel_run_label"] = [
+        _format_ground_truth_channel_run_label(channel, repeat, repeat_count)
+        for channel, repeat, repeat_count
+        in zip(work["ground_truth_channel"], repeat_values, repeat_count_values)
+    ]
+    return work
+
+
 def _join_hyperparameter_response_channels(values: pd.Series) -> str:
     channels: list[str] = []
     for value in values.dropna().astype(str):
@@ -2173,6 +2492,7 @@ def _hyperparameter_response_frame(
 ) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
+    frame = _add_ground_truth_channel_run_axis(frame)
     best_q_column = None
     if at_best_q_parameter is not None:
         if at_best_q_parameter not in frame.columns:
@@ -2212,8 +2532,11 @@ def _hyperparameter_response_frame(
             "group_id",
             "group_name",
             "run_label",
+            "ground_truth_channel",
             "replicate",
             "repeat_index",
+            "channel_repeat_index",
+            "channel_repeat_count",
             "seed",
             *hyper_columns,
         ]
@@ -2279,6 +2602,16 @@ def _hyperparameter_response_frame(
                 rows_for_run
             ),
         })
+        if "ground_truth_channel_run_label" in rows_for_run.columns:
+            run_labels = (
+                rows_for_run["ground_truth_channel_run_label"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            if run_labels:
+                row["ground_truth_channel_run_label"] = run_labels[0]
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -2302,17 +2635,25 @@ def _hyperparameter_response_grouped(
     if "response_channels" not in response.columns:
         response = response.copy()
         response["response_channels"] = "Unknown"
+    aggregations = {
+        "metric_value": ("metric_value", aggregate_func),
+        "repeats": ("metric_value", "count"),
+        "std": ("metric_value", "std"),
+        "channels": (
+            "response_channels",
+            _join_hyperparameter_response_channels,
+        ),
+    }
+    if "ground_truth_channel_run_label" in response.columns:
+        aggregations["channel_run_label"] = (
+            "ground_truth_channel_run_label",
+            lambda values: ", ".join(
+                sorted(set(values.dropna().astype(str)), key=_channel_sort_key)
+            ) or "Unknown",
+        )
     return (
         response.groupby(group_axes, as_index=False, dropna=False)
-        .agg(
-            metric_value=("metric_value", aggregate_func),
-            repeats=("metric_value", "count"),
-            std=("metric_value", "std"),
-            channels=(
-                "response_channels",
-                _join_hyperparameter_response_channels,
-            ),
-        )
+        .agg(**aggregations)
         .sort_values(group_axes)
     )
 
@@ -2831,6 +3172,17 @@ def _plot_hyperparameter_response(
         return _apply_plotly_colorbar_height(fig)
     x_values = sorted(grouped[x_axis].dropna().unique())
     y_values = sorted(grouped[y_axis].dropna().unique())
+    channel_run_tick_labels = {}
+    if (
+        "channel_run_label" in grouped.columns
+        and "ground_truth_channel_run" in grouped.columns
+    ):
+        channel_run_tick_labels = {
+            float(row["ground_truth_channel_run"]): str(row["channel_run_label"])
+            for _index, row in grouped.dropna(
+                subset=["ground_truth_channel_run"]
+            ).iterrows()
+        }
     if len(x_values) >= 2 and len(y_values) >= 2:
         value_grid = (
             grouped.pivot(index=y_axis, columns=x_axis, values="metric_value")
@@ -2860,6 +3212,24 @@ def _plot_hyperparameter_response(
             height=460,
             margin={"l": 70, "r": 110, "t": 55, "b": 65},
         )
+        if x_axis == "ground_truth_channel_run" and channel_run_tick_labels:
+            fig.update_xaxes(
+                tickmode="array",
+                tickvals=x_values,
+                ticktext=[
+                    channel_run_tick_labels.get(float(value), f"{float(value):g}")
+                    for value in x_values
+                ],
+            )
+        if y_axis == "ground_truth_channel_run" and channel_run_tick_labels:
+            fig.update_yaxes(
+                tickmode="array",
+                tickvals=y_values,
+                ticktext=[
+                    channel_run_tick_labels.get(float(value), f"{float(value):g}")
+                    for value in y_values
+                ],
+            )
         return _apply_plotly_colorbar_height(fig)
     fig = go.Figure(go.Scatter(
         x=grouped[x_axis],
@@ -2888,6 +3258,24 @@ def _plot_hyperparameter_response(
         height=420,
         margin={"l": 70, "r": 110, "t": 55, "b": 65},
     )
+    if x_axis == "ground_truth_channel_run" and channel_run_tick_labels:
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=sorted(channel_run_tick_labels),
+            ticktext=[
+                channel_run_tick_labels[value]
+                for value in sorted(channel_run_tick_labels)
+            ],
+        )
+    if y_axis == "ground_truth_channel_run" and channel_run_tick_labels:
+        fig.update_yaxes(
+            tickmode="array",
+            tickvals=sorted(channel_run_tick_labels),
+            ticktext=[
+                channel_run_tick_labels[value]
+                for value in sorted(channel_run_tick_labels)
+            ],
+        )
     return _apply_plotly_colorbar_height(fig)
 
 
@@ -2979,8 +3367,8 @@ def _plot_hyperparameter_parallel_coordinates(
     ):
         color_max = color_min + 1.0
 
-    plot_columns = [*dimensions, "__metric_value"]
-    plot_labels = [_metric_label(column) for column in dimensions] + [metric_label]
+    plot_columns = [*dimensions]
+    plot_labels = [_metric_label(column) for column in dimensions]
     plot_data = grouped.rename(columns={"metric_value": "__metric_value"})
     if line_draw_order == "Low response on top":
         plot_data = plot_data.sort_values(
@@ -3054,6 +3442,7 @@ def _plot_hyperparameter_parallel_coordinates(
             f"{label}: {float(row[column]):.4g}"
             for label, column in zip(plot_labels, plot_columns)
         ]
+        hover_lines.append(f"{metric_label}: {current_metric:.4g}")
         fig.add_trace(go.Scatter(
             x=x_positions,
             y=y_values,
@@ -3447,6 +3836,7 @@ def _plot_channel_trend(
                         showlegend=False,
                         row=subplot_row + 1,
                         col=subplot_column + 1,
+                        annotate=True,
                     )
                 else:
                     _add_group_reference_line(
@@ -4165,6 +4555,119 @@ def _real_group_metric_points(
             points["group_id"] = group_id
             frames.append(points)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _real_heatmap_history_values(
+    observations: list[dict],
+    history: pd.DataFrame | None,
+) -> pd.DataFrame:
+    columns = [
+        "Q_run",
+        "best_Q",
+        "best_so_far",
+        "observed_value",
+        "predicted_mean_Q",
+        "predicted_std_Q",
+        "acquisition_value",
+    ]
+    frames = []
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        history_columns = [
+            column for column in ["group_id", "iteration", *columns]
+            if column in history.columns
+        ]
+        if {"group_id", "iteration"}.issubset(history_columns):
+            frames.append(history[history_columns].copy())
+    observation_rows = []
+    for observation in observations:
+        quality = observation.get("quality") or {}
+        row = {
+            "group_id": observation.get("group_id", 1),
+            "iteration": observation.get("iteration"),
+            "Q_run": observation.get("Q_run", quality.get("Q_run")),
+            "observed_value": observation.get("Q_run", quality.get("Q_run")),
+            "predicted_mean_Q": quality.get("predicted_mean_Q"),
+            "predicted_std_Q": quality.get("predicted_std_Q"),
+            "acquisition_value": quality.get("acquisition_value"),
+        }
+        observation_rows.append(row)
+    if observation_rows:
+        frames.append(pd.DataFrame(observation_rows))
+    if not frames:
+        return pd.DataFrame()
+    values = pd.concat(frames, ignore_index=True, sort=False)
+    values["group_id"] = pd.to_numeric(values["group_id"], errors="coerce")
+    values["iteration"] = pd.to_numeric(values["iteration"], errors="coerce")
+    values = values.dropna(subset=["group_id", "iteration"])
+    if values.empty:
+        return pd.DataFrame()
+    values["group_id"] = values["group_id"].astype(int)
+    values["iteration"] = values["iteration"].astype(int)
+    for column in columns:
+        if column in values.columns:
+            values[column] = pd.to_numeric(values[column], errors="coerce")
+    aggregations = {
+        column: "first"
+        for column in columns
+        if column in values.columns
+    }
+    values = (
+        values.sort_values(["group_id", "iteration"])
+        .groupby(["group_id", "iteration"], as_index=False, dropna=False)
+        .agg(aggregations)
+    )
+    q_source = None
+    for column in ("Q_run", "observed_value"):
+        if column in values.columns and values[column].notna().any():
+            q_source = column
+            break
+    if "best_Q" not in values.columns:
+        values["best_Q"] = np.nan
+    if "best_so_far" not in values.columns:
+        values["best_so_far"] = np.nan
+    if q_source is not None:
+        computed_best = (
+            values.sort_values(["group_id", "iteration"])
+            .groupby("group_id", dropna=False)[q_source]
+            .cummax()
+        )
+        values["best_Q"] = values["best_Q"].fillna(computed_best)
+        values["best_so_far"] = values["best_so_far"].fillna(computed_best)
+    elif values["best_so_far"].notna().any():
+        values["best_Q"] = values["best_Q"].fillna(values["best_so_far"])
+    elif values["best_Q"].notna().any():
+        values["best_so_far"] = values["best_so_far"].fillna(values["best_Q"])
+    return values
+
+
+def _add_real_heatmap_history_columns(
+    points_by_phase: dict[str, pd.DataFrame],
+    observations: list[dict],
+    history: pd.DataFrame | None,
+) -> dict[str, pd.DataFrame]:
+    values = _real_heatmap_history_values(observations, history)
+    if values.empty:
+        return points_by_phase
+    result = {}
+    for phase, points in points_by_phase.items():
+        if points.empty or not {"group_id", "iteration"}.issubset(points.columns):
+            result[phase] = points
+            continue
+        work = points.copy()
+        work["__group_id"] = pd.to_numeric(work["group_id"], errors="coerce")
+        work["__iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+        merged = work.merge(
+            values,
+            how="left",
+            left_on=["__group_id", "__iteration"],
+            right_on=["group_id", "iteration"],
+            suffixes=("", "__history"),
+        )
+        for duplicate in ("group_id__history", "iteration__history"):
+            if duplicate in merged.columns:
+                merged = merged.drop(columns=[duplicate])
+        result[phase] = merged.drop(columns=["__group_id", "__iteration"])
+    return result
 
 
 def _real_comparison_payload(
@@ -4908,6 +5411,36 @@ def _plot_real_channel_iteration_heatmap(
     work = work.dropna(
         subset=["__channel_label", "iteration", "value", "__color_value"]
     )
+    group_label_columns = [
+        column for column in ("run_label", "group_name", "group_id")
+        if column in work.columns
+    ]
+    if group_label_columns:
+        duplicate_counts = (
+            work.groupby(["__channel_label", "iteration"], dropna=False)
+            [group_label_columns[0]]
+            .nunique(dropna=True)
+        )
+        has_repeated_channel_iterations = bool(
+            (duplicate_counts > 1).any()
+        )
+        if has_repeated_channel_iterations:
+            if "run_label" in work.columns:
+                group_labels = work["run_label"].fillna("").astype(str)
+            elif "group_name" in work.columns:
+                group_labels = work["group_name"].fillna("").astype(str)
+            else:
+                group_labels = (
+                    "Group " + work["group_id"].fillna("").astype(str)
+                )
+            work["__channel_label"] = [
+                (
+                    f"{channel} | {group_label}"
+                    if group_label else str(channel)
+                )
+                for channel, group_label
+                in zip(work["__channel_label"], group_labels)
+            ]
     if work.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -5110,7 +5643,6 @@ def _plot_real_data_parallel_coordinates(
             column for column in parameter_columns
             if parameter_varies(column)
         ],
-        "__metric_value",
     ]
     if len(dimensions) < 2 or "value" not in points.columns:
         fig = go.Figure()
@@ -5131,7 +5663,6 @@ def _plot_real_data_parallel_coordinates(
             channel_index_by_label.get(str(value), np.nan)
             for value in work["channel"]
         ]
-    work["__metric_value"] = pd.to_numeric(work["value"], errors="coerce")
     for column in [*dimensions, "value"]:
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=[*dimensions, "value"]).sort_values("iteration")
@@ -5155,8 +5686,6 @@ def _plot_real_data_parallel_coordinates(
             dimension_labels[column] = "Iteration"
         elif column == "__channel_value":
             dimension_labels[column] = "Channel"
-        elif column == "__metric_value":
-            dimension_labels[column] = metric_label
         elif column == "frequency" and log_frequency:
             safe_values = pd.to_numeric(plot_values[column], errors="coerce")
             safe_values = safe_values.where(safe_values > 0)
@@ -5263,12 +5792,8 @@ def _plot_real_data_parallel_coordinates(
             ]
             hover_lines = [
                 (
-                    f"{metric_label}: {current_metric:.4g}"
-                    if column == "__metric_value"
-                    else (
-                        f"Channel: "
-                        f"{channel_labels[int(round(float(row[column])))]}"
-                    )
+                    f"Channel: "
+                    f"{channel_labels[int(round(float(row[column])))]}"
                     if column == "__channel_value"
                     else (
                         f"{dimension_labels[column]}: "
@@ -5282,6 +5807,7 @@ def _plot_real_data_parallel_coordinates(
                 )
                 for column in dimensions
             ]
+            hover_lines.append(f"{metric_label}: {current_metric:.4g}")
             hover_lines.append(f"Series: {series_label}")
             fig.add_trace(go.Scatter(
                 x=x_positions,
@@ -5382,7 +5908,7 @@ def _plot_real_data_parallel_coordinates(
         optimum_y: list[float] = []
         optimum_hover: list[str] = []
         for axis_index, column in enumerate(dimensions):
-            if column in {"iteration", "__metric_value"}:
+            if column == "iteration":
                 continue
             reference_value = _finite_float(optimum_reference.get(column))
             if reference_value is None:
@@ -9505,6 +10031,8 @@ def _simulation_channel_group_metadata(
     exploration: float | None = None,
     replicate: int | None = None,
     seed: int | None = None,
+    channel_repeat_index: int | None = None,
+    channel_repeat_count: int | None = None,
 ) -> dict:
     settings = dict(settings or {})
     falloffs = dict(settings.get("falloff_fractions") or {})
@@ -9537,6 +10065,8 @@ def _simulation_channel_group_metadata(
         "gp_length_scales": falloffs,
         "simulation_replicate": replicate,
         "simulation_seed": seed,
+        "channel_repeat_index": channel_repeat_index,
+        "channel_repeat_count": channel_repeat_count,
         "ground_truth_channel": (
             str(settings.get("ground_truth_channel"))
             if settings.get("ground_truth_channel") is not None else None
@@ -9714,6 +10244,18 @@ def _write_simulated_bo_session(
         exploration=exploration,
         replicate=replicate,
         seed=seed,
+        channel_repeat_index=(
+            int(history["channel_repeat_index"].dropna().iloc[0])
+            if "channel_repeat_index" in history.columns
+            and not history["channel_repeat_index"].dropna().empty
+            else None
+        ),
+        channel_repeat_count=(
+            int(history["channel_repeat_count"].dropna().iloc[0])
+            if "channel_repeat_count" in history.columns
+            and not history["channel_repeat_count"].dropna().empty
+            else None
+        ),
     )
     config["channel_groups"] = [group_metadata]
     config["channels"] = channel_values
@@ -9836,6 +10378,8 @@ def _write_simulated_bo_session(
             "initial_random_points": simulation_settings.get("initial_random_points"),
             "gp_falloff_parameter": row.get("gp_falloff_parameter"),
             "gp_falloff_value": row.get("gp_falloff_value"),
+            "channel_repeat_index": row.get("channel_repeat_index"),
+            "channel_repeat_count": row.get("channel_repeat_count"),
             "run_label": run_label,
             "ground_truth_channel": ground_truth_channel,
             "best_so_far": float(row.get("best_so_far", q_run)),
@@ -9880,6 +10424,18 @@ def _write_simulated_bo_session(
             "replicate": replicate,
             "seed": seed,
             "ground_truth_channel": ground_truth_channel,
+            "channel_repeat_index": (
+                int(history["channel_repeat_index"].dropna().iloc[0])
+                if "channel_repeat_index" in history.columns
+                and not history["channel_repeat_index"].dropna().empty
+                else None
+            ),
+            "channel_repeat_count": (
+                int(history["channel_repeat_count"].dropna().iloc[0])
+                if "channel_repeat_count" in history.columns
+                and not history["channel_repeat_count"].dropna().empty
+                else None
+            ),
             "settings": simulation_settings,
             "ground_truth_rows": int(len(ground_truth)),
             "candidate_pool_rows": int(
@@ -9996,6 +10552,8 @@ def _write_simulated_bo_session_bundle(
             exploration=exploration,
             replicate=replicate,
             seed=seed,
+            channel_repeat_index=run.get("channel_repeat_index"),
+            channel_repeat_count=run.get("channel_repeat_count"),
         )
         channel_groups.append(group_metadata)
         for _row_index, row in run["history"].sort_values("iteration").iterrows():
@@ -10116,6 +10674,8 @@ def _write_simulated_bo_session_bundle(
                 "initial_random_points": run_settings.get("initial_random_points"),
                 "gp_falloff_parameter": run.get("gp_falloff_parameter"),
                 "gp_falloff_value": run.get("gp_falloff_value"),
+                "channel_repeat_index": run.get("channel_repeat_index"),
+                "channel_repeat_count": run.get("channel_repeat_count"),
                 "run_label": run_label,
                 "ground_truth_channel": (
                     str(ground_truth_channel)
@@ -10217,15 +10777,25 @@ def _write_simulated_bo_session_bundle(
 
 def _simulation_run_summary_frame(runs: list[dict]) -> pd.DataFrame:
     rows = []
-    for run in runs:
+    for group_id, run in enumerate(runs, start=1):
         history = run.get("history")
         if history is None or history.empty:
             continue
         best_row = history.loc[history["observed_value"].idxmax()]
+        optimum_reference = run.get("optimum_reference")
+        if not isinstance(optimum_reference, dict):
+            run_ground_truth = run.get("ground_truth")
+            optimum_reference = (
+                _simulation_optimum_reference_from_frame(run_ground_truth)
+                if isinstance(run_ground_truth, pd.DataFrame)
+                and not run_ground_truth.empty
+                else {}
+            )
         final_best = float(history["best_so_far"].iloc[-1])
         threshold = 0.95 * final_best
         reached = history[history["best_so_far"] >= threshold]
-        rows.append({
+        row = {
+            "group_id": group_id,
             "run_label": str(run.get("label") or "Simulation"),
             "ground_truth_channel": run.get("ground_truth_channel"),
             "exploration": run.get("exploration"),
@@ -10234,6 +10804,8 @@ def _simulation_run_summary_frame(runs: list[dict]) -> pd.DataFrame:
             "gp_falloff_value": run.get("gp_falloff_value"),
             "repeat_index": run.get("repeat_index"),
             "repeat_count": run.get("repeat_count"),
+            "channel_repeat_index": run.get("channel_repeat_index"),
+            "channel_repeat_count": run.get("channel_repeat_count"),
             "replicate": run.get("replicate"),
             "seed": run.get("seed"),
             "best_fitness": float(best_row["observed_value"]),
@@ -10243,7 +10815,12 @@ def _simulation_run_summary_frame(runs: list[dict]) -> pd.DataFrame:
                 int(reached["iteration"].iloc[0])
                 if not reached.empty else np.nan
             ),
-        })
+        }
+        for parameter in ("Q_run", "frequency", "amplitude", "step_potential"):
+            value = _finite_float(optimum_reference.get(parameter))
+            if value is not None:
+                row[f"ground_truth_optimum_{parameter}"] = value
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -10318,6 +10895,8 @@ def _write_compact_simulated_sweep_session(
             exploration=exploration,
             replicate=run.get("replicate"),
             seed=run.get("seed"),
+            channel_repeat_index=run.get("channel_repeat_index"),
+            channel_repeat_count=run.get("channel_repeat_count"),
         ))
         for _row_index, row in run["history"].sort_values("iteration").iterrows():
             params = _simulation_history_row_params(row, config, axes)
@@ -10338,6 +10917,8 @@ def _write_compact_simulated_sweep_session(
                 "gp_falloff_value": run.get("gp_falloff_value"),
                 "repeat_index": run.get("repeat_index"),
                 "repeat_count": run.get("repeat_count"),
+                "channel_repeat_index": run.get("channel_repeat_index"),
+                "channel_repeat_count": run.get("channel_repeat_count"),
                 "replicate": run.get("replicate"),
                 "seed": run.get("seed"),
                 "run_label": run_label,
@@ -11898,6 +12479,13 @@ def _swv_trace_kind_label(
     return "corrected"
 
 
+def _compact_trace_stem(path: Path, *, max_chars: int = 42) -> str:
+    stem = str(path.stem)
+    if len(stem) <= max_chars:
+        return stem
+    return stem[: max_chars - 3].rstrip("_-. ") + "..."
+
+
 def _plot_traces(
     session: dict,
     observation: dict,
@@ -11960,7 +12548,7 @@ def _plot_traces(
                 voltage = voltage[voltage_mask]
                 y = y[voltage_mask]
             channel_label = _trace_channel_label(_trace_channel_key(item))
-            trace_label = f"{phase} {channel_label}: {path.stem}"
+            trace_label = f"{phase} {channel_label}: {_compact_trace_stem(path)}"
             ax.plot(
                 voltage,
                 y,
@@ -12133,7 +12721,7 @@ def _plot_iteration_trace_overlay(
                 label=(
                     f"Iter {iteration} · {str(phase).title()} · "
                     f"{_trace_channel_label(channel)}"
-                    f": {path.stem}"
+                    f": {_compact_trace_stem(path)}"
                 ),
             )
         except Exception as exc:
@@ -14834,9 +15422,47 @@ def _numeric_slice_title_note(column: str | None, value: float | None) -> str | 
     return f"Fixed {_metric_label(column)} = {float(value):g}"
 
 
+def _sanitize_matplotlib_text_for_png(fig, *, max_chars: int = 180) -> None:
+    replacements = {
+        "µ": "u",
+        "Δ": "Delta",
+        "—": "-",
+        "–": "-",
+        "·": "-",
+        "≈": "~",
+        "≥": ">=",
+        "≤": "<=",
+    }
+    for artist in fig.findobj():
+        get_text = getattr(artist, "get_text", None)
+        set_text = getattr(artist, "set_text", None)
+        if get_text is None or set_text is None:
+            continue
+        try:
+            text = str(get_text())
+        except Exception:
+            continue
+        sanitized = text
+        for source, target in replacements.items():
+            sanitized = sanitized.replace(source, target)
+        sanitized = sanitized.encode("ascii", errors="replace").decode("ascii")
+        if len(sanitized) > max_chars:
+            sanitized = sanitized[: max_chars - 3].rstrip() + "..."
+        if sanitized != text:
+            try:
+                set_text(sanitized)
+            except Exception:
+                continue
+
+
 def _matplotlib_png_bytes(fig, *, dpi: int = 150) -> bytes:
     buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
+    try:
+        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
+    except Exception:
+        buffer = BytesIO()
+        _sanitize_matplotlib_text_for_png(fig)
+        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
     return buffer.getvalue()
 
 
@@ -16888,6 +17514,8 @@ def render_bo_session_app() -> None:
 
         @st.fragment
         def _render_hyperparameter_response_fragment() -> None:
+            nonlocal trend_history
+            trend_history = _add_ground_truth_channel_run_axis(trend_history)
             hyperparameter_columns = _hyperparameter_response_columns(trend_history)
             hyper_metric_options = list(metric_options)
             has_best_q_source = any(
@@ -19638,14 +20266,42 @@ def render_bo_session_app() -> None:
         real_groups = [
             group for group in groups if group["id"] in observed_group_ids
         ]
+        real_metadata = _channel_group_optimization_metadata(
+            full_session,
+            real_groups,
+        )
+        parameter_config = (
+            (full_session.get("config") or {}).get("parameters") or {}
+        )
+        real_metadata_overlay_options = _real_metadata_overlay_options(
+            real_metadata,
+            parameter_config,
+        )
+        real_metadata_overlay_mode = "Overlay simulation runs by metadata"
+        real_simulation_run_mode = "Plot simulation runs separately"
         handling_options = [
             "Average selected channels",
             "Overlay selected channels",
             "Plot channels individually",
         ]
+        if (
+            _is_loaded_simulated_sweep_session(full_session)
+            and real_groups
+            and not count_mode
+        ):
+            handling_options.append(real_simulation_run_mode)
+        if (
+            real_metadata_overlay_options
+            and _is_loaded_simulated_sweep_session(full_session)
+            and not count_mode
+        ):
+            handling_options.append(real_metadata_overlay_mode)
         if real_groups and not count_mode:
             handling_options.append("Plot channel groups")
         real_channel_mode_key = f"bo_real_channel_mode_{real_metric}_{real_phase}"
+        previous_real_channel_mode = st.session_state.get(
+            f"{real_channel_mode_key}__last"
+        )
         _preserve_valid_widget_value(
             real_channel_mode_key,
             handling_options,
@@ -19659,17 +20315,53 @@ def render_bo_session_app() -> None:
         )
         selected_real_groups = []
         selected_real_channels = []
+        real_metadata_overlay_choice = None
+        real_metadata_overlay_values = None
+        real_metadata_overlay_label = None
+        real_channels = _real_data_channels(all_real_observations)
+        real_channels_key = (
+            f"bo_real_channels_{real_scope_key}_{real_metric}_{real_phase}"
+        )
+        real_channels_preference_key = f"{real_channels_key}__preferred"
+        preferred_real_channels = st.session_state.get(
+            real_channels_preference_key,
+            st.session_state.get(real_channels_key, real_channels),
+        )
+        if not isinstance(preferred_real_channels, (list, tuple, set)):
+            preferred_real_channels = [preferred_real_channels]
+        preferred_real_channels = [
+            channel for channel in preferred_real_channels
+            if channel in real_channels
+        ]
         if real_channel_mode == "Plot channel groups":
             real_group_options = [group["id"] for group in real_groups]
+            preferred_channel_set = set(map(str, preferred_real_channels))
+            real_group_default = [
+                group["id"]
+                for group in real_groups
+                if preferred_channel_set.intersection(
+                    str(channel) for channel in group.get("channels", [])
+                )
+            ]
+            real_group_default = (
+                sorted(dict.fromkeys(real_group_default))
+                if real_group_default else real_group_options
+            )
             real_groups_key = (
                 f"bo_real_groups_{real_scope_key}_{real_metric}_{real_phase}"
             )
+            real_groups_preference_key = f"{real_groups_key}__preferred"
+            if (
+                previous_real_channel_mode is not None
+                and previous_real_channel_mode != "Plot channel groups"
+            ):
+                st.session_state[real_groups_preference_key] = real_group_default
             real_groups_valid, real_groups_display = (
                 _prepare_preferred_multiselect_value(
                     real_groups_key,
-                    f"{real_groups_key}__preferred",
+                    real_groups_preference_key,
                     real_group_options,
-                    real_group_options,
+                    real_group_default,
                 )
             )
             selected_group_ids = st.multiselect(
@@ -19689,7 +20381,7 @@ def render_bo_session_app() -> None:
             )
             _sync_preferred_widget_value(
                 real_groups_key,
-                f"{real_groups_key}__preferred",
+                real_groups_preference_key,
                 real_groups_valid,
                 real_groups_display,
             )
@@ -19698,14 +20390,10 @@ def render_bo_session_app() -> None:
                 if group["id"] in selected_group_ids
             ]
         else:
-            real_channels = _real_data_channels(all_real_observations)
-            real_channels_key = (
-                f"bo_real_channels_{real_scope_key}_{real_metric}_{real_phase}"
-            )
             real_channels_valid, real_channels_display = (
                 _prepare_preferred_multiselect_value(
                     real_channels_key,
-                    f"{real_channels_key}__preferred",
+                    real_channels_preference_key,
                     real_channels,
                     real_channels,
                 )
@@ -19719,10 +20407,38 @@ def render_bo_session_app() -> None:
             )
             _sync_preferred_widget_value(
                 real_channels_key,
-                f"{real_channels_key}__preferred",
+                real_channels_preference_key,
                 real_channels_valid,
                 real_channels_display,
             )
+            if real_channel_mode == real_metadata_overlay_mode:
+                metadata_overlay_key = (
+                    f"bo_real_metadata_overlay_{real_scope_key}_"
+                    f"{real_metric}_{real_phase}"
+                )
+                metadata_overlay_choices = list(real_metadata_overlay_options)
+                _preserve_valid_widget_value(
+                    metadata_overlay_key,
+                    metadata_overlay_choices,
+                    metadata_overlay_choices[0],
+                )
+                real_metadata_overlay_choice = st.selectbox(
+                    "Overlay metadata",
+                    metadata_overlay_choices,
+                    key=metadata_overlay_key,
+                    help=(
+                        "Creates one plot for each selected metadata value and "
+                        "overlays all matching simulation runs within that plot. "
+                        "When multiple channels are selected, plots are split by "
+                        "channel and metadata value."
+                    ),
+                )
+                selected_overlay_option = real_metadata_overlay_options[
+                    real_metadata_overlay_choice
+                ]
+                real_metadata_overlay_values = selected_overlay_option["values"]
+                real_metadata_overlay_label = selected_overlay_option["label"]
+        st.session_state[f"{real_channel_mode_key}__last"] = real_channel_mode
         selected_real_run_group_ids: set[int] | None = None
         show_real_simulation_run_selector = (
             _is_loaded_simulated_sweep_session(full_session)
@@ -19740,11 +20456,7 @@ def render_bo_session_app() -> None:
             ]
             run_options = sorted(dict.fromkeys(run_options))
             if run_options:
-                real_run_default = (
-                    run_options[:1]
-                    if len(selected_channel_set) == 1 and len(run_options) > 1
-                    else run_options
-                )
+                real_run_default = run_options
                 selected_channel_token = "_".join(
                     re.sub(r"[^0-9A-Za-z]+", "-", str(channel)).strip("-")
                     or "channel"
@@ -19758,10 +20470,24 @@ def render_bo_session_app() -> None:
                     f"{real_metric}_{real_phase}_{real_channel_mode}_"
                     f"{selected_channel_token}"
                 )
+                real_run_preference_key = f"{real_run_key}__preferred"
+                old_single_run_default = run_options[:1]
+                default_migration_key = f"{real_run_key}__all_runs_default_v2"
+                if (
+                    len(selected_channel_set) == 1
+                    and len(run_options) > 1
+                    and not st.session_state.get(default_migration_key, False)
+                ):
+                    if (
+                        st.session_state.get(real_run_preference_key)
+                        == old_single_run_default
+                    ):
+                        st.session_state[real_run_preference_key] = run_options
+                    st.session_state[default_migration_key] = True
                 real_run_valid, real_run_display = (
                     _prepare_preferred_multiselect_value(
                         real_run_key,
-                        f"{real_run_key}__preferred",
+                        real_run_preference_key,
                         run_options,
                         real_run_default,
                     )
@@ -19787,7 +20513,7 @@ def render_bo_session_app() -> None:
                 )
                 _sync_preferred_widget_value(
                     real_run_key,
-                    f"{real_run_key}__preferred",
+                    real_run_preference_key,
                     real_run_valid,
                     selected_real_run_ids,
                 )
@@ -19807,10 +20533,6 @@ def render_bo_session_app() -> None:
         real_group_color_values = None
         real_group_color_label = None
         if real_channel_mode == "Overlay selected channels":
-            real_metadata = _channel_group_optimization_metadata(
-                full_session,
-                groups,
-            )
             real_color_options: dict[
                 str,
                 tuple[dict[int, float] | None, str | None],
@@ -19835,9 +20557,6 @@ def render_bo_session_app() -> None:
                     "Exploitation",
                 ),
             }
-            parameter_config = (
-                (full_session.get("config") or {}).get("parameters") or {}
-            )
             for parameter in PARAMETERS:
                 metadata_values = {
                     item["id"]: float(item["gp_falloff_fractions"][parameter])
@@ -19912,6 +20631,22 @@ def render_bo_session_app() -> None:
                 )
                 for phase in requested_phases
             }
+        if (
+            real_channel_mode == real_metadata_overlay_mode
+            and real_metadata_overlay_values is not None
+            and real_metadata_overlay_label is not None
+        ):
+                real_points_by_phase = _add_real_metadata_overlay_column(
+                    real_points_by_phase,
+                    group_values=real_metadata_overlay_values,
+                    label=real_metadata_overlay_label,
+                    split_by_channel=len(selected_real_channels) > 1,
+                )
+        real_points_by_phase = _add_real_heatmap_history_columns(
+            real_points_by_phase,
+            real_observations,
+            full_session.get("history"),
+        )
         real_movie_source_by_phase = {
             phase: points.copy()
             for phase, points in real_points_by_phase.items()
@@ -21168,6 +21903,26 @@ def render_bo_session_app() -> None:
                     heatmap_color_options: list[tuple[str, str]] = [
                         ("value", display_real_metric)
                     ]
+                    for column, label in (
+                        ("Q_run", "Q run"),
+                        ("best_Q", "Best Q so far"),
+                        ("best_so_far", "Best Q so far"),
+                        ("observed_value", "Observed Q"),
+                        ("predicted_mean_Q", "Predicted mean Q"),
+                        ("predicted_std_Q", "Predicted std Q"),
+                        ("acquisition_value", "Acquisition value"),
+                    ):
+                        if column in combined_real_points.columns:
+                            numeric_values = pd.to_numeric(
+                                combined_real_points[column],
+                                errors="coerce",
+                            )
+                            if numeric_values.notna().any() and not any(
+                                existing_label == label
+                                for _existing_column, existing_label
+                                in heatmap_color_options
+                            ):
+                                heatmap_color_options.append((column, label))
                     for parameter in (
                         "frequency",
                         "amplitude",
@@ -21308,8 +22063,8 @@ def render_bo_session_app() -> None:
                     real_parallel_columns[2].caption(
                         "This view plots iteration as the leftmost coordinate, "
                         "then channel when overlaid, frequency, amplitude, "
-                        "step size, and the selected measured metric. Line color "
-                        "follows the measured metric."
+                        "and step size. Line color follows the selected "
+                        "measured metric."
                     )
                 def real_2d_tensor_source(
                     phase: str,
@@ -21344,6 +22099,32 @@ def render_bo_session_app() -> None:
                             real_crop_ranges,
                         ).reset_index(drop=True)
                     if (
+                        series_name is not None
+                        and real_channel_mode == real_metadata_overlay_mode
+                        and "metadata_overlay_group" in source.columns
+                    ):
+                        source = source.loc[
+                            source["metadata_overlay_group"].astype(str)
+                            == str(series_name)
+                        ].reset_index(drop=True)
+                    elif (
+                        series_name is not None
+                        and real_channel_mode == real_simulation_run_mode
+                        and "group_id" in source.columns
+                    ):
+                        group_id = (
+                            series_name[0]
+                            if isinstance(series_name, tuple)
+                            else series_name
+                        )
+                        source_group_ids = pd.to_numeric(
+                            source["group_id"],
+                            errors="coerce",
+                        )
+                        source = source.loc[
+                            source_group_ids == int(group_id)
+                        ].reset_index(drop=True)
+                    elif (
                         series_name is not None
                         and "channel" in source.columns
                         ):
@@ -21739,6 +22520,31 @@ def render_bo_session_app() -> None:
                             hide_index=True,
                         )
 
+                def real_plot_series(points: pd.DataFrame) -> list[tuple[Any, pd.DataFrame]]:
+                    if points.empty:
+                        return []
+                    if real_channel_mode == real_metadata_overlay_mode:
+                        return _real_metadata_plot_series(points)
+                    if real_channel_mode == real_simulation_run_mode:
+                        return _real_simulation_run_plot_series(points)
+                    if real_channel_mode in (
+                        "Plot channels individually",
+                        "Plot channel groups",
+                    ):
+                        return list(points.groupby("channel", sort=False))
+                    return [(None, points)]
+
+                def real_series_heading(series_name: Any) -> str:
+                    if series_name is None:
+                        return ""
+                    if real_channel_mode == "Plot channels individually":
+                        return f"Ch {series_name}"
+                    if real_channel_mode == real_simulation_run_mode:
+                        if isinstance(series_name, tuple) and len(series_name) >= 2:
+                            return str(series_name[1])
+                        return str(series_name)
+                    return str(series_name)
+
                 if real_view == "Channel x iteration heatmap":
                     heatmap_plot_items = (
                         [
@@ -21759,36 +22565,50 @@ def render_bo_session_app() -> None:
                                 f"No {phase} values are available."
                             )
                             continue
-                        real_figure = _plot_real_channel_iteration_heatmap(
-                            phase_points.assign(phase=phase),
-                            metric_label=display_real_metric,
-                            phase=phase,
-                            color_value_column=real_heatmap_color_value_column,
-                            color_value_label=real_heatmap_color_value_label,
-                            value_range=(
-                                real_value_range
-                                if real_heatmap_color_value_column == "value"
-                                else None
-                            ),
-                            value_colorscale=real_value_colorscale,
-                        )
-                        _render_downloadable_plotly(
-                            plot_container,
-                            real_figure,
-                            key=(
-                                f"bo_real_channel_iteration_heatmap_"
-                                f"{real_plot_state_key}_{phase}_{real_metric}_"
-                                f"{real_channel_mode}_{real_scope_key}_"
-                                f"{real_heatmap_color_value_column}"
-                            ),
-                            file_stem=(
-                                f"real_data_{phase}_{real_metric}_"
-                                "channel_iteration_heatmap_colored_by_"
-                                f"{_safe_download_stem(real_heatmap_color_value_column)}"
-                            ),
-                            width_percent=plot_width_percent,
-                            export_height=int(real_figure.layout.height or 500),
-                        )
+                        heatmap_series = real_plot_series(phase_points)
+                        for series_name, series_points in heatmap_series:
+                            if series_points.empty:
+                                continue
+                            if series_name is not None:
+                                series_heading = real_series_heading(series_name)
+                                plot_container.markdown(f"#### {series_heading}")
+                            real_figure = _plot_real_channel_iteration_heatmap(
+                                series_points.assign(phase=phase),
+                                metric_label=display_real_metric,
+                                phase=phase,
+                                color_value_column=real_heatmap_color_value_column,
+                                color_value_label=real_heatmap_color_value_label,
+                                value_range=(
+                                    real_value_range
+                                    if real_heatmap_color_value_column == "value"
+                                    else None
+                                ),
+                                value_colorscale=real_value_colorscale,
+                            )
+                            series_token = (
+                                "all"
+                                if series_name is None
+                                else _safe_download_stem(str(series_name))
+                            )
+                            _render_downloadable_plotly(
+                                plot_container,
+                                real_figure,
+                                key=(
+                                    f"bo_real_channel_iteration_heatmap_"
+                                    f"{real_plot_state_key}_{phase}_{series_token}_"
+                                    f"{real_metric}_{real_channel_mode}_"
+                                    f"{real_scope_key}_"
+                                    f"{real_heatmap_color_value_column}"
+                                ),
+                                file_stem=(
+                                    f"real_data_{phase}_{series_token}_"
+                                    f"{real_metric}_channel_iteration_heatmap_"
+                                    "colored_by_"
+                                    f"{_safe_download_stem(real_heatmap_color_value_column)}"
+                                ),
+                                width_percent=plot_width_percent,
+                                export_height=int(real_figure.layout.height or 500),
+                            )
                 elif real_view == "Parallel coordinates":
                     parallel_plot_items = (
                         [
@@ -21809,24 +22629,12 @@ def render_bo_session_app() -> None:
                                 f"No {phase} values are available."
                             )
                             continue
-                        parallel_series = (
-                            list(phase_points.groupby("channel", sort=False))
-                            if real_channel_mode in (
-                                "Plot channels individually",
-                                "Plot channel groups",
-                            )
-                            else [(None, phase_points)]
-                        )
+                        parallel_series = real_plot_series(phase_points)
                         for series_name, series_points in parallel_series:
                             if series_points.empty:
                                 continue
                             if series_name is not None:
-                                series_heading = (
-                                    f"Ch {series_name}"
-                                    if real_channel_mode
-                                    == "Plot channels individually"
-                                    else str(series_name)
-                                )
+                                series_heading = real_series_heading(series_name)
                                 plot_container.markdown(f"#### {series_heading}")
                             real_figure = _plot_real_data_parallel_coordinates(
                                 series_points.assign(phase=phase),
@@ -21866,7 +22674,107 @@ def render_bo_session_app() -> None:
                                 export_height=int(real_figure.layout.height or 500),
                             )
                 elif real_phase == "both" and real_view == "1D slice":
-                    if real_channel_mode == "Plot channels individually":
+                    if real_channel_mode == real_metadata_overlay_mode:
+                        series_names = sorted(
+                            set(real_points_by_phase["buffer"].get(
+                                "metadata_overlay_group",
+                                pd.Series(dtype=str),
+                            ).astype(str))
+                            | set(real_points_by_phase["target"].get(
+                                "metadata_overlay_group",
+                                pd.Series(dtype=str),
+                            ).astype(str)),
+                        )
+                        for series_name in series_names:
+                            st.markdown(f"#### {series_name}")
+                            real_figure = _plot_real_data_both_1d(
+                                real_points_by_phase["buffer"].loc[
+                                    real_points_by_phase["buffer"][
+                                        "metadata_overlay_group"
+                                    ].astype(str) == str(series_name)
+                                ],
+                                real_points_by_phase["target"].loc[
+                                    real_points_by_phase["target"][
+                                        "metadata_overlay_group"
+                                    ].astype(str) == str(series_name)
+                                ],
+                                display_real_metric,
+                                real_x,
+                                dot_size=plot_dot_size,
+                                dot_opacity=plot_dot_opacity,
+                                log_frequency=real_log_frequency,
+                                color_by=real_color_by,
+                                group_color_values=real_group_color_values,
+                                group_color_label=real_group_color_label,
+                                show_iteration_path=real_effective_show_iteration_path,
+                                axis_ranges=real_axis_ranges,
+                                value_range=real_value_range,
+                            )
+                            _plotly_chart_with_colorbars(
+                                _sized_plot_container(st, plot_width_percent),
+                                real_figure,
+                                use_container_width=True,
+                                key=(
+                                    f"bo_real_plot_both_{real_plot_state_key}_"
+                                    f"{_safe_download_stem(series_name)}_"
+                                    f"{real_metric}_{real_x}_{real_scope_key}"
+                                ),
+                            )
+                    elif real_channel_mode == real_simulation_run_mode:
+                        run_series = _real_simulation_run_plot_series(pd.concat(
+                            [
+                                real_points_by_phase["buffer"],
+                                real_points_by_phase["target"],
+                            ],
+                            ignore_index=True,
+                        ))
+                        for series_name, _combined_series_points in run_series:
+                            group_id = int(series_name[0])
+                            st.markdown(f"#### {real_series_heading(series_name)}")
+                            buffer_group_ids = pd.to_numeric(
+                                real_points_by_phase["buffer"].get(
+                                    "group_id",
+                                    pd.Series(dtype=float),
+                                ),
+                                errors="coerce",
+                            )
+                            target_group_ids = pd.to_numeric(
+                                real_points_by_phase["target"].get(
+                                    "group_id",
+                                    pd.Series(dtype=float),
+                                ),
+                                errors="coerce",
+                            )
+                            real_figure = _plot_real_data_both_1d(
+                                real_points_by_phase["buffer"].loc[
+                                    buffer_group_ids == group_id
+                                ],
+                                real_points_by_phase["target"].loc[
+                                    target_group_ids == group_id
+                                ],
+                                display_real_metric,
+                                real_x,
+                                dot_size=plot_dot_size,
+                                dot_opacity=plot_dot_opacity,
+                                log_frequency=real_log_frequency,
+                                color_by=real_color_by,
+                                group_color_values=real_group_color_values,
+                                group_color_label=real_group_color_label,
+                                show_iteration_path=real_effective_show_iteration_path,
+                                axis_ranges=real_axis_ranges,
+                                value_range=real_value_range,
+                            )
+                            _plotly_chart_with_colorbars(
+                                _sized_plot_container(st, plot_width_percent),
+                                real_figure,
+                                use_container_width=True,
+                                key=(
+                                    f"bo_real_plot_both_{real_plot_state_key}_"
+                                    f"{group_id}_{real_metric}_{real_x}_"
+                                    f"{real_scope_key}"
+                                ),
+                            )
+                    elif real_channel_mode == "Plot channels individually":
                         individual_channels = sorted(
                             set(real_points_by_phase["buffer"].get("channel", []))
                             | set(real_points_by_phase["target"].get("channel", [])),
@@ -21951,28 +22859,19 @@ def render_bo_session_app() -> None:
                             column.info(f"No {phase} values are available.")
                         else:
                             phase_points = real_points_by_phase[phase]
-                            plot_series = (
-                                list(phase_points.groupby("channel", sort=False))
-                                if real_channel_mode in (
-                                    "Plot channels individually",
-                                    "Plot channel groups",
-                                )
-                                else [(None, phase_points)]
-                            )
+                            plot_series = real_plot_series(phase_points)
                             for series_name, series_points in plot_series:
                                 if series_name is not None:
-                                    series_heading = (
-                                        f"Ch {series_name}"
-                                        if real_channel_mode == "Plot channels individually"
-                                        else str(series_name)
-                                    )
+                                    series_heading = real_series_heading(series_name)
                                     column.markdown(f"**{series_heading}**")
                                 associated_slice_plots = []
                                 plot_container = column
                                 if (
                                     real_view == "3D tensor"
-                                    and real_channel_mode
-                                    == "Plot channels individually"
+                                    and real_channel_mode in (
+                                        "Plot channels individually",
+                                        real_simulation_run_mode,
+                                    )
                                 ):
                                     associated_slice_plots = [
                                         (slice_plot_index, slice_plot)
@@ -22103,23 +23002,10 @@ def render_bo_session_app() -> None:
                                     )
                 else:
                     phase_points = real_points_by_phase[real_phase]
-                    plot_series = (
-                        list(phase_points.groupby("channel", sort=False))
-                        if (
-                            real_channel_mode in (
-                                "Plot channels individually",
-                                "Plot channel groups",
-                            )
-                        )
-                        else [(None, phase_points)]
-                    )
+                    plot_series = real_plot_series(phase_points)
                     for series_name, series_points in plot_series:
                         if series_name is not None:
-                            series_heading = (
-                                f"Ch {series_name}"
-                                if real_channel_mode == "Plot channels individually"
-                                else str(series_name)
-                            )
+                            series_heading = real_series_heading(series_name)
                             st.markdown(f"#### {series_heading}")
                         real_figure = _plot_real_data_landscape(
                             series_points,
@@ -22270,17 +23156,7 @@ def render_bo_session_app() -> None:
                                     )
                                     if phase_source is None or phase_source.empty:
                                         continue
-                                    plot_series = (
-                                        list(phase_source.groupby(
-                                            "channel",
-                                            sort=False,
-                                        ))
-                                        if real_channel_mode in (
-                                            "Plot channels individually",
-                                            "Plot channel groups",
-                                        )
-                                        else [(None, phase_source)]
-                                    )
+                                    plot_series = real_plot_series(phase_source)
                                     for series_name, source_points in plot_series:
                                         slice_points = _apply_numeric_slice(
                                             source_points,
@@ -22365,8 +23241,10 @@ def render_bo_session_app() -> None:
                             }
                             if (
                                 real_phase == "both"
-                                and real_channel_mode
-                                == "Plot channels individually"
+                                and real_channel_mode in (
+                                    "Plot channels individually",
+                                    real_simulation_run_mode,
+                                )
                             ):
                                 st.rerun()
                         else:
@@ -22379,8 +23257,10 @@ def render_bo_session_app() -> None:
                         highlighted_real_3d_slice_plot is not None
                         and not (
                             real_phase == "both"
-                            and real_channel_mode
-                            == "Plot channels individually"
+                            and real_channel_mode in (
+                                "Plot channels individually",
+                                real_simulation_run_mode,
+                            )
                         )
                     ):
                         real_3d_slice_axes = highlighted_real_3d_slice_plot.get(
@@ -22484,26 +23364,15 @@ def render_bo_session_app() -> None:
                                         "for this slice."
                                     )
                                     continue
-                                sweep_plot_series = (
-                                    list(sweep_phase_points.groupby(
-                                        "channel",
-                                        sort=False,
-                                    ))
-                                    if real_channel_mode in (
-                                        "Plot channels individually",
-                                        "Plot channel groups",
-                                    )
-                                    else [(None, sweep_phase_points)]
+                                sweep_plot_series = real_plot_series(
+                                    sweep_phase_points
                                 )
                                 for sweep_series_name, sweep_series_points in (
                                     sweep_plot_series
                                 ):
                                     if sweep_series_name is not None:
-                                        sweep_heading = (
-                                            f"Ch {sweep_series_name}"
-                                            if real_channel_mode
-                                            == "Plot channels individually"
-                                            else str(sweep_series_name)
+                                        sweep_heading = real_series_heading(
+                                            sweep_series_name
                                         )
                                         sweep_container.markdown(
                                             f"**{sweep_heading}**"
@@ -23242,18 +24111,20 @@ def render_bo_session_app() -> None:
                                 if real_channel_mode in (
                                     "Plot channels individually",
                                     "Plot channel groups",
+                                    real_metadata_overlay_mode,
+                                    real_simulation_run_mode,
                                 ):
                                     movie_targets.extend([
                                         (
-                                            f"{phase.title()} · Ch {channel}",
+                                            (
+                                                f"{phase.title()} · "
+                                                f"{real_series_heading(series_name)}"
+                                            ),
                                             phase,
-                                            channel_points,
+                                            series_points,
                                         )
-                                        for channel, channel_points
-                                        in source_points.groupby(
-                                            "channel",
-                                            sort=False,
-                                        )
+                                        for series_name, series_points
+                                        in real_plot_series(source_points)
                                     ])
                                 else:
                                     movie_targets.append((
@@ -27216,6 +28087,12 @@ def render_bo_session_app() -> None:
                             history_frame["gp_falloff_value"] = run_falloff_value
                             history_frame["repeat_index"] = run_repeat_index
                             history_frame["repeat_count"] = run_repeat_count
+                            history_frame["channel_repeat_index"] = (
+                                run_channel_repeat_index
+                            )
+                            history_frame["channel_repeat_count"] = (
+                                run_channel_repeat_count
+                            )
                             history_frame["replicate"] = replicate_index
                             history_frame["seed"] = run_seed
                             history_frame["run_label"] = run_label
@@ -27233,6 +28110,8 @@ def render_bo_session_app() -> None:
                             "gp_falloff_value": run_falloff_value,
                             "repeat_index": run_repeat_index,
                             "repeat_count": run_repeat_count,
+                            "channel_repeat_index": run_channel_repeat_index,
+                            "channel_repeat_count": run_channel_repeat_count,
                             "replicate": replicate_index,
                             "seed": run_seed,
                             "ground_truth_channel": run_ground_truth_channel,
@@ -27304,6 +28183,8 @@ def render_bo_session_app() -> None:
                             "GP falloff value": run.get("gp_falloff_value"),
                             "Repeat": run.get("repeat_index"),
                             "Repeat count": run.get("repeat_count"),
+                            "Channel repeat": run.get("channel_repeat_index"),
+                            "Channel repeat count": run.get("channel_repeat_count"),
                             "Replicate": int(run.get("replicate", 1)),
                             "Seed": int(run.get("seed", sim_seed)),
                             "Best fitness": float(best_row["observed_value"]),
