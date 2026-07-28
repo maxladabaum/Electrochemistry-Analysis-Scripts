@@ -14616,6 +14616,26 @@ def _plot_traces(
                 _trace_channel_label(channel)
                 for channel in selected_channels
             )
+        associated_q_label = ""
+        trace_phases = {
+            str(trace.get("phase", "")).lower()
+            for trace in traces
+        }
+        has_single_associated_trace = len(traces) == 1
+        has_paired_buffer_target_trace = (
+            len(traces) == 2
+            and trace_phases == {"buffer", "target"}
+        )
+        if has_single_associated_trace or has_paired_buffer_target_trace:
+            quality = observation.get("quality") or {}
+            q_value = _finite_float(
+                observation.get("Q_run", quality.get("Q_run"))
+            )
+            associated_q_label = (
+                f" | Q={q_value:.4g}"
+                if q_value is not None
+                else " | Q=unknown"
+            )
         params = observation.get("params") or {}
         parameter_text = (
             f"Frequency={float(params['frequency']):g} Hz"
@@ -14636,6 +14656,7 @@ def _plot_traces(
                 f"Iteration {observation.get('iteration')} "
                 f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline)} SWV traces"
                 f"{channel_title}"
+                f"{associated_q_label}"
                 f"{f' ({correction_label})' if corrected else ''}"
                 f"\n{parameter_text}"
             ),
@@ -15866,10 +15887,10 @@ def _recompute_group_surrogate(
 
 
 def _observed_points(session: dict, iteration: int, axes: list[str]):
-    """Return history through the next observation chosen from an artifact."""
+    """Return observation history available when an artifact was generated."""
     rows = []
     for obs in session["observations"]:
-        if int(obs.get("iteration", 0)) > iteration + 1:
+        if int(obs.get("iteration", 0)) > iteration:
             continue
         params = obs.get("params") or {}
         if all(params.get(axis) is not None for axis in axes):
@@ -16103,6 +16124,7 @@ def _plot_surrogate_2d_control_style(
     log_frequency: bool = False,
     show_iteration_path: bool = True,
     show_observed_points: bool = True,
+    show_contours: bool = False,
     axis_ranges: Mapping[str, tuple[float, float]] | None = None,
     observed_slice_axis: str | None = None,
     observed_slice_value: float | None = None,
@@ -16128,6 +16150,23 @@ def _plot_surrogate_2d_control_style(
             cmap="viridis",
             shading="auto",
         )
+        if show_contours:
+            finite_values = np.asarray(z_values, dtype=float)
+            finite_values = finite_values[np.isfinite(finite_values)]
+            if finite_values.size and not np.isclose(
+                float(np.nanmin(finite_values)),
+                float(np.nanmax(finite_values)),
+            ):
+                ax.contour(
+                    x_values,
+                    y_values,
+                    np.ma.masked_invalid(z_values),
+                    levels=10,
+                    colors="#111111",
+                    linewidths=0.65,
+                    alpha=0.62,
+                    zorder=3,
+                )
     else:
         valid = display_frame[[x_name, y_name, value]].apply(
             pd.to_numeric,
@@ -16227,6 +16266,29 @@ def _plot_surrogate_2d_control_style(
                 label="observed runs",
                 zorder=5,
             )
+    current_observation = next(
+        (
+            obs for obs in observed_points
+            if int(obs.get("iteration", 0)) == int(iteration)
+        ),
+        None,
+    )
+    if current_observation is not None:
+        current_params = current_observation.get("params") or {}
+        current_x = _finite_float(current_params.get(x_name))
+        current_y = _finite_float(current_params.get(y_name))
+        if current_x is not None and current_y is not None:
+            ax.scatter(
+                [current_x],
+                [current_y],
+                marker="s",
+                color="#00b4d8",
+                edgecolors="black",
+                linewidths=1.0,
+                s=(dot_size + 7) ** 2,
+                zorder=6,
+                label=f"current iteration {iteration}",
+            )
     if (
         not selected_next_frame.empty
         and x_name in selected_next_frame.columns
@@ -16241,7 +16303,7 @@ def _plot_surrogate_2d_control_style(
                 edgecolors="black",
                 linewidths=1.0,
                 s=(dot_size + 8) ** 2,
-                zorder=6,
+                zorder=7,
                 label=f"selected next iteration {iteration + 1}",
             )
     ax.set_xlabel(x_name, fontsize=9, labelpad=4)
@@ -16792,7 +16854,8 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
                     observed_slice_value: float | None = None,
                     slice_sweep_values: Sequence[float] | None = None,
                     title_note: str | None = None,
-                    draw_full_cube_edges: bool = False):
+                    draw_full_cube_edges: bool = False,
+                    show_2d_contours: bool = False):
     parameter_context = _surrogate_parameter_context(session, iteration)
     title = (
         f"{view} | {value} | artifact iteration {iteration}<br>"
@@ -17221,6 +17284,7 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             log_frequency=log_frequency,
             show_iteration_path=show_iteration_path,
             show_observed_points=show_observed_points,
+            show_contours=show_2d_contours,
             axis_ranges=axis_ranges,
             observed_slice_axis=observed_slice_axis,
             observed_slice_value=observed_slice_value,
@@ -18796,24 +18860,22 @@ def _render_downloadable_pyplot(
     width_percent: int,
     dpi: int = 100,
 ) -> None:
-    plot_column = _sized_plot_container(container, width_percent)
+    effective_width_px = int(max(1, float(width_percent)))
+    plot_column = _sized_plot_container(container, effective_width_px)
     try:
-        width_inches, height_inches = fig.get_size_inches()
+        _width_inches, height_inches = fig.get_size_inches()
+        target_width_inches = max(1.0, effective_width_px / float(dpi))
         fig.set_size_inches(
-            max(1.0, float(width_percent) / 100.0),
+            target_width_inches,
             height_inches,
             forward=True,
         )
+        fig._bo_base_size_inches = (target_width_inches, float(height_inches))
     except Exception:
         pass
     _apply_global_plot_style(fig)
     png_bytes = _matplotlib_png_bytes(fig, dpi=dpi)
-    plot_column.pyplot(
-        fig,
-        clear_figure=False,
-        use_container_width=False,
-        bbox_inches=None,
-    )
+    plot_column.image(png_bytes, width=effective_width_px)
     _render_browser_download_link(
         plot_column,
         "Download plot",
@@ -19549,6 +19611,8 @@ def _figures_to_gif(
     *,
     plotly_width: int = 1000,
     plotly_height: int = 700,
+    matplotlib_width: int | None = None,
+    matplotlib_height: int | None = None,
     plotly_camera: dict | None = None,
     total_frames: int | None = None,
     progress_callback=None,
@@ -19579,10 +19643,34 @@ def _figures_to_gif(
             buffer.write(png)
             buffer.seek(0)
         else:
+            target_width_px = int(max(1, matplotlib_width or plotly_width))
+            target_height_px = matplotlib_height
+            if target_height_px is None:
+                target_height_px = _plot_height_px(_matplotlib_plot_kind(figure))
+            target_height_px = int(max(1, target_height_px))
+            target_dpi = 100
+            try:
+                figure.set_size_inches(
+                    target_width_px / float(target_dpi),
+                    target_height_px / float(target_dpi),
+                    forward=True,
+                )
+                figure._bo_base_size_inches = (
+                    target_width_px / float(target_dpi),
+                    target_height_px / float(target_dpi),
+                )
+                _apply_global_plot_style(figure)
+                figure.set_size_inches(
+                    target_width_px / float(target_dpi),
+                    target_height_px / float(target_dpi),
+                    forward=True,
+                )
+            except Exception:
+                pass
             figure.savefig(
                 buffer,
                 format="png",
-                dpi=110,
+                dpi=target_dpi,
             )
             buffer.seek(0)
             plt.close(figure)
@@ -19634,8 +19722,57 @@ def _figures_to_gif(
     return output.getvalue()
 
 
+def _render_app_scrollbar_style() -> None:
+    st.markdown(
+        """
+        <style>
+        html,
+        body {
+            overflow-y: hidden !important;
+        }
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main {
+            scrollbar-width: auto;
+            scrollbar-color: #7b828c #eef0f2;
+            scrollbar-gutter: stable;
+        }
+        [data-testid="stAppViewContainer"]::-webkit-scrollbar,
+        [data-testid="stMain"]::-webkit-scrollbar,
+        section.main::-webkit-scrollbar {
+            width: 24px;
+            height: 18px;
+        }
+        [data-testid="stAppViewContainer"]::-webkit-scrollbar-track,
+        [data-testid="stMain"]::-webkit-scrollbar-track,
+        section.main::-webkit-scrollbar-track {
+            background: #eef0f2;
+        }
+        [data-testid="stAppViewContainer"]::-webkit-scrollbar-thumb,
+        [data-testid="stMain"]::-webkit-scrollbar-thumb,
+        section.main::-webkit-scrollbar-thumb {
+            background: #7b828c;
+            border: 2px solid #eef0f2;
+            border-radius: 10px;
+        }
+        [data-testid="stAppViewContainer"]::-webkit-scrollbar-thumb:hover,
+        [data-testid="stMain"]::-webkit-scrollbar-thumb:hover,
+        section.main::-webkit-scrollbar-thumb:hover {
+            background: #555c66;
+        }
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"] {
+            right: 30px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_bo_session_app() -> None:
     """Render the complete BO viewer. Called after Analysis mode is set to BO."""
+    _render_app_scrollbar_style()
     st.title("⚡ Bayesian Optimization Session Analysis")
     with st.sidebar:
         st.subheader("BO Session")
@@ -23920,14 +24057,120 @@ def render_bo_session_app() -> None:
     with traces:
         @st.fragment
         def _render_swv_traces_tab() -> None:
-            trace_observations = selected_observations
-            trace_all_mode = not observation_is_single
             selected_group_label = selected_observation_group_scope_label
-            selected_iteration_label = (
-                "all iterations"
+            trace_iteration_mode_options = [
+                "Selected observation iteration",
+                "Iteration range",
+                "All iterations",
+            ]
+            if len(scoped_iterations) < 2:
+                trace_iteration_mode_options.remove("Iteration range")
+            default_trace_iteration_mode = (
+                "All iterations"
                 if selected_iteration_scope == "all"
-                else f"iteration {selected_iteration_scope}"
+                else "Selected observation iteration"
             )
+            if default_trace_iteration_mode not in trace_iteration_mode_options:
+                default_trace_iteration_mode = trace_iteration_mode_options[-1]
+            trace_iteration_mode_key = (
+                f"bo_trace_iteration_mode_{selected_observation_group_scope}"
+            )
+            _preserve_valid_widget_value(
+                trace_iteration_mode_key,
+                trace_iteration_mode_options,
+                default_trace_iteration_mode,
+            )
+            trace_iteration_mode = st.radio(
+                "SWV iterations to display",
+                trace_iteration_mode_options,
+                horizontal=True,
+                key=trace_iteration_mode_key,
+            )
+            if trace_iteration_mode == "Iteration range" and len(scoped_iterations) >= 2:
+                selected_iteration_for_default = (
+                    int(selected_iteration_scope)
+                    if selected_iteration_scope != "all"
+                    else scoped_iterations[-1]
+                )
+                default_iteration_start = (
+                    scoped_iterations[0]
+                    if selected_iteration_scope == "all"
+                    else selected_iteration_for_default
+                )
+                default_iteration_end = (
+                    scoped_iterations[-1]
+                    if selected_iteration_scope == "all"
+                    else selected_iteration_for_default
+                )
+                range_columns = st.columns(2)
+                trace_iteration_start_input = range_columns[0].number_input(
+                    "Iteration start",
+                    min_value=int(scoped_iterations[0]),
+                    max_value=int(scoped_iterations[-1]),
+                    value=int(default_iteration_start),
+                    step=1,
+                    key=(
+                        f"bo_trace_iteration_start_"
+                        f"{selected_observation_group_scope}"
+                    ),
+                )
+                trace_iteration_end_input = range_columns[1].number_input(
+                    "Iteration end",
+                    min_value=int(scoped_iterations[0]),
+                    max_value=int(scoped_iterations[-1]),
+                    value=int(default_iteration_end),
+                    step=1,
+                    key=(
+                        f"bo_trace_iteration_end_"
+                        f"{selected_observation_group_scope}"
+                    ),
+                )
+                trace_iteration_start, trace_iteration_end = sorted(
+                    (
+                        int(trace_iteration_start_input),
+                        int(trace_iteration_end_input),
+                    )
+                )
+                trace_observations = [
+                    obs for obs in group_scoped_observations
+                    if trace_iteration_start
+                    <= int(obs.get("iteration", 0))
+                    <= trace_iteration_end
+                ]
+                selected_iteration_label = (
+                    f"iterations {trace_iteration_start}-{trace_iteration_end}"
+                )
+                trace_iteration_token = (
+                    f"range_{trace_iteration_start}_{trace_iteration_end}"
+                )
+            elif trace_iteration_mode == "All iterations":
+                trace_observations = list(group_scoped_observations)
+                selected_iteration_label = "all iterations"
+                trace_iteration_token = "all"
+            else:
+                trace_iteration_value = (
+                    int(selected_iteration_scope)
+                    if selected_iteration_scope != "all"
+                    else int(scoped_iterations[-1])
+                )
+                trace_observations = [
+                    obs for obs in group_scoped_observations
+                    if int(obs.get("iteration", 0)) == trace_iteration_value
+                ]
+                selected_iteration_label = f"iteration {trace_iteration_value}"
+                trace_iteration_token = f"iter_{trace_iteration_value}"
+            trace_observations = sorted(
+                trace_observations,
+                key=lambda item: (
+                    int(item.get("group_id", 1)),
+                    int(item.get("iteration", 0)),
+                ),
+            )
+            if not trace_observations:
+                st.info("No observations match the selected SWV iteration range.")
+                return
+            trace_focus_observation = trace_observations[-1]
+            trace_all_mode = len(trace_observations) > 1
             trace_selection_label = (
                 f"{selected_group_label} — {selected_iteration_label}"
             )
@@ -23950,11 +24193,11 @@ def render_bo_session_app() -> None:
                     for trace_observation in trace_observations
                     for trace in _trace_paths(full_session, trace_observation)
                 ]
-            available_traces = [trace for _observation, trace in trace_entries]
-            available_channels = sorted(
-                {_trace_channel_key(item) for item in available_traces},
-                key=_channel_sort_key,
-            )
+                available_traces = [trace for _observation, trace in trace_entries]
+                available_channels = sorted(
+                    {_trace_channel_key(item) for item in available_traces},
+                    key=_channel_sort_key,
+                )
             if not available_traces:
                 st.info(
                     "No locally accessible raw SWV files were found for this selection. "
@@ -23974,8 +24217,7 @@ def render_bo_session_app() -> None:
                 selected_trace_phases = None
                 if trace_has_paired_phases:
                     trace_phase_key = (
-                        f"bo_trace_phase_filter_{selected_observation_group_scope}_"
-                        f"{selected_iteration_scope}"
+                        f"bo_trace_phase_filter_{selected_observation_group_scope}"
                     )
                     _preserve_valid_widget_value(
                         trace_phase_key,
@@ -24010,7 +24252,7 @@ def render_bo_session_app() -> None:
                 ]
                 trace_channels_key = (
                     f"bo_trace_channels_{selected_observation_group_scope}_"
-                    f"{selected_iteration_scope}_{selected_trace_phase_label}"
+                    f"{selected_trace_phase_label}"
                 )
                 available_channels = sorted(
                     {_trace_channel_key(item) for item in display_available_traces},
@@ -24037,20 +24279,37 @@ def render_bo_session_app() -> None:
                     trace_channels_valid,
                     selected_channels,
                 )
+                trace_channel_layout_options = [
+                    "Plot channels together",
+                    "Plot channels separately",
+                ]
+                trace_channel_layout_key = (
+                    f"bo_trace_channel_layout_{selected_observation_group_scope}"
+                )
+                _preserve_valid_widget_value(
+                    trace_channel_layout_key,
+                    trace_channel_layout_options,
+                    trace_channel_layout_options[0],
+                )
+                trace_channel_layout = st.radio(
+                    "Channel layout",
+                    trace_channel_layout_options,
+                    horizontal=True,
+                    key=trace_channel_layout_key,
+                )
                 trace_layout_options = [
-                    "Overlay selected channels",
-                    "Separate plot per channel",
+                    "Each SWV trace separately",
+                    "Overlay SWV traces",
                 ]
                 if trace_all_mode:
                     trace_layout_options.append("Chronological diagonal stack")
                 trace_layout_key = (
-                    f"bo_trace_layout_{selected_observation_group_scope}_"
-                    f"{selected_iteration_scope}"
+                    f"bo_trace_layout_{selected_observation_group_scope}"
                 )
                 _preserve_valid_widget_value(
                     trace_layout_key,
                     trace_layout_options,
-                    trace_layout_options[0],
+                    "Overlay SWV traces",
                 )
                 trace_layout = st.radio(
                     "Plot layout",
@@ -24058,35 +24317,99 @@ def render_bo_session_app() -> None:
                     horizontal=True,
                     key=trace_layout_key,
                 )
-                selected_trace_type = st.radio(
-                    "Trace type",
-                    [
-                        "Raw",
-                        "Offset raw",
-                        "Corrected",
-                        "Normalized corrected",
-                        "Normalized raw",
-                    ],
-                    horizontal=True,
-                    key=(
-                        f"bo_trace_type_{selected_observation_group_scope}_"
-                        f"{selected_iteration_scope}"
-                    ),
-                )
-                corrected = selected_trace_type != "Raw"
-                offset_to_baseline = selected_trace_type == "Offset raw"
-                normalize_to_peak = selected_trace_type in {
+                trace_type_options = [
+                    "Raw",
+                    "Offset raw",
+                    "Corrected",
                     "Normalized corrected",
                     "Normalized raw",
-                }
-                corrected_trace_key = (
-                    "raw_current"
-                    if selected_trace_type == "Offset raw"
-                    else "corrected_current"
-                    if selected_trace_type == "Normalized raw"
-                    else "smoothed_corrected_current"
+                ]
+                trace_types_key = (
+                    f"bo_trace_types_{selected_observation_group_scope}"
                 )
-                trace_transform_key = _safe_download_stem(selected_trace_type)
+                trace_types_preference_key = (
+                    f"{trace_types_key}__preferred"
+                )
+                legacy_trace_type_key = (
+                    f"bo_trace_type_{selected_observation_group_scope}"
+                )
+                if (
+                    trace_types_key not in st.session_state
+                    and legacy_trace_type_key in st.session_state
+                ):
+                    legacy_trace_type = st.session_state.get(
+                        legacy_trace_type_key
+                    )
+                    if legacy_trace_type in trace_type_options:
+                        st.session_state[trace_types_preference_key] = [
+                            legacy_trace_type
+                        ]
+                trace_types_valid, trace_types_display = (
+                    _prepare_preferred_multiselect_value(
+                        trace_types_key,
+                        trace_types_preference_key,
+                        trace_type_options,
+                        ["Corrected"],
+                    )
+                )
+                selected_trace_types = st.multiselect(
+                    "Trace types",
+                    trace_type_options,
+                    default=trace_types_display,
+                    key=trace_types_key,
+                )
+                _sync_preferred_widget_value(
+                    trace_types_key,
+                    trace_types_preference_key,
+                    trace_types_valid,
+                    trace_types_display,
+                )
+                selected_trace_types = [
+                    trace_type
+                    for trace_type in selected_trace_types
+                    if trace_type in trace_type_options
+                ]
+
+                def _selected_trace_type_settings(trace_type: str) -> tuple[
+                    bool,
+                    bool,
+                    bool,
+                    str,
+                    str,
+                ]:
+                    is_corrected = trace_type != "Raw"
+                    is_offset_to_baseline = trace_type == "Offset raw"
+                    is_normalize_to_peak = trace_type in {
+                        "Normalized corrected",
+                        "Normalized raw",
+                    }
+                    current_trace_key = (
+                        "raw_current"
+                        if trace_type == "Offset raw"
+                        else "corrected_current"
+                        if trace_type == "Normalized raw"
+                        else "smoothed_corrected_current"
+                    )
+                    return (
+                        is_corrected,
+                        is_offset_to_baseline,
+                        is_normalize_to_peak,
+                        current_trace_key,
+                        _safe_download_stem(trace_type),
+                    )
+
+                primary_trace_type = (
+                    selected_trace_types[0]
+                    if selected_trace_types
+                    else "Corrected"
+                )
+                (
+                    corrected,
+                    offset_to_baseline,
+                    normalize_to_peak,
+                    corrected_trace_key,
+                    trace_transform_key,
+                ) = _selected_trace_type_settings(primary_trace_type)
                 analysis_settings = _bo_analysis_settings(session["config"])
                 trace_voltage_columns = st.columns(2)
                 trace_voltage_min = float(trace_voltage_columns[0].number_input(
@@ -24096,7 +24419,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_min_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                        f"{selected_observation_group_scope}"
                     ),
                 ))
                 trace_voltage_max = float(trace_voltage_columns[1].number_input(
@@ -24106,7 +24429,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_max_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                        f"{selected_observation_group_scope}"
                     ),
                 ))
                 if trace_voltage_min > trace_voltage_max:
@@ -24124,12 +24447,12 @@ def render_bo_session_app() -> None:
                 default_trace_y_max = 1.2 if normalize_to_peak else 1.0
                 trace_y_min_key = (
                     f"bo_trace_y_min_"
-                    f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                    f"{selected_observation_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 trace_y_max_key = (
                     f"bo_trace_y_max_"
-                    f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                    f"{selected_observation_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 st.session_state.setdefault(trace_y_min_key, default_trace_y_min)
@@ -24139,7 +24462,7 @@ def render_bo_session_app() -> None:
                     "Set SWV y-axis limits manually",
                     key=(
                         f"bo_trace_manual_y_limits_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{selected_observation_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help=(
@@ -24193,8 +24516,7 @@ def render_bo_session_app() -> None:
                             horizontal=True,
                             key=(
                                 f"bo_trace_stack_phase_display_"
-                                f"{selected_observation_group_scope}_"
-                                f"{selected_iteration_scope}"
+                                f"{selected_observation_group_scope}"
                             ),
                         )
                     offset_columns = st.columns(3)
@@ -24205,7 +24527,7 @@ def render_bo_session_app() -> None:
                         format="%.4f",
                         key=(
                             f"bo_trace_stack_x_offset_"
-                            f"{selected_observation_group_scope}_{selected_iteration_scope}"
+                            f"{selected_observation_group_scope}"
                         ),
                         help="Positive values shift newer traces to the right; negative values shift them left.",
                     )
@@ -24216,7 +24538,7 @@ def render_bo_session_app() -> None:
                         format="%.4f",
                         key=(
                             f"bo_trace_stack_y_offset_"
-                            f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                            f"{selected_observation_group_scope}_"
                             f"{trace_transform_key}"
                         ),
                         help="Positive values shift newer traces upward; negative values shift them downward.",
@@ -24229,7 +24551,7 @@ def render_bo_session_app() -> None:
                         step=0.1,
                         key=(
                             f"bo_trace_stack_height_"
-                            f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                            f"{selected_observation_group_scope}_"
                             f"{trace_transform_key}"
                         ),
                         help="Scales each SWV vertically before applying the chronological offset.",
@@ -24238,7 +24560,7 @@ def render_bo_session_app() -> None:
                         "Crop each SWV trace by current before stacking",
                         key=(
                             f"bo_trace_stack_manual_y_limits_"
-                            f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                            f"{selected_observation_group_scope}_"
                             f"{trace_transform_key}"
                         ),
                     )
@@ -24248,12 +24570,12 @@ def render_bo_session_app() -> None:
                     y_limit_columns = st.columns(2)
                     stack_y_min_key = (
                         f"bo_trace_stack_trace_y_min_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{selected_observation_group_scope}_"
                         f"{trace_transform_key}"
                     )
                     stack_y_max_key = (
                         f"bo_trace_stack_trace_y_max_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{selected_observation_group_scope}_"
                         f"{trace_transform_key}"
                     )
                     st.session_state.setdefault(
@@ -24292,8 +24614,7 @@ def render_bo_session_app() -> None:
                     value=350,
                     step=50,
                     key=(
-                        f"bo_trace_gif_duration_{selected_observation_group_scope}_"
-                        f"{selected_iteration_scope}"
+                        f"bo_trace_gif_duration_{selected_observation_group_scope}"
                     ),
                     disabled=not trace_all_mode,
                 )
@@ -24301,12 +24622,13 @@ def render_bo_session_app() -> None:
                 trace_render_signature = (
                     session["state"].get("session_id", session["root"].name),
                     selected_observation_group_scope,
-                    selected_iteration_scope,
+                    trace_iteration_token,
                     selected_trace_phase_label,
                     tuple(selected_trace_phases or ()),
                     tuple(selected_channels),
+                    trace_channel_layout,
                     trace_layout,
-                    selected_trace_type,
+                    tuple(selected_trace_types),
                     trace_voltage_min,
                     trace_voltage_max,
                     trace_y_min,
@@ -24339,14 +24661,15 @@ def render_bo_session_app() -> None:
                 if render_swv_traces:
                     channel_groups = (
                         [[channel] for channel in selected_channels]
-                        if trace_layout in (
-                            "Separate plot per channel",
-                            "Chronological diagonal stack",
-                        )
+                        if trace_channel_layout == "Plot channels separately"
                         else [selected_channels]
                     )
                     if not selected_channels:
                         st.info("Select at least one channel to display traces.")
+                    if not selected_trace_types:
+                        st.info("Select at least one trace type to display traces.")
+                    if not selected_channels or not selected_trace_types:
+                        channel_groups = []
                     for channel_group in channel_groups:
                         phase_targets = [(None, selected_trace_phases)]
                         if (
@@ -24357,10 +24680,7 @@ def render_bo_session_app() -> None:
                                 ("buffer", ("buffer",)),
                                 ("target", ("target",)),
                             ]
-                        if trace_layout in (
-                            "Separate plot per channel",
-                            "Chronological diagonal stack",
-                        ):
+                        if trace_channel_layout == "Plot channels separately":
                             channel = channel_group[0]
                             st.markdown(
                                 f"#### {_trace_channel_label(channel)}"
@@ -24368,100 +24688,304 @@ def render_bo_session_app() -> None:
                         for phase_label, selected_stack_phases in phase_targets:
                             if phase_label is not None:
                                 st.markdown(f"**{phase_label.title()}**")
-                            with st.spinner(
-                                "Processing corrected traces..."
-                                if corrected
-                                else "Loading raw traces..."
-                            ):
-                                if trace_layout == "Chronological diagonal stack":
-                                    figure, errors = _plot_chronological_swv_stack(
-                                        display_trace_entries,
-                                        corrected,
-                                        channel_group,
-                                        trace_analysis,
-                                        session["config"],
-                                        correction_label,
-                                        trace_selection_label,
-                                        normalize_to_peak,
-                                        corrected_trace_key,
-                                        offset_to_baseline,
-                                        stack_x_offset,
-                                        stack_y_offset,
-                                        stack_trace_height,
-                                        stack_voltage_min,
-                                        stack_voltage_max,
-                                        stack_y_min,
-                                        stack_y_max,
-                                        selected_stack_phases,
+                            if trace_layout == "Each SWV trace separately":
+                                separate_entries = [
+                                    (trace_observation, trace)
+                                    for trace_observation, trace in display_trace_entries
+                                    if _trace_channel_key(trace) in channel_group
+                                    and (
+                                        selected_stack_phases is None
+                                        or str(trace.get("phase", "")).lower()
+                                        in {
+                                            str(phase).lower()
+                                            for phase in selected_stack_phases
+                                        }
                                     )
-                                elif trace_all_mode:
-                                    figure, errors = _plot_iteration_trace_overlay(
-                                        display_trace_entries,
-                                        corrected,
-                                        channel_group,
-                                        trace_analysis,
-                                        correction_label,
-                                        trace_selection_label,
-                                        normalize_to_peak,
-                                        corrected_trace_key,
-                                        offset_to_baseline,
-                                        trace_voltage_min,
-                                        trace_voltage_max,
-                                    )
+                                ]
+                                pair_buffer_target = (
+                                    selected_stack_phases is not None
+                                    and {
+                                        str(phase).lower()
+                                        for phase in selected_stack_phases
+                                    } == {"buffer", "target"}
+                                )
+                                separate_plot_entries = []
+                                if pair_buffer_target:
+                                    for trace_observation in trace_observations:
+                                        observation_entries = [
+                                            trace
+                                            for entry_observation, trace in separate_entries
+                                            if entry_observation is trace_observation
+                                        ]
+                                        observation_channels = sorted(
+                                            {
+                                                _trace_channel_key(trace)
+                                                for trace in observation_entries
+                                            },
+                                            key=_channel_sort_key,
+                                        )
+                                        for single_channel in observation_channels:
+                                            traces_by_phase = {}
+                                            for trace in observation_entries:
+                                                if (
+                                                    _trace_channel_key(trace)
+                                                    != single_channel
+                                                ):
+                                                    continue
+                                                phase = str(
+                                                    trace.get("phase", "")
+                                                ).lower()
+                                                if phase in {"buffer", "target"}:
+                                                    traces_by_phase.setdefault(
+                                                        phase,
+                                                        trace,
+                                                    )
+                                            if all(
+                                                phase in traces_by_phase
+                                                for phase in ("buffer", "target")
+                                            ):
+                                                separate_plot_entries.append((
+                                                    trace_observation,
+                                                    [
+                                                        traces_by_phase["buffer"],
+                                                        traces_by_phase["target"],
+                                                    ],
+                                                    single_channel,
+                                                ))
                                 else:
-                                    figure, errors = _plot_traces(
-                                        session,
-                                        observation,
-                                        corrected,
-                                        channel_group,
-                                        trace_analysis,
-                                        correction_label,
-                                        trace_layout == "Overlay selected channels",
-                                        display_available_traces,
-                                        normalize_to_peak,
-                                        corrected_trace_key,
-                                        offset_to_baseline,
-                                        trace_voltage_min,
-                                        trace_voltage_max,
+                                    separate_plot_entries = [
+                                        (
+                                            trace_observation,
+                                            [single_trace],
+                                            _trace_channel_key(single_trace),
+                                        )
+                                        for trace_observation, single_trace
+                                        in separate_entries
+                                    ]
+                                if not separate_plot_entries:
+                                    st.info("No SWV traces match this channel and phase selection.")
+                                    continue
+                                previous_iteration_heading = None
+                                for trace_index, (
+                                    trace_observation,
+                                    trace_items,
+                                    single_channel,
+                                ) in enumerate(separate_plot_entries, start=1):
+                                    trace_iteration = int(
+                                        trace_observation.get("iteration", 0)
                                     )
-                            if (
-                                trace_y_min is not None
-                                and trace_y_max is not None
-                                and figure.axes
-                            ):
-                                figure.axes[0].set_ylim(trace_y_min, trace_y_max)
-                            trace_file_stem = (
-                                f"swv_traces_{selected_trace_type}_{trace_layout}_"
-                                f"{selected_group_label}_{selected_iteration_label}_"
-                                f"{selected_trace_phase_label}_"
-                                f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
-                                f"{f'y_{trace_y_min:g}_{trace_y_max:g}_' if trace_y_min is not None and trace_y_max is not None else ''}"
-                                f"{phase_label + '_' if phase_label else ''}"
-                                f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
-                            )
-                            _render_downloadable_pyplot(
-                                st,
-                                figure,
-                                key=(
-                                    f"bo_trace_plot_{selected_observation_group_scope}_"
-                                    f"{selected_iteration_scope}_{trace_layout}_"
-                                    f"{selected_trace_type}_{phase_label or 'all'}_"
+                                    if (
+                                        trace_all_mode
+                                        and trace_iteration != previous_iteration_heading
+                                    ):
+                                        st.markdown(
+                                            f"**Iteration {trace_iteration}**"
+                                        )
+                                        previous_iteration_heading = trace_iteration
+                                    trace_group = str(
+                                        trace_observation.get("group_name")
+                                        or f"Group {trace_observation.get('group_id', 1)}"
+                                    )
+                                    trace_phase = (
+                                        "buffer_target"
+                                        if pair_buffer_target
+                                        else str(trace_items[0].get("phase", "trace"))
+                                    )
+                                    trace_stem = _safe_download_stem(
+                                        "_".join(
+                                            Path(trace["path"]).stem
+                                            for trace in trace_items
+                                        )
+                                    )
+                                    for selected_trace_type in selected_trace_types:
+                                        (
+                                            current_corrected,
+                                            current_offset_to_baseline,
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            _current_trace_transform_key,
+                                        ) = _selected_trace_type_settings(selected_trace_type)
+                                        if len(selected_trace_types) > 1:
+                                            st.markdown(f"**{selected_trace_type}**")
+                                        with st.spinner(
+                                            "Processing corrected trace..."
+                                            if current_corrected
+                                            else "Loading raw trace..."
+                                        ):
+                                            figure, errors = _plot_traces(
+                                                session,
+                                                trace_observation,
+                                                current_corrected,
+                                                [single_channel],
+                                                trace_analysis,
+                                                correction_label,
+                                                overlaid=False,
+                                                trace_items=trace_items,
+                                                normalize_to_peak=(
+                                                    current_normalize_to_peak
+                                                ),
+                                                corrected_trace_key=(
+                                                    current_corrected_trace_key
+                                                ),
+                                                offset_to_baseline=(
+                                                    current_offset_to_baseline
+                                                ),
+                                                voltage_min=trace_voltage_min,
+                                                voltage_max=trace_voltage_max,
+                                            )
+                                            if (
+                                                trace_y_min is not None
+                                                and trace_y_max is not None
+                                                and figure.axes
+                                            ):
+                                                figure.axes[0].set_ylim(
+                                                    trace_y_min,
+                                                    trace_y_max,
+                                                )
+                                        trace_file_stem = (
+                                            f"swv_trace_{selected_trace_type}_"
+                                            f"{trace_group}_{trace_iteration}_"
+                                            f"{trace_phase}_{single_channel}_"
+                                            f"{trace_stem}"
+                                        )
+                                        _render_downloadable_pyplot(
+                                            st,
+                                            figure,
+                                            key=(
+                                                f"bo_trace_plot_single_"
+                                                f"{selected_observation_group_scope}_"
+                                                f"{trace_iteration_token}_"
+                                                f"{selected_trace_type}_"
+                                                f"{trace_index}_{trace_iteration}_"
+                                                f"{trace_phase}_{single_channel}_"
+                                                f"{trace_stem}_"
+                                                f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                                                f"{trace_y_min if trace_y_min is not None else 'auto'}_"
+                                                f"{trace_y_max if trace_y_max is not None else 'auto'}"
+                                            ),
+                                            file_stem=trace_file_stem,
+                                            width_percent=plot_width_percent,
+                                        )
+                                        for error in errors:
+                                            st.warning(error)
+                                continue
+                            for selected_trace_type in selected_trace_types:
+                                (
+                                    current_corrected,
+                                    current_offset_to_baseline,
+                                    current_normalize_to_peak,
+                                    current_corrected_trace_key,
+                                    _current_trace_transform_key,
+                                ) = _selected_trace_type_settings(selected_trace_type)
+                                if len(selected_trace_types) > 1:
+                                    st.markdown(f"**{selected_trace_type}**")
+                                with st.spinner(
+                                    "Processing corrected traces..."
+                                    if current_corrected
+                                    else "Loading raw traces..."
+                                ):
+                                    if trace_layout == "Chronological diagonal stack":
+                                        figure, errors = _plot_chronological_swv_stack(
+                                            display_trace_entries,
+                                            current_corrected,
+                                            channel_group,
+                                            trace_analysis,
+                                            session["config"],
+                                            correction_label,
+                                            trace_selection_label,
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            current_offset_to_baseline,
+                                            stack_x_offset,
+                                            stack_y_offset,
+                                            stack_trace_height,
+                                            stack_voltage_min,
+                                            stack_voltage_max,
+                                            stack_y_min,
+                                            stack_y_max,
+                                            selected_stack_phases,
+                                        )
+                                    elif trace_layout == "Overlay SWV traces" and trace_all_mode:
+                                        figure, errors = _plot_iteration_trace_overlay(
+                                            display_trace_entries,
+                                            current_corrected,
+                                            channel_group,
+                                            trace_analysis,
+                                            correction_label,
+                                            trace_selection_label,
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            current_offset_to_baseline,
+                                            trace_voltage_min,
+                                            trace_voltage_max,
+                                        )
+                                    else:
+                                        figure, errors = _plot_traces(
+                                            session,
+                                            trace_focus_observation,
+                                            current_corrected,
+                                            channel_group,
+                                            trace_analysis,
+                                            correction_label,
+                                            True,
+                                            display_available_traces,
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            current_offset_to_baseline,
+                                            trace_voltage_min,
+                                            trace_voltage_max,
+                                        )
+                                if (
+                                    trace_y_min is not None
+                                    and trace_y_max is not None
+                                    and figure.axes
+                                ):
+                                    figure.axes[0].set_ylim(trace_y_min, trace_y_max)
+                                trace_file_stem = (
+                                    f"swv_traces_{selected_trace_type}_{trace_layout}_"
+                                    f"{selected_group_label}_{selected_iteration_label}_"
                                     f"{selected_trace_phase_label}_"
                                     f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
-                                    f"{trace_y_min if trace_y_min is not None else 'auto'}_"
-                                    f"{trace_y_max if trace_y_max is not None else 'auto'}_"
-                                    f"{'_'.join(map(str, channel_group))}"
-                                ),
-                                file_stem=trace_file_stem,
-                                width_percent=plot_width_percent,
-                            )
-                            for error in errors:
-                                st.warning(error)
+                                    f"{f'y_{trace_y_min:g}_{trace_y_max:g}_' if trace_y_min is not None and trace_y_max is not None else ''}"
+                                    f"{phase_label + '_' if phase_label else ''}"
+                                    f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
+                                )
+                                _render_downloadable_pyplot(
+                                    st,
+                                    figure,
+                                    key=(
+                                        f"bo_trace_plot_{selected_observation_group_scope}_"
+                                        f"{trace_iteration_token}_{trace_layout}_"
+                                        f"{selected_trace_type}_{phase_label or 'all'}_"
+                                        f"{selected_trace_phase_label}_"
+                                        f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                                        f"{trace_y_min if trace_y_min is not None else 'auto'}_"
+                                        f"{trace_y_max if trace_y_max is not None else 'auto'}_"
+                                        f"{'_'.join(map(str, channel_group))}"
+                                    ),
+                                    file_stem=trace_file_stem,
+                                    width_percent=plot_width_percent,
+                                )
+                                for error in errors:
+                                    st.warning(error)
 
-                    if trace_all_mode and selected_channels:
+                    if (
+                        trace_all_mode
+                        and selected_channels
+                        and trace_layout != "Each SWV trace separately"
+                        and len(selected_trace_types) == 1
+                    ):
+                        selected_trace_type = selected_trace_types[0]
+                        (
+                            corrected,
+                            offset_to_baseline,
+                            normalize_to_peak,
+                            corrected_trace_key,
+                            _trace_transform_key,
+                        ) = _selected_trace_type_settings(selected_trace_type)
                         trace_gif_key = (
                             f"bo_trace_gif_{selected_observation_group_scope}_"
-                            f"{selected_iteration_scope}_{trace_layout}_{selected_trace_type}_"
+                            f"{trace_iteration_token}_{trace_layout}_{selected_trace_type}_"
                             f"{selected_trace_phase_label}_"
                             f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
                             f"{trace_y_min if trace_y_min is not None else 'auto'}_"
@@ -24545,7 +25069,7 @@ def render_bo_session_app() -> None:
                                                 ]
                                             if not frame_traces:
                                                 continue
-                                            if trace_layout == "Separate plot per channel":
+                                            if trace_channel_layout == "Plot channels separately":
                                                 figures = []
                                                 for single_channel in selected_channels:
                                                     fig, errors = _plot_traces(
@@ -24681,6 +25205,16 @@ def render_bo_session_app() -> None:
                                 mime="image/gif",
                                 key=f"{trace_gif_key}_download",
                             )
+                    elif (
+                        trace_all_mode
+                        and selected_channels
+                        and trace_layout != "Each SWV trace separately"
+                        and len(selected_trace_types) > 1
+                    ):
+                        st.caption(
+                            "SWV GIF generation is available when exactly one "
+                            "trace type is selected."
+                        )
 
 
         _render_swv_traces_tab()
@@ -27343,6 +27877,116 @@ def render_bo_session_app() -> None:
                         )
                         if real_can_show_global_optimum else False
                     )
+                    real_show_swv_traces = False
+                    real_swv_iteration_mode = "Latest plotted iteration"
+                    real_swv_trace_type = "Corrected"
+                    real_swv_voltage_min = None
+                    real_swv_voltage_max = None
+                    real_swv_current_min = None
+                    real_swv_current_max = None
+                    if real_view in {"2D map", "3D tensor"}:
+                        real_swv_columns = real_view_form.columns(3)
+                        real_show_swv_traces = real_swv_columns[0].checkbox(
+                            "Show SWV traces below real-data plots",
+                            value=False,
+                            key=f"bo_real_show_swv_traces_{real_control_scope_key}",
+                            help=(
+                                "Adds an SWV trace panel below each rendered 2D map "
+                                "or 3D tensor."
+                            ),
+                        )
+                        real_swv_iteration_mode = real_swv_columns[1].selectbox(
+                            "SWV iteration",
+                            ["Latest plotted iteration", "Selected observation iteration"],
+                            key=f"bo_real_swv_iteration_mode_{real_control_scope_key}",
+                            disabled=not real_show_swv_traces,
+                        )
+                        real_swv_trace_type = real_swv_columns[2].selectbox(
+                            "SWV trace type",
+                            [
+                                "Corrected",
+                                "Normalized corrected",
+                                "Raw",
+                                "Offset raw",
+                                "Normalized raw",
+                            ],
+                            key=f"bo_real_swv_trace_type_{real_control_scope_key}",
+                            disabled=not real_show_swv_traces,
+                        )
+                        if real_show_swv_traces:
+                            analysis_settings = _bo_analysis_settings(session["config"])
+                            real_swv_crop_columns = real_view_form.columns(4)
+                            real_swv_voltage_min = float(
+                                real_swv_crop_columns[0].number_input(
+                                    "SWV voltage crop min (V)",
+                                    value=float(analysis_settings["crop_min_v"]),
+                                    step=0.01,
+                                    format="%.4f",
+                                    key=f"bo_real_swv_voltage_min_{real_control_scope_key}",
+                                )
+                            )
+                            real_swv_voltage_max = float(
+                                real_swv_crop_columns[1].number_input(
+                                    "SWV voltage crop max (V)",
+                                    value=float(analysis_settings["crop_max_v"]),
+                                    step=0.01,
+                                    format="%.4f",
+                                    key=f"bo_real_swv_voltage_max_{real_control_scope_key}",
+                                )
+                            )
+                            if real_swv_voltage_min > real_swv_voltage_max:
+                                real_view_form.warning(
+                                    "SWV voltage crop min is greater than max; "
+                                    "applying the bounds in ascending order."
+                                )
+                                real_swv_voltage_min, real_swv_voltage_max = (
+                                    real_swv_voltage_max,
+                                    real_swv_voltage_min,
+                                )
+                            manual_real_swv_current = real_swv_crop_columns[2].checkbox(
+                                "Set SWV current range",
+                                value=False,
+                                key=f"bo_real_swv_manual_current_{real_control_scope_key}",
+                            )
+                            current_defaults = (
+                                (-0.2, 1.2)
+                                if real_swv_trace_type in {
+                                    "Normalized corrected",
+                                    "Normalized raw",
+                                }
+                                else (-1.0, 1.0)
+                            )
+                            real_swv_current_min = float(
+                                real_swv_crop_columns[2].number_input(
+                                    "SWV current min",
+                                    value=float(current_defaults[0]),
+                                    step=0.1,
+                                    format="%.4f",
+                                    key=f"bo_real_swv_current_min_{real_control_scope_key}",
+                                    disabled=not manual_real_swv_current,
+                                )
+                            )
+                            real_swv_current_max = float(
+                                real_swv_crop_columns[3].number_input(
+                                    "SWV current max",
+                                    value=float(current_defaults[1]),
+                                    step=0.1,
+                                    format="%.4f",
+                                    key=f"bo_real_swv_current_max_{real_control_scope_key}",
+                                    disabled=not manual_real_swv_current,
+                                )
+                            )
+                            if manual_real_swv_current:
+                                if real_swv_current_min >= real_swv_current_max:
+                                    real_view_form.warning(
+                                        "SWV current minimum must be less than the "
+                                        "maximum; autoscale is being used."
+                                    )
+                                    real_swv_current_min = None
+                                    real_swv_current_max = None
+                            else:
+                                real_swv_current_min = None
+                                real_swv_current_max = None
 
                     real_show_channel_iteration_paths = (
                         real_show_iteration_path
@@ -27593,6 +28237,228 @@ def render_bo_session_app() -> None:
                             return str(series_name)
                         return str(series_name)
 
+                    def real_swv_channels_for_series(
+                        series_name: Any,
+                        series_points: pd.DataFrame,
+                        group_id: int | None,
+                    ) -> list[str]:
+                        if real_channel_mode == "Plot channels individually":
+                            return [str(series_name)]
+                        if real_channel_mode == "Plot channel groups":
+                            group = next(
+                                (
+                                    item for item in real_groups
+                                    if group_id is not None
+                                    and int(item["id"]) == int(group_id)
+                                ),
+                                None,
+                            )
+                            if group is not None:
+                                return [
+                                    str(channel)
+                                    for channel in group.get("channels", [])
+                                ]
+                        if real_channel_mode == real_simulation_run_mode:
+                            return list(map(str, selected_real_channels))
+                        if real_channel_mode == real_metadata_overlay_mode:
+                            if "metadata_overlay_channel" in series_points.columns:
+                                channels = sorted(
+                                    {
+                                        str(channel)
+                                        for channel in series_points[
+                                            "metadata_overlay_channel"
+                                        ].dropna()
+                                    },
+                                    key=_channel_sort_key,
+                                )
+                                if channels:
+                                    return channels
+                            return list(map(str, selected_real_channels))
+                        channels = sorted(
+                            {
+                                str(channel)
+                                for channel in series_points.get(
+                                    "channel",
+                                    pd.Series(dtype=str),
+                                ).dropna()
+                                if str(channel) not in {"Average", "Run"}
+                            },
+                            key=_channel_sort_key,
+                        )
+                        return channels or list(map(str, selected_real_channels))
+
+                    def render_real_swv_traces(
+                        container,
+                        phase: str,
+                        series_name: Any,
+                        series_points: pd.DataFrame,
+                        *,
+                        width_percent: int | None = None,
+                    ) -> None:
+                        if not real_show_swv_traces:
+                            return
+                        if real_view not in {"2D map", "3D tensor"}:
+                            return
+                        if series_points.empty or "iteration" not in series_points.columns:
+                            return
+                        series_iterations = pd.to_numeric(
+                            series_points["iteration"],
+                            errors="coerce",
+                        )
+                        if real_swv_iteration_mode == "Selected observation iteration":
+                            target_iteration = int(selected_iteration)
+                            matching_series = series_points.loc[
+                                series_iterations == target_iteration
+                            ]
+                            if matching_series.empty:
+                                matching_series = series_points.copy()
+                        else:
+                            finite_iterations = series_iterations.dropna()
+                            if finite_iterations.empty:
+                                return
+                            target_iteration = int(finite_iterations.max())
+                            matching_series = series_points.loc[
+                                series_iterations == target_iteration
+                            ]
+                        group_id = None
+                        if "group_id" in matching_series.columns:
+                            group_ids = pd.to_numeric(
+                                matching_series["group_id"],
+                                errors="coerce",
+                            ).dropna()
+                            if not group_ids.empty:
+                                group_id = int(group_ids.iloc[0])
+                        observation_candidates = [
+                            observation
+                            for observation in real_observations
+                            if int(observation.get("iteration", 0))
+                            == int(target_iteration)
+                            and (
+                                group_id is None
+                                or int(observation.get("group_id", 1))
+                                == int(group_id)
+                            )
+                        ]
+                        if not observation_candidates:
+                            observation_candidates = [
+                                observation
+                                for observation in real_observations
+                                if int(observation.get("iteration", 0))
+                                == int(target_iteration)
+                            ]
+                        if not observation_candidates:
+                            container.caption(
+                                "No SWV observation is available for iteration "
+                                f"{target_iteration}."
+                            )
+                            return
+                        swv_observation = observation_candidates[-1]
+                        swv_quality = swv_observation.get("quality") or {}
+                        swv_q_value = _finite_float(
+                            swv_observation.get("Q_run", swv_quality.get("Q_run"))
+                        )
+                        swv_q_label = (
+                            f"Q={swv_q_value:.4g}"
+                            if swv_q_value is not None
+                            else "Q=unknown"
+                        )
+                        trace_items = _trace_paths(full_session, swv_observation)
+                        if phase in {"buffer", "target"}:
+                            trace_items = [
+                                item for item in trace_items
+                                if str(item.get("phase", "")).lower() == phase
+                            ]
+                        swv_channels = real_swv_channels_for_series(
+                            series_name,
+                            matching_series,
+                            group_id,
+                        )
+                        if not swv_channels:
+                            swv_channels = sorted(
+                                {
+                                    _trace_channel_key(item)
+                                    for item in trace_items
+                                },
+                                key=_channel_sort_key,
+                            )
+                        swv_corrected = real_swv_trace_type != "Raw"
+                        swv_offset_to_baseline = real_swv_trace_type == "Offset raw"
+                        swv_normalize_to_peak = real_swv_trace_type in {
+                            "Normalized corrected",
+                            "Normalized raw",
+                        }
+                        swv_corrected_trace_key = (
+                            "raw_current"
+                            if real_swv_trace_type == "Offset raw"
+                            else "corrected_current"
+                            if real_swv_trace_type == "Normalized raw"
+                            else "smoothed_corrected_current"
+                        )
+                        swv_figure, swv_errors = _plot_traces(
+                            full_session,
+                            swv_observation,
+                            swv_corrected,
+                            swv_channels,
+                            trace_analysis,
+                            correction_label,
+                            overlaid=True,
+                            trace_items=trace_items,
+                            normalize_to_peak=swv_normalize_to_peak,
+                            corrected_trace_key=swv_corrected_trace_key,
+                            offset_to_baseline=swv_offset_to_baseline,
+                            voltage_min=real_swv_voltage_min,
+                            voltage_max=real_swv_voltage_max,
+                        )
+                        if (
+                            real_swv_current_min is not None
+                            and real_swv_current_max is not None
+                            and swv_figure.axes
+                        ):
+                            swv_figure.axes[0].set_ylim(
+                                real_swv_current_min,
+                                real_swv_current_max,
+                            )
+                        container.markdown(
+                            f"##### SWV traces | {phase} | "
+                            f"{real_swv_iteration_mode.lower()} {target_iteration} | "
+                            f"{swv_q_label}"
+                        )
+                        series_token = (
+                            "all"
+                            if series_name is None
+                            else _safe_download_stem(str(series_name))
+                        )
+                        swv_trace_type_token = _safe_download_stem(
+                            real_swv_trace_type
+                        )
+                        effective_width = (
+                            plot_width_percent
+                            if width_percent is None
+                            else int(width_percent)
+                        )
+                        _render_downloadable_pyplot(
+                            container,
+                            swv_figure,
+                            key=(
+                                f"bo_real_swv_{real_plot_state_key}_{phase}_"
+                                f"{series_token}_{target_iteration}_"
+                                f"{swv_trace_type_token}_{real_view}_"
+                                f"{real_x}_{real_y}_{real_z}_"
+                                f"v{real_swv_voltage_min:g}_{real_swv_voltage_max:g}_"
+                                f"i{real_swv_current_min if real_swv_current_min is not None else 'auto'}_"
+                                f"{real_swv_current_max if real_swv_current_max is not None else 'auto'}"
+                            ),
+                            file_stem=(
+                                f"real_data_{phase}_{series_token}_"
+                                f"swv_iteration_{target_iteration}_"
+                                f"{swv_trace_type_token}_"
+                                f"v{real_swv_voltage_min:g}_{real_swv_voltage_max:g}"
+                            ),
+                            width_percent=effective_width,
+                        )
+                        for error in swv_errors:
+                            container.warning(error)
+
                     real_plot_signature = (
                         real_plot_signature,
                         real_view,
@@ -27622,6 +28488,13 @@ def render_bo_session_app() -> None:
                         real_selected_path_marker_size,
                         real_selected_path_tail_length,
                         real_show_global_optimum,
+                        real_show_swv_traces,
+                        real_swv_iteration_mode,
+                        real_swv_trace_type,
+                        real_swv_voltage_min,
+                        real_swv_voltage_max,
+                        real_swv_current_min,
+                        real_swv_current_max,
                         real_parallel_line_width,
                         real_parallel_line_opacity,
                     )
@@ -28084,6 +28957,17 @@ def render_bo_session_app() -> None:
                                             export_height=plot_3d_height,
                                             camera_storage_key=camera_storage_key,
                                         )
+                                        render_real_swv_traces(
+                                            plot_container,
+                                            phase,
+                                            series_name,
+                                            series_points,
+                                            width_percent=(
+                                                100
+                                                if associated_slice_plots
+                                                else plot_width_percent
+                                            ),
+                                        )
                                         if associated_slice_plots:
                                             slice_container.markdown(
                                                 "##### Highlighted slice 2D map"
@@ -28109,6 +28993,12 @@ def render_bo_session_app() -> None:
                                             real_figure,
                                             use_container_width=True,
                                             key=plot_key,
+                                        )
+                                        render_real_swv_traces(
+                                            column,
+                                            phase,
+                                            series_name,
+                                            series_points,
                                         )
                     else:
                         phase_points = real_points_by_phase[real_phase]
@@ -28210,12 +29100,24 @@ def render_bo_session_app() -> None:
                                     export_height=plot_3d_height,
                                     camera_storage_key=camera_storage_key,
                                 )
+                                render_real_swv_traces(
+                                    st,
+                                    real_phase,
+                                    series_name,
+                                    series_points,
+                                )
                             else:
                                 _plotly_chart_with_colorbars(
                                     _sized_plot_container(st, plot_width_percent),
                                     real_figure,
                                     use_container_width=True,
                                     key=plot_key,
+                                )
+                                render_real_swv_traces(
+                                    st,
+                                    real_phase,
+                                    series_name,
+                                    series_points,
                                 )
 
                     if (
@@ -29636,78 +30538,115 @@ def render_bo_session_app() -> None:
                             "selected groups."
                         )
                         return
-                    surrogate_iteration_key = (
-                        f"{surrogate_state_prefix}_artifact_iteration"
+                    surrogate_iterations_key = (
+                        f"{surrogate_state_prefix}_artifact_iterations"
                         if available_surrogate_groups
-                        else "bo_surrogate_ungrouped_artifact_iteration"
+                        else "bo_surrogate_ungrouped_artifact_iterations"
                     )
                     legacy_surrogate_iteration_key = (
                         f"{legacy_surrogate_state_prefix}_artifact_iteration"
                         if available_surrogate_groups
                         else "bo_surrogate_ungrouped_artifact_iteration"
                     )
-                    surrogate_iteration_preference_key = (
-                        f"{surrogate_state_prefix}_pref_artifact_iteration"
+                    surrogate_iterations_preference_key = (
+                        f"{surrogate_state_prefix}_pref_artifact_iterations"
                         if available_surrogate_groups
-                        else "bo_surrogate_ungrouped_pref_artifact_iteration"
+                        else "bo_surrogate_ungrouped_pref_artifact_iterations"
+                    )
+                    legacy_iteration_value = st.session_state.get(
+                        legacy_surrogate_iteration_key,
+                        artifact_iterations[-1],
                     )
                     _initialize_preference(
-                        surrogate_iteration_preference_key,
-                        surrogate_iteration_key,
-                        legacy_surrogate_iteration_key,
-                        default=artifact_iterations[-1],
+                        surrogate_iterations_preference_key,
+                        surrogate_iterations_key,
+                        default=[legacy_iteration_value],
                     )
-                    iteration_preference_valid, iteration_display = (
-                        _prepare_preferred_widget_value(
-                            surrogate_iteration_key,
-                            surrogate_iteration_preference_key,
-                            artifact_iterations,
-                            artifact_iterations[-1],
-                        )
-                    )
-                    artifact_iteration = st.selectbox(
-                        "Artifact iteration",
+                    (
+                        iterations_preference_valid,
+                        artifact_iterations_display,
+                    ) = _prepare_preferred_multiselect_value(
+                        surrogate_iterations_key,
+                        surrogate_iterations_preference_key,
                         artifact_iterations,
-                        key=surrogate_iteration_key,
+                        [artifact_iterations[-1]],
+                    )
+                    selected_artifact_iterations = st.multiselect(
+                        "Artifact iterations",
+                        artifact_iterations,
+                        default=artifact_iterations_display,
+                        key=surrogate_iterations_key,
+                        help=(
+                            "Select multiple saved surrogate artifacts to render "
+                            "one plot per selected iteration for each channel group."
+                        ),
                     )
                     _sync_preferred_widget_value(
-                        surrogate_iteration_key,
-                        surrogate_iteration_preference_key,
-                        iteration_preference_valid,
-                        iteration_display,
+                        surrogate_iterations_key,
+                        surrogate_iterations_preference_key,
+                        iterations_preference_valid,
+                        selected_artifact_iterations,
                     )
-                    available_at_iteration = [
+                    selected_artifact_iterations = sorted({
+                        int(iteration)
+                        for iteration in selected_artifact_iterations
+                        if iteration in artifact_iterations
+                    })
+                    if not selected_artifact_iterations:
+                        st.info("Select at least one artifact iteration.")
+                        return
+                    artifact_iteration = selected_artifact_iterations[-1]
+                    artifact_iteration_token = "_".join(
+                        str(iteration)
+                        for iteration in selected_artifact_iterations
+                    )
+                    available_artifacts = [
                         (
+                            int(current_iteration),
                             group,
                             surrogate_session,
                             _recompute_group_surrogate(
                                 surrogate_session,
-                                pd.read_csv(files[artifact_iteration]),
-                                artifact_iteration,
+                                pd.read_csv(files[current_iteration]),
+                                int(current_iteration),
                             ),
                         )
                         for group, surrogate_session, files in selected_surrogates
-                        if artifact_iteration in files
+                        for current_iteration in selected_artifact_iterations
+                        if current_iteration in files
                     ]
-                    if len(available_at_iteration) < len(selected_surrogates):
-                        missing_names = [
-                            group["name"] if group is not None else "Ungrouped"
-                            for group, _surrogate_session, files in selected_surrogates
-                            if artifact_iteration not in files
-                        ]
+                    missing_artifacts = [
+                        (
+                            group["name"] if group is not None else "Ungrouped",
+                            int(current_iteration),
+                        )
+                        for group, _surrogate_session, files in selected_surrogates
+                        for current_iteration in selected_artifact_iterations
+                        if current_iteration not in files
+                    ]
+                    if missing_artifacts:
                         st.caption(
-                            "No artifact at this iteration for: " + ", ".join(missing_names)
+                            "No artifact for: "
+                            + ", ".join(
+                                f"{name} iteration {iteration}"
+                                for name, iteration in missing_artifacts[:8]
+                            )
+                            + (
+                                f"; {len(missing_artifacts) - 8} more"
+                                if len(missing_artifacts) > 8 else ""
+                            )
                         )
                     predictions_frames = [
                         predictions
-                        for _group, _surrogate_session, predictions in available_at_iteration
+                        for _iteration, _group, _surrogate_session, predictions
+                        in available_artifacts
                     ]
                     if not predictions_frames or all(
                         predictions.empty for predictions in predictions_frames
                     ):
                         st.info(
                             "No surrogate prediction rows are available for the "
-                            "selected artifact iteration."
+                            "selected artifact iterations."
                         )
                         return
                     dimensions = [
@@ -30000,7 +30939,7 @@ def render_bo_session_app() -> None:
                         [x_name, y_name, z_name],
                         key_prefix=(
                             f"bo_surrogate_parameter_crop_{surrogate_state_prefix}_"
-                            f"{artifact_iteration}_{value}_{view}_{x_name}_"
+                            f"{artifact_iteration_token}_{value}_{view}_{x_name}_"
                             f"{y_name or 'none'}_{z_name or 'none'}_"
                             f"{surrogate_2d_slice_token}"
                         ),
@@ -30147,6 +31086,151 @@ def render_bo_session_app() -> None:
                         st.session_state[
                             surrogate_observed_points_preference_key
                         ] = surrogate_show_observed_points
+                    surrogate_show_2d_contours = False
+                    if view == "2D map":
+                        surrogate_2d_contours_key = (
+                            f"{surrogate_state_prefix}_show_2d_contours"
+                        )
+                        surrogate_2d_contours_preference_key = (
+                            f"{surrogate_state_prefix}_pref_show_2d_contours"
+                        )
+                        _initialize_preference(
+                            surrogate_2d_contours_preference_key,
+                            surrogate_2d_contours_key,
+                            default=False,
+                        )
+                        _capture_widget_preference(
+                            surrogate_2d_contours_key,
+                            surrogate_2d_contours_preference_key,
+                        )
+                        st.session_state[surrogate_2d_contours_key] = bool(
+                            st.session_state.get(
+                                surrogate_2d_contours_preference_key,
+                                False,
+                            )
+                        )
+                        surrogate_show_2d_contours = st.checkbox(
+                            "Show contour lines",
+                            value=False,
+                            key=surrogate_2d_contours_key,
+                            help=(
+                                "Overlays black contour lines on surrogate 2D maps "
+                                "for static publication figures."
+                            ),
+                        )
+                        st.session_state[surrogate_2d_contours_preference_key] = (
+                            surrogate_show_2d_contours
+                        )
+                    surrogate_show_swv_traces = False
+                    surrogate_swv_iteration_mode = "Current iteration"
+                    surrogate_swv_trace_type = "Corrected"
+                    surrogate_swv_voltage_min = None
+                    surrogate_swv_voltage_max = None
+                    surrogate_swv_current_min = None
+                    surrogate_swv_current_max = None
+                    if view in ("2D map", "3D tensor"):
+                        surrogate_swv_columns = st.columns(3)
+                        surrogate_show_swv_traces = surrogate_swv_columns[0].checkbox(
+                            "Show SWV traces below surrogate plots",
+                            value=False,
+                            key=f"{surrogate_state_prefix}_show_swv_traces",
+                            help=(
+                                "Adds the SWV trace for the chosen BO iteration "
+                                "below each rendered surrogate map or tensor."
+                            ),
+                        )
+                        surrogate_swv_iteration_mode = surrogate_swv_columns[1].selectbox(
+                            "SWV iteration",
+                            ["Current iteration", "Selected next iteration"],
+                            key=f"{surrogate_state_prefix}_swv_iteration_mode",
+                            disabled=not surrogate_show_swv_traces,
+                        )
+                        surrogate_swv_trace_type = surrogate_swv_columns[2].selectbox(
+                            "SWV trace type",
+                            [
+                                "Corrected",
+                                "Normalized corrected",
+                                "Raw",
+                                "Offset raw",
+                                "Normalized raw",
+                            ],
+                            key=f"{surrogate_state_prefix}_swv_trace_type",
+                            disabled=not surrogate_show_swv_traces,
+                        )
+                        if surrogate_show_swv_traces:
+                            analysis_settings = _bo_analysis_settings(session["config"])
+                            swv_crop_columns = st.columns(4)
+                            surrogate_swv_voltage_min = float(
+                                swv_crop_columns[0].number_input(
+                                    "SWV voltage crop min (V)",
+                                    value=float(analysis_settings["crop_min_v"]),
+                                    step=0.01,
+                                    format="%.4f",
+                                    key=f"{surrogate_state_prefix}_swv_voltage_min",
+                                )
+                            )
+                            surrogate_swv_voltage_max = float(
+                                swv_crop_columns[1].number_input(
+                                    "SWV voltage crop max (V)",
+                                    value=float(analysis_settings["crop_max_v"]),
+                                    step=0.01,
+                                    format="%.4f",
+                                    key=f"{surrogate_state_prefix}_swv_voltage_max",
+                                )
+                            )
+                            if surrogate_swv_voltage_min > surrogate_swv_voltage_max:
+                                st.warning(
+                                    "SWV voltage crop min is greater than max; "
+                                    "applying the bounds in ascending order."
+                                )
+                                surrogate_swv_voltage_min, surrogate_swv_voltage_max = (
+                                    surrogate_swv_voltage_max,
+                                    surrogate_swv_voltage_min,
+                                )
+                            manual_surrogate_swv_current = swv_crop_columns[2].checkbox(
+                                "Set SWV current range",
+                                value=False,
+                                key=f"{surrogate_state_prefix}_swv_manual_current",
+                            )
+                            current_defaults = (
+                                (-0.2, 1.2)
+                                if surrogate_swv_trace_type in {
+                                    "Normalized corrected",
+                                    "Normalized raw",
+                                }
+                                else (-1.0, 1.0)
+                            )
+                            surrogate_swv_current_min = float(
+                                swv_crop_columns[2].number_input(
+                                    "SWV current min",
+                                    value=float(current_defaults[0]),
+                                    step=0.1,
+                                    format="%.4f",
+                                    key=f"{surrogate_state_prefix}_swv_current_min",
+                                    disabled=not manual_surrogate_swv_current,
+                                )
+                            )
+                            surrogate_swv_current_max = float(
+                                swv_crop_columns[3].number_input(
+                                    "SWV current max",
+                                    value=float(current_defaults[1]),
+                                    step=0.1,
+                                    format="%.4f",
+                                    key=f"{surrogate_state_prefix}_swv_current_max",
+                                    disabled=not manual_surrogate_swv_current,
+                                )
+                            )
+                            if manual_surrogate_swv_current:
+                                if surrogate_swv_current_min >= surrogate_swv_current_max:
+                                    st.warning(
+                                        "SWV current minimum must be less than the "
+                                        "maximum; autoscale is being used."
+                                    )
+                                    surrogate_swv_current_min = None
+                                    surrogate_swv_current_max = None
+                            else:
+                                surrogate_swv_current_min = None
+                                surrogate_swv_current_max = None
                     source_columns = [
                         _surrogate_pool_source_column(predictions)
                         for predictions in predictions_frames
@@ -30387,7 +31471,7 @@ def render_bo_session_app() -> None:
                         surrogate_state_prefix,
                         surrogate_group_ids_tuple,
                         "ungrouped" if not surrogate_group_ids_tuple else "grouped",
-                        artifact_iteration,
+                        tuple(selected_artifact_iterations),
                         value,
                         view,
                         x_name,
@@ -30408,6 +31492,14 @@ def render_bo_session_app() -> None:
                         surrogate_log_frequency,
                         surrogate_show_iteration_path,
                         surrogate_show_observed_points,
+                        surrogate_show_2d_contours,
+                        surrogate_show_swv_traces,
+                        surrogate_swv_iteration_mode,
+                        surrogate_swv_trace_type,
+                        surrogate_swv_voltage_min,
+                        surrogate_swv_voltage_max,
+                        surrogate_swv_current_min,
+                        surrogate_swv_current_max,
                         surrogate_show_local_pool,
                         surrogate_gif_duration,
                     )
@@ -30433,7 +31525,13 @@ def render_bo_session_app() -> None:
                             f"plots for this selection{large_plot_note}."
                         )
                         return
-                    for group, surrogate_session, predictions in available_at_iteration:
+                    rendered_group_iteration_headings: set[tuple[Any, int]] = set()
+                    for (
+                        current_artifact_iteration,
+                        group,
+                        surrogate_session,
+                        predictions,
+                    ) in available_artifacts:
                         surrogate_group_id = group["id"] if group is not None else "ungrouped"
                         plot_prediction_source = _apply_numeric_slice(
                             predictions,
@@ -30460,11 +31558,29 @@ def render_bo_session_app() -> None:
                         group_name = (
                             group["name"] if group is not None else "Session"
                         )
-                        if len(available_at_iteration) > 1 and group is not None:
-                            st.markdown(
-                                f"#### {group['name']} "
-                                f"(channels {', '.join(map(str, group['channels']))})"
+                        heading_key = (
+                            surrogate_group_id,
+                            int(current_artifact_iteration),
+                        )
+                        if (
+                            heading_key not in rendered_group_iteration_headings
+                            and (
+                                len(selected_artifact_iterations) > 1
+                                or surrogate_group_count > 1
                             )
+                        ):
+                            rendered_group_iteration_headings.add(heading_key)
+                            if group is not None:
+                                st.markdown(
+                                    f"#### {group['name']} "
+                                    f"(channels {', '.join(map(str, group['channels']))}) "
+                                    f"| artifact iteration {current_artifact_iteration}"
+                                )
+                            else:
+                                st.markdown(
+                                    "#### Session | artifact iteration "
+                                    f"{current_artifact_iteration}"
+                                )
                         if plot_predictions.empty:
                             st.info(
                                 f"The current parameter crop excludes all {group_name} "
@@ -30487,14 +31603,16 @@ def render_bo_session_app() -> None:
                         st.markdown(f"##### {group_name} animation")
                         surrogate_gif_key = (
                             f"{surrogate_output_prefix}_gif_{surrogate_group_id}_"
-                            f"{view}_{value}_{x_name}_{y_name}_{z_name}_"
+                            f"{current_artifact_iteration}_{view}_{value}_"
+                            f"{x_name}_{y_name}_{z_name}_"
                             f"{surrogate_crop_token}_{surrogate_2d_slice_token}_"
                             f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
-                            f"obs{int(bool(surrogate_show_observed_points))}"
+                            f"obs{int(bool(surrogate_show_observed_points))}_"
+                            f"contour{int(bool(surrogate_show_2d_contours))}"
                         )
                         surrogate_gif_camera_storage_key = (
                             f"surrogate_3d_{surrogate_group_id}_"
-                            f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
+                            f"{current_artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
                             f"log{int(bool(surrogate_log_frequency))}_"
                             f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}"
                             if view == "3D tensor"
@@ -30502,10 +31620,11 @@ def render_bo_session_app() -> None:
                         )
                         surrogate_static_preview_key = (
                             f"{surrogate_output_prefix}_static_preview_{surrogate_group_id}_"
-                            f"{artifact_iteration}_{value}_{view}_{x_name}_{y_name}_"
+                            f"{current_artifact_iteration}_{value}_{view}_{x_name}_{y_name}_"
                             f"{z_name}_{surrogate_crop_token}_{surrogate_2d_slice_token}_"
                             f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
-                            f"obs{int(bool(surrogate_show_observed_points))}"
+                            f"obs{int(bool(surrogate_show_observed_points))}_"
+                            f"contour{int(bool(surrogate_show_2d_contours))}"
                         )
                         if st.button(
                             f"Generate {group_name} GIF",
@@ -30612,6 +31731,7 @@ def render_bo_session_app() -> None:
                                             observed_slice_value=surrogate_2d_slice_value,
                                             title_note=surrogate_2d_title_note,
                                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
+                                            show_2d_contours=surrogate_show_2d_contours,
                                         )
     
                                 gif_bytes = _figures_to_gif(
@@ -30621,7 +31741,20 @@ def render_bo_session_app() -> None:
                                         500,
                                         int(plot_width_percent),
                                     ),
-                                    plotly_height=plot_3d_height,
+                                    plotly_height=(
+                                        plot_3d_height
+                                        if view == "3D tensor"
+                                        else plot_2d_height
+                                    ),
+                                    matplotlib_width=max(
+                                        500,
+                                        int(plot_width_percent),
+                                    ),
+                                    matplotlib_height=(
+                                        plot_2d_height
+                                        if view == "2D map"
+                                        else plot_1d_height
+                                    ),
                                     plotly_camera=surrogate_gif_camera,
                                     total_frames=len(group_files),
                                     progress_callback=(
@@ -30654,8 +31787,35 @@ def render_bo_session_app() -> None:
                                 st.error(
                                     f"{group_name} GIF generation failed: {exc}"
                                 )
+                        gif_bytes = st.session_state.get(surrogate_gif_key)
+                        if gif_bytes:
+                            _sized_plot_container(
+                                st,
+                                plot_width_percent,
+                            ).image(
+                                gif_bytes,
+                                width=int(plot_width_percent),
+                            )
+                            safe_gif_name = re.sub(
+                                r"[^A-Za-z0-9._-]+",
+                                "_",
+                                group_name,
+                            ).strip("_")
+                            st.download_button(
+                                f"Download {group_name} GIF",
+                                data=gif_bytes,
+                                file_name=(
+                                    f"surrogate_{safe_gif_name}_{view}.gif"
+                                ),
+                                mime="image/gif",
+                                key=(
+                                    f"{surrogate_gif_key}_download_"
+                                    f"{safe_gif_name}"
+                                ),
+                            )
                         surrogate_figure = _plot_surrogate(
-                            surrogate_session, plot_predictions, artifact_iteration,
+                            surrogate_session, plot_predictions,
+                            current_artifact_iteration,
                             value, view, x_name, y_name, z_name,
                             tensor_height=plot_3d_height,
                             dot_size=plot_dot_size,
@@ -30672,17 +31832,131 @@ def render_bo_session_app() -> None:
                             observed_slice_value=surrogate_2d_slice_value,
                             title_note=surrogate_2d_title_note,
                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
+                            show_2d_contours=surrogate_show_2d_contours,
                         )
+
+                        def render_surrogate_swv_traces() -> None:
+                            if not surrogate_show_swv_traces:
+                                return
+                            swv_iteration = (
+                                int(current_artifact_iteration) + 1
+                                if surrogate_swv_iteration_mode == "Selected next iteration"
+                                else int(current_artifact_iteration)
+                            )
+                            swv_observation = next(
+                                (
+                                    obs for obs in surrogate_session["observations"]
+                                    if int(obs.get("iteration", 0)) == swv_iteration
+                                ),
+                                None,
+                            )
+                            if swv_observation is None:
+                                st.caption(
+                                    f"No SWV observation is available for iteration {swv_iteration}."
+                                )
+                                return
+                            swv_quality = swv_observation.get("quality") or {}
+                            swv_q_value = _finite_float(
+                                swv_observation.get("Q_run", swv_quality.get("Q_run"))
+                            )
+                            swv_q_label = (
+                                f"Q={swv_q_value:.4g}"
+                                if swv_q_value is not None
+                                else "Q=unknown"
+                            )
+                            swv_trace_items = _trace_paths(full_session, swv_observation)
+                            if group is not None:
+                                swv_channels = [
+                                    str(channel)
+                                    for channel in group.get("channels", [])
+                                ]
+                            else:
+                                swv_channels = sorted(
+                                    {
+                                        _trace_channel_key(item)
+                                        for item in swv_trace_items
+                                    },
+                                    key=_channel_sort_key,
+                                )
+                            swv_corrected = surrogate_swv_trace_type != "Raw"
+                            swv_offset_to_baseline = (
+                                surrogate_swv_trace_type == "Offset raw"
+                            )
+                            swv_normalize_to_peak = surrogate_swv_trace_type in {
+                                "Normalized corrected",
+                                "Normalized raw",
+                            }
+                            swv_corrected_trace_key = (
+                                "raw_current"
+                                if surrogate_swv_trace_type == "Offset raw"
+                                else "corrected_current"
+                                if surrogate_swv_trace_type == "Normalized raw"
+                                else "smoothed_corrected_current"
+                            )
+                            swv_figure, swv_errors = _plot_traces(
+                                full_session,
+                                swv_observation,
+                                swv_corrected,
+                                swv_channels,
+                                trace_analysis,
+                                correction_label,
+                                overlaid=True,
+                                trace_items=swv_trace_items,
+                                normalize_to_peak=swv_normalize_to_peak,
+                                corrected_trace_key=swv_corrected_trace_key,
+                                offset_to_baseline=swv_offset_to_baseline,
+                                voltage_min=surrogate_swv_voltage_min,
+                                voltage_max=surrogate_swv_voltage_max,
+                            )
+                            if (
+                                surrogate_swv_current_min is not None
+                                and surrogate_swv_current_max is not None
+                                and swv_figure.axes
+                            ):
+                                swv_figure.axes[0].set_ylim(
+                                    surrogate_swv_current_min,
+                                    surrogate_swv_current_max,
+                                )
+                            st.markdown(
+                                f"##### SWV traces | {surrogate_swv_iteration_mode.lower()} "
+                                f"{swv_iteration} | {swv_q_label}"
+                            )
+                            swv_trace_type_token = _safe_download_stem(
+                                surrogate_swv_trace_type
+                            )
+                            _render_downloadable_pyplot(
+                                st,
+                                swv_figure,
+                                key=(
+                                    f"bo_surrogate_swv_{surrogate_group_id}_"
+                                    f"{current_artifact_iteration}_{swv_iteration}_"
+                                    f"{swv_trace_type_token}_{value}_{view}_"
+                                    f"{x_name}_{y_name}_{z_name}_"
+                                    f"{surrogate_crop_token}_{surrogate_2d_slice_token}_"
+                                    f"v{surrogate_swv_voltage_min:g}_{surrogate_swv_voltage_max:g}_"
+                                    f"i{surrogate_swv_current_min if surrogate_swv_current_min is not None else 'auto'}_"
+                                    f"{surrogate_swv_current_max if surrogate_swv_current_max is not None else 'auto'}"
+                                ),
+                                file_stem=(
+                                    f"surrogate_{group_name}_{current_artifact_iteration}_"
+                                    f"swv_iteration_{swv_iteration}_{swv_trace_type_token}_"
+                                    f"v{surrogate_swv_voltage_min:g}_{surrogate_swv_voltage_max:g}"
+                                ),
+                                width_percent=plot_width_percent,
+                            )
+                            for error in swv_errors:
+                                st.warning(error)
+
                         if view == "3D tensor":
                             camera_storage_key = (
                                 f"surrogate_3d_{surrogate_group_id}_"
-                                f"{artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
+                                f"{current_artifact_iteration}_{value}_{x_name}_{y_name}_{z_name}_"
                                 f"log{int(bool(surrogate_log_frequency))}_"
                                 f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}"
                             )
                             surrogate_3d_plot_key = (
                                 f"bo_surrogate_3d_{surrogate_group_id}_"
-                                f"{artifact_iteration}_{value}_{x_name}_{y_name}_"
+                                f"{current_artifact_iteration}_{value}_{x_name}_{y_name}_"
                                 f"{z_name}_{surrogate_crop_token}_"
                                 f"{surrogate_2d_slice_token}_{surrogate_3d_slice_token}_"
                                 f"{surrogate_3d_slice_sweep_token}"
@@ -30710,13 +31984,14 @@ def render_bo_session_app() -> None:
                                     surrogate_figure,
                                     key=f"{surrogate_3d_plot_key}_rotate",
                                     file_stem=(
-                                        f"surrogate_{group_name}_{artifact_iteration}_"
+                                        f"surrogate_{group_name}_{current_artifact_iteration}_"
                                         f"{value}_3d_tensor_{x_name}_{y_name}_{z_name}"
                                     ),
                                     width_percent=plot_width_percent,
                                     export_height=plot_3d_height,
                                     camera_storage_key=camera_storage_key,
                                 )
+                            render_surrogate_swv_traces()
                             if surrogate_click_pick_enabled and plotly_events is None:
                                 st.caption(
                                     "Mouse click slice picking requires "
@@ -30759,10 +32034,11 @@ def render_bo_session_app() -> None:
                             ):
                                 slice_plot_key = (
                                     f"bo_surrogate_highlighted_2d_slice_"
-                                    f"{surrogate_group_id}_{artifact_iteration}_{value}_"
+                                    f"{surrogate_group_id}_{current_artifact_iteration}_{value}_"
                                     f"{x_name}_{y_name}_{z_name}_{surrogate_crop_token}_"
                                     f"{surrogate_3d_slice_token}_{surrogate_3d_slice_sweep_token}_"
-                                    f"obs{int(bool(surrogate_show_observed_points))}"
+                                    f"obs{int(bool(surrogate_show_observed_points))}_"
+                                    f"contour{int(bool(surrogate_show_2d_contours))}"
                                 )
                                 requested_slice_values = (
                                     surrogate_3d_slice_sweep_values
@@ -30804,7 +32080,7 @@ def render_bo_session_app() -> None:
                                             slice_figure = _plot_surrogate(
                                                 surrogate_session,
                                                 slice_predictions,
-                                                artifact_iteration,
+                                                current_artifact_iteration,
                                                 value,
                                                 "2D map",
                                                 slice_axes[0],
@@ -30825,6 +32101,7 @@ def render_bo_session_app() -> None:
                                                     requested_slice_value,
                                                 ),
                                                 draw_full_cube_edges=surrogate_draw_full_cube_edges,
+                                                show_2d_contours=surrogate_show_2d_contours,
                                             )
                                             slice_color, _plotly_color = _slice_highlight_color(
                                                 slice_color_index,
@@ -30896,7 +32173,7 @@ def render_bo_session_app() -> None:
                                                 f"{slice_plot_index}_{slice_value_label:g}"
                                             ),
                                             file_stem=(
-                                                f"surrogate_{group_name}_{artifact_iteration}_"
+                                                f"surrogate_{group_name}_{current_artifact_iteration}_"
                                                 f"{value}_highlighted_slice_"
                                                 f"{slice_axes[0]}_{slice_axes[1]}_"
                                                 f"{surrogate_3d_slice_axis}_"
@@ -30927,17 +32204,19 @@ def render_bo_session_app() -> None:
                                 surrogate_figure,
                                 key=(
                                     f"bo_surrogate_plot_{surrogate_group_id}_"
-                                    f"{artifact_iteration}_{value}_{view}_"
+                                    f"{current_artifact_iteration}_{value}_{view}_"
                                     f"{x_name}_{y_name}_{z_name}_{surrogate_crop_token}_"
                                     f"{surrogate_2d_slice_token}_"
-                                    f"obs{int(bool(surrogate_show_observed_points))}"
+                                    f"obs{int(bool(surrogate_show_observed_points))}_"
+                                    f"contour{int(bool(surrogate_show_2d_contours))}"
                                 ),
                                 file_stem=(
-                                    f"surrogate_{group_name}_{artifact_iteration}_"
+                                    f"surrogate_{group_name}_{current_artifact_iteration}_"
                                     f"{value}_{view}_{x_name}_{y_name or 'none'}"
                                 ),
                                 width_percent=plot_width_percent,
                             )
+                            render_surrogate_swv_traces()
                             if (
                                 view == "2D map"
                                 and surrogate_2d_slice_column is not None
@@ -30974,7 +32253,7 @@ def render_bo_session_app() -> None:
                                         sweep_figure = _plot_surrogate(
                                             surrogate_session,
                                             sweep_predictions,
-                                            artifact_iteration,
+                                            current_artifact_iteration,
                                             value,
                                             view,
                                             x_name,
@@ -30997,20 +32276,22 @@ def render_bo_session_app() -> None:
                                                 sweep_value,
                                             ),
                                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
+                                            show_2d_contours=surrogate_show_2d_contours,
                                         )
                                         _render_downloadable_pyplot(
                                             st,
                                             sweep_figure,
                                             key=(
                                                 f"bo_surrogate_slice_sweep_"
-                                                f"{surrogate_group_id}_{artifact_iteration}_"
+                                                f"{surrogate_group_id}_{current_artifact_iteration}_"
                                                 f"{value}_{x_name}_{y_name}_"
                                                 f"{surrogate_crop_token}_{sweep_token}_"
                                                 f"{surrogate_2d_sweep_token}_"
-                                                f"obs{int(bool(surrogate_show_observed_points))}"
+                                                f"obs{int(bool(surrogate_show_observed_points))}_"
+                                                f"contour{int(bool(surrogate_show_2d_contours))}"
                                             ),
                                             file_stem=(
-                                                f"surrogate_{group_name}_{artifact_iteration}_"
+                                                f"surrogate_{group_name}_{current_artifact_iteration}_"
                                                 f"{value}_{x_name}_{y_name}_{sweep_token}"
                                             ),
                                             width_percent=plot_width_percent,
@@ -31025,7 +32306,7 @@ def render_bo_session_app() -> None:
                                         value=False,
                                         key=(
                                             f"bo_surrogate_2d_stack_show_{surrogate_group_id}_"
-                                            f"{value}_{x_name}_{y_name}"
+                                            f"{current_artifact_iteration}_{value}_{x_name}_{y_name}"
                                         ),
                                     )
                                     stack_columns = st.columns(3)
@@ -31038,7 +32319,7 @@ def render_bo_session_app() -> None:
                                         format="%.3f",
                                         key=(
                                             f"bo_surrogate_2d_stack_x_{surrogate_group_id}_"
-                                            f"{value}_{x_name}_{y_name}"
+                                            f"{current_artifact_iteration}_{value}_{x_name}_{y_name}"
                                         ),
                                         help="Fraction of map width. Positive values shift newer maps right.",
                                     )
@@ -31051,7 +32332,7 @@ def render_bo_session_app() -> None:
                                         format="%.3f",
                                         key=(
                                             f"bo_surrogate_2d_stack_y_{surrogate_group_id}_"
-                                            f"{value}_{x_name}_{y_name}"
+                                            f"{current_artifact_iteration}_{value}_{x_name}_{y_name}"
                                         ),
                                         help="Fraction of map height. Positive values shift newer maps upward.",
                                     )
@@ -31063,7 +32344,7 @@ def render_bo_session_app() -> None:
                                         step=0.05,
                                         key=(
                                             f"bo_surrogate_2d_stack_alpha_{surrogate_group_id}_"
-                                            f"{value}_{x_name}_{y_name}"
+                                            f"{current_artifact_iteration}_{value}_{x_name}_{y_name}"
                                         ),
                                         help="Older maps fade below this value.",
                                     )
@@ -31076,7 +32357,7 @@ def render_bo_session_app() -> None:
                                             _plot_chronological_surrogate_2d_stack(
                                                 surrogate_session,
                                                 group_files,
-                                                artifact_iteration,
+                                                current_artifact_iteration,
                                                 value,
                                                 x_name,
                                                 y_name,
@@ -31115,12 +32396,12 @@ def render_bo_session_app() -> None:
                                             stack_figure,
                                             key=(
                                                 f"bo_surrogate_2d_stack_{surrogate_group_id}_"
-                                                f"{artifact_iteration}_{value}_{x_name}_"
+                                                f"{current_artifact_iteration}_{value}_{x_name}_"
                                                 f"{y_name}_{surrogate_crop_token}_"
                                                 f"{surrogate_2d_slice_token}"
                                             ),
                                             file_stem=(
-                                                f"surrogate_{group_name}_{artifact_iteration}_"
+                                                f"surrogate_{group_name}_{current_artifact_iteration}_"
                                                 f"{value}_chronological_2d_stack_{x_name}_{y_name}"
                                             ),
                                             width_percent=plot_width_percent,
@@ -31156,35 +32437,16 @@ def render_bo_session_app() -> None:
                                 + 1
                             )
                             st.caption(
-                                f"Selected iteration {artifact_iteration + 1}: "
+                                f"Selected iteration {current_artifact_iteration + 1}: "
                                 f"eligible acquisition rank {selected_rank} of "
                                 f"{len(eligible_predictions)}."
                             )
                     with st.expander(
                         f"Candidate predictions — "
-                        f"{group['name'] if group is not None else 'session'}"
+                        f"{group['name'] if group is not None else 'session'} "
+                        f"— artifact iteration {current_artifact_iteration}"
                     ):
                         st.dataframe(predictions, use_container_width=True, hide_index=True)
-                    gif_bytes = st.session_state.get(surrogate_gif_key)
-                    if gif_bytes:
-                        st.image(gif_bytes)
-                        safe_gif_name = re.sub(
-                            r"[^A-Za-z0-9._-]+",
-                            "_",
-                            group_name,
-                        ).strip("_")
-                        st.download_button(
-                            f"Download {group_name} GIF",
-                            data=gif_bytes,
-                            file_name=(
-                                f"surrogate_{safe_gif_name}_{view}.gif"
-                            ),
-                            mime="image/gif",
-                            key=(
-                                f"{surrogate_gif_key}_download_"
-                                f"{safe_gif_name}"
-                            ),
-                        )
                     st.divider()
                 _render_q_equation(
                     session["config"],
