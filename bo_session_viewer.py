@@ -3257,6 +3257,7 @@ def _plot_hyperparameter_response(
     voxel_internal_point_count: int = 1,
     slice_axis: str | None = None,
     slice_value: float | None = None,
+    draw_cube_edges: bool = False,
 ) -> go.Figure:
     response_colorscale = "Plasma"
 
@@ -3412,6 +3413,34 @@ def _plot_hyperparameter_response(
             slice_axis=slice_axis,
             slice_value=slice_value,
         )
+        if draw_cube_edges:
+            x_bounds, y_bounds, z_bounds = _hyperparameter_response_voxel_bounds(
+                grouped,
+                x_axis=x_axis,
+                y_axis=y_axis,
+                z_axis=z_axis,
+            )
+            _add_plotly_cube_edges(
+                fig,
+                grouped,
+                x_axis,
+                y_axis,
+                z_axis,
+                axis_ranges={
+                    x_axis: (
+                        min(edge[0] for edge in x_bounds.values()),
+                        max(edge[1] for edge in x_bounds.values()),
+                    ),
+                    y_axis: (
+                        min(edge[0] for edge in y_bounds.values()),
+                        max(edge[1] for edge in y_bounds.values()),
+                    ),
+                    z_axis: (
+                        min(edge[0] for edge in z_bounds.values()),
+                        max(edge[1] for edge in z_bounds.values()),
+                    ),
+                },
+            )
         fig.update_layout(
             title=f"{aggregate} {metric_label} by hyperparameters",
             scene={
@@ -3654,6 +3683,9 @@ def _plot_hyperparameter_parallel_coordinates(
     x_positions = list(range(len(plot_columns)))
     line_width = max(0.5, min(10.0, float(line_width)))
     line_opacity = max(0.05, min(1.0, float(line_opacity)))
+    text_size = _plot_text_size_points()
+    tick_font_size = max(1, round(text_size, 2))
+    axis_label_font_size = max(1, round(text_size * 1.2, 2))
     metric_denominator = (
         color_max - color_min
         if color_min is not None and color_max is not None
@@ -3731,19 +3763,21 @@ def _plot_hyperparameter_parallel_coordinates(
                 x=axis_index - 0.045,
                 y=tick_y,
                 text=f"{float(tick_value):.3g}",
+                name="bo_parallel_tick_label",
                 showarrow=False,
                 xanchor="right",
                 yanchor="middle",
-                font={"size": 10, "color": "rgba(30,30,30,0.72)"},
+                font={"size": tick_font_size, "color": "rgba(30,30,30,0.72)"},
             )
         fig.add_annotation(
             x=axis_index,
             y=1.08,
             text=label,
+            name="bo_parallel_axis_label",
             showarrow=False,
             xanchor="center",
             yanchor="bottom",
-            font={"size": 12},
+            font={"size": axis_label_font_size},
         )
 
     colorbar_marker: dict[str, Any] = {
@@ -4462,15 +4496,38 @@ def _chronological_points(
     return pd.DataFrame(rows), transitions
 
 
+def _chronological_iteration_markers(points: pd.DataFrame) -> list[tuple[float, str]]:
+    if points.empty or "position" not in points.columns or "iteration" not in points.columns:
+        return []
+    marker_points = points[["position", "iteration"]].dropna().drop_duplicates()
+    marker_points["position"] = pd.to_numeric(marker_points["position"], errors="coerce")
+    marker_points["iteration"] = pd.to_numeric(marker_points["iteration"], errors="coerce")
+    marker_points = marker_points.dropna().sort_values("position")
+    markers: list[tuple[float, str]] = []
+    for _row_index, row in marker_points.iterrows():
+        position = float(row["position"])
+        iteration = float(row["iteration"])
+        label = (
+            f"Iteration {int(iteration)}"
+            if np.isclose(iteration, int(iteration))
+            else f"Iteration {iteration:g}"
+        )
+        markers.append((position, label))
+    return markers
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_chronological(
     points: pd.DataFrame,
     transitions: list[tuple[float, str]],
     metric_label: str,
     layout: str,
+    show_fluid_exchange_lines: bool = True,
+    show_iteration_lines: bool = False,
 ):
     colors = {"buffer": "#1f77b4", "target": "#ff7f0e"}
     channels = list(dict.fromkeys(points["channel"].astype(str)))
+    iteration_markers = _chronological_iteration_markers(points)
     if layout == "Separate plots":
         columns = 2 if len(channels) > 1 else 1
         rows = max(1, (len(channels) + columns - 1) // columns)
@@ -4486,9 +4543,16 @@ def _plot_chronological(
                 transition_y_max += 0.5
         transition_x = []
         transition_y = []
-        for x_position, _label in transitions:
-            transition_x.extend([x_position, x_position, None])
-            transition_y.extend([transition_y_min, transition_y_max, None])
+        if show_fluid_exchange_lines:
+            for x_position, _label in transitions:
+                transition_x.extend([x_position, x_position, None])
+                transition_y.extend([transition_y_min, transition_y_max, None])
+        iteration_x = []
+        iteration_y = []
+        if show_iteration_lines:
+            for x_position, _label in iteration_markers:
+                iteration_x.extend([x_position, x_position, None])
+                iteration_y.extend([transition_y_min, transition_y_max, None])
         fig = make_subplots(
             rows=rows,
             cols=columns,
@@ -4513,6 +4577,23 @@ def _plot_chronological(
                             "color": "rgba(90,107,132,0.45)",
                             "dash": "dash",
                             "width": 1.2,
+                        },
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ),
+                    row=row,
+                    col=column,
+                )
+            if iteration_x:
+                fig.add_trace(
+                    go.Scatter(
+                        x=iteration_x,
+                        y=iteration_y,
+                        mode="lines",
+                        line={
+                            "color": "rgba(46,46,46,0.22)",
+                            "dash": "dot",
+                            "width": 1,
                         },
                         showlegend=False,
                         hoverinfo="skip",
@@ -4613,20 +4694,40 @@ def _plot_chronological(
                     "Batch %{customdata[2]} | Channel %{customdata[3]}<extra></extra>"
                 ),
             ))
-    for x_position, label in transitions:
-        color = "#2ca02c" if label.startswith("Buffer") else "#9467bd"
-        fig.add_vline(x=x_position, line_dash="dash", line_color=color, line_width=1.5)
-        fig.add_annotation(
-            x=x_position,
-            y=1,
-            yref="paper",
-            text=label,
-            showarrow=False,
-            textangle=-90,
-            xanchor="left",
-            yanchor="top",
-            font={"size": 10, "color": color},
-        )
+    if show_fluid_exchange_lines:
+        for x_position, label in transitions:
+            color = "#2ca02c" if label.startswith("Buffer") else "#9467bd"
+            fig.add_vline(x=x_position, line_dash="dash", line_color=color, line_width=1.5)
+            fig.add_annotation(
+                x=x_position,
+                y=1,
+                yref="paper",
+                text=label,
+                showarrow=False,
+                textangle=-90,
+                xanchor="left",
+                yanchor="top",
+                font={"size": 10, "color": color},
+            )
+    if show_iteration_lines:
+        for x_position, label in iteration_markers:
+            fig.add_vline(
+                x=x_position,
+                line_dash="dot",
+                line_color="rgba(46,46,46,0.28)",
+                line_width=1,
+            )
+            fig.add_annotation(
+                x=x_position,
+                y=1,
+                yref="paper",
+                text=label,
+                showarrow=False,
+                textangle=-90,
+                xanchor="left",
+                yanchor="top",
+                font={"size": 9, "color": "rgba(46,46,46,0.68)"},
+            )
     fig.update_layout(
         title=f"Chronological buffer/target measurements | {metric_label}",
         xaxis_title="Chronological measurement order",
@@ -4661,6 +4762,21 @@ def _real_metric_points(
     rows = []
     for observation in observations:
         params = observation.get("params") or {}
+        observation_metadata = {
+            column: observation.get(column)
+            for column in (
+                "run_label",
+                "exploration",
+                "initial_random_points",
+                "gp_falloff_parameter",
+                "gp_falloff_value",
+            )
+            if observation.get(column) is not None
+        }
+        if "exploration" not in observation_metadata and observation.get("simulation_exploration") is not None:
+            observation_metadata["exploration"] = observation.get("simulation_exploration")
+        if "run_label" not in observation_metadata and observation.get("simulation_run_label") is not None:
+            observation_metadata["run_label"] = observation.get("simulation_run_label")
         if source == "observation":
             per_iteration = []
             quality = observation.get("quality") or {}
@@ -4700,6 +4816,7 @@ def _real_metric_points(
                     for name in PARAMETERS
                     if params.get(name) is not None
                 })
+                row.update(observation_metadata)
                 per_iteration.append(row)
             if average_channels and per_iteration:
                 averaged = dict(per_iteration[0])
@@ -4730,6 +4847,7 @@ def _real_metric_points(
                     for name in PARAMETERS
                     if params.get(name) is not None
                 })
+                row.update(observation_metadata)
                 rows.append(row)
             continue
         per_iteration = []
@@ -4772,6 +4890,7 @@ def _real_metric_points(
                 for name in PARAMETERS
                 if params.get(name) is not None
             })
+            row.update(observation_metadata)
             per_iteration.append(row)
         if average_channels and per_iteration:
             averaged = dict(per_iteration[0])
@@ -5718,6 +5837,7 @@ def _plot_real_channel_iteration_heatmap(
     color_value_label: str | None = None,
     value_range: tuple[float, float] | None = None,
     value_colorscale: str = "Viridis",
+    metadata_hierarchy: Sequence[str] | None = None,
 ) -> go.Figure:
     color_value_label = color_value_label or metric_label
     required_columns = {"channel", "iteration", "value", color_value_column}
@@ -5788,9 +5908,120 @@ def _plot_real_channel_iteration_heatmap(
         fig.update_layout(height=440)
         return fig
 
+    def row_metadata(channel_label: str) -> dict[str, Any]:
+        rows = work.loc[work["__channel_label"].astype(str) == str(channel_label)]
+        metadata: dict[str, Any] = {
+            "label": str(channel_label),
+            "channel": str(channel_label).split("|", 1)[0].strip(),
+            "exploration": None,
+            "initial": None,
+            "gp_falloff": None,
+            "gp_parameter": "",
+            "repeat": None,
+        }
+        if rows.empty:
+            return metadata
+
+        def first_numeric(column: str) -> float | None:
+            if column not in rows.columns:
+                return None
+            values = pd.to_numeric(rows[column], errors="coerce")
+            values = values[np.isfinite(values)]
+            return float(values.iloc[0]) if not values.empty else None
+
+        metadata["exploration"] = first_numeric("exploration")
+        metadata["initial"] = first_numeric("initial_random_points")
+        metadata["gp_falloff"] = first_numeric("gp_falloff_value")
+        if "gp_falloff_parameter" in rows.columns:
+            parameters = rows["gp_falloff_parameter"].dropna().astype(str)
+            metadata["gp_parameter"] = parameters.iloc[0] if not parameters.empty else ""
+
+        text_sources = [str(channel_label)]
+        for column in ("metadata_overlay_group", "run_label", "group_name"):
+            if column in rows.columns:
+                text_sources.extend(rows[column].dropna().astype(str).unique().tolist())
+        combined_text = " | ".join(text_sources)
+        regex_specs = (
+            ("exploration", r"\bexplore(?:\s+weight)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+            ("initial", r"\binitial(?:\s+maximin(?:\s+points)?)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+            ("gp_falloff", r"\b(?:gp\s+)?(?:\w+\s+)?falloff\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+            ("repeat", r"\brep(?:eat)?\s+(\d+)(?:\s*/\s*\d+)?"),
+        )
+        for key, pattern in regex_specs:
+            if metadata.get(key) is not None:
+                continue
+            match = re.search(pattern, combined_text, flags=re.IGNORECASE)
+            if match:
+                metadata[key] = float(match.group(1))
+        if not metadata["gp_parameter"]:
+            parameter_match = re.search(
+                r"\b([A-Za-z_][\w\s]*)\s+falloff\s*=",
+                combined_text,
+                flags=re.IGNORECASE,
+            )
+            if parameter_match:
+                metadata["gp_parameter"] = parameter_match.group(1).strip()
+        if metadata["gp_falloff"] is None:
+            falloff_parameter_patterns = [
+                ("all", r"\ball\s*(?:parameters?)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+                ("frequency", r"\bfrequency\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+                ("amplitude", r"\bamplitude\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+                ("step_potential", r"\bstep[_\s-]*potential\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
+            ]
+            for parameter, pattern in falloff_parameter_patterns:
+                match = re.search(pattern, combined_text, flags=re.IGNORECASE)
+                if match:
+                    metadata["gp_parameter"] = parameter
+                    metadata["gp_falloff"] = float(match.group(1))
+                    break
+        return metadata
+
+    def numeric_sort_value(value: Any) -> tuple[int, float]:
+        numeric = _finite_float(value)
+        return (0, float(numeric)) if numeric is not None else (1, 0.0)
+
+    row_metadata_by_label = {
+        str(label): row_metadata(str(label))
+        for label in work["__channel_label"].dropna().unique().tolist()
+    }
+    sweep_metadata_present = any(
+        _finite_float(metadata.get(key)) is not None
+        for metadata in row_metadata_by_label.values()
+        for key in ("exploration", "initial", "gp_falloff")
+    )
+
+    metadata_key_options = {
+        "exploration": "Exploration",
+        "gp_falloff": "GP falloff",
+        "initial": "Initial points",
+    }
+    ordered_metadata_keys = [
+        key for key in (metadata_hierarchy or ())
+        if key in metadata_key_options
+    ]
+    ordered_metadata_keys.extend([
+        key for key in ("exploration", "gp_falloff", "initial")
+        if key not in ordered_metadata_keys
+    ])
+    ordered_metadata_keys = ordered_metadata_keys[:3]
+
+    def row_sort_key(channel_label: str) -> tuple:
+        metadata = row_metadata_by_label.get(str(channel_label), {})
+        sort_values = []
+        for metadata_key in ordered_metadata_keys:
+            if metadata_key == "gp_falloff":
+                sort_values.append(str(metadata.get("gp_parameter") or ""))
+            sort_values.append(numeric_sort_value(metadata.get(metadata_key)))
+        return (
+            *sort_values,
+            numeric_sort_value(metadata.get("repeat")),
+            _channel_sort_key(str(metadata.get("channel") or channel_label)),
+            str(channel_label),
+        )
+
     channel_labels = sorted(
         work["__channel_label"].dropna().unique().tolist(),
-        key=_channel_sort_key,
+        key=row_sort_key if sweep_metadata_present else _channel_sort_key,
     )
     iteration_values = sorted(
         float(value)
@@ -5873,90 +6104,178 @@ def _plot_real_channel_iteration_heatmap(
         int(value) if float(value).is_integer() else value
         for value in iteration_values
     ]
+    def metadata_value_label(value: Any) -> str | None:
+        numeric = _finite_float(value)
+        if numeric is None:
+            return None
+        return f"{numeric:g}"
+
+    def compact_channel_label(channel_label: str) -> str:
+        metadata = row_metadata_by_label.get(str(channel_label), {})
+        if not sweep_metadata_present:
+            return f"Ch {channel_label}" if str(channel_label).isdigit() else str(channel_label)
+        parts = []
+        gp_label = metadata_value_label(metadata.get("gp_falloff"))
+        initial_label = metadata_value_label(metadata.get("initial"))
+        repeat_label = metadata_value_label(metadata.get("repeat"))
+        channel = str(metadata.get("channel") or channel_label)
+        if gp_label is not None:
+            parts.append(f"gp={gp_label}")
+        if initial_label is not None:
+            parts.append(f"init={initial_label}")
+        if repeat_label is not None:
+            parts.append(f"rep={repeat_label}")
+        parts.append(f"ch={channel}" if channel.isdigit() else channel)
+        return " ".join(parts)
+
     display_channels = [
-        f"Ch {label}" if str(label).isdigit() else str(label)
+        compact_channel_label(str(label))
         for label in channel_labels
     ]
 
-    def row_metadata_key(channel_label: str) -> tuple[str, str] | None:
-        rows = work.loc[work["__channel_label"].astype(str) == str(channel_label)]
-        if rows.empty:
-            return None
-        for column in (
-            "metadata_overlay_value",
-            "exploration",
-            "initial_random_points",
-            "gp_falloff_value",
-        ):
-            if column not in rows.columns:
-                continue
-            values = pd.to_numeric(rows[column], errors="coerce").dropna().unique()
-            if len(values):
-                parameter = ""
-                if column == "gp_falloff_value" and "gp_falloff_parameter" in rows.columns:
-                    parameters = rows["gp_falloff_parameter"].dropna().astype(str).unique()
-                    parameter = parameters[0] if len(parameters) else ""
-                return (column, f"{parameter}:{float(values[0]):.12g}")
-        text_sources = [str(channel_label)]
-        for column in ("metadata_overlay_group", "run_label", "group_name"):
-            if column in rows.columns:
-                text_sources.extend(rows[column].dropna().astype(str).unique().tolist())
-        for text in text_sources:
-            for name, pattern in (
-                ("exploration", r"\bexplore(?:\s+weight)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
-                ("initial", r"\binitial(?:\s+maximin(?:\s+points)?)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
-                ("gp_falloff", r"\bfalloff(?:\s+\w+)?\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)"),
-            ):
-                match = re.search(pattern, text, flags=re.IGNORECASE)
-                if match:
-                    return (name, f"{float(match.group(1)):.12g}")
-        return None
-
-    metadata_keys = [row_metadata_key(label) for label in channel_labels]
-    separator_boundaries = [
-        index - 0.5
-        for index in range(1, len(metadata_keys))
-        if (
-            metadata_keys[index - 1] is not None
-            and metadata_keys[index] is not None
-            and metadata_keys[index - 1] != metadata_keys[index]
+    def metadata_group_key(channel_label: str, fields: Sequence[str]) -> tuple:
+        metadata = row_metadata_by_label.get(str(channel_label), {})
+        return tuple(
+            metadata.get(field)
+            for field in fields
         )
-    ]
+
+    separator_specs: list[tuple[float, str, float]] = []
+    if sweep_metadata_present:
+        separator_fields: list[str] = []
+        separator_levels = []
+        for index, metadata_key in enumerate(ordered_metadata_keys):
+            if metadata_key == "gp_falloff":
+                separator_fields.append("gp_parameter")
+            separator_fields.append(metadata_key)
+            color = (
+                "rgba(70,70,70,0.95)"
+                if index == 0
+                else "rgba(120,120,120,0.85)"
+                if index == 1
+                else "rgba(170,170,170,0.70)"
+            )
+            width = 2.4 if index == 0 else 1.5 if index == 1 else 0.8
+            separator_levels.append((tuple(separator_fields), color, width))
+        for fields, color, width in separator_levels:
+            keys = [metadata_group_key(str(label), fields) for label in channel_labels]
+            for index in range(1, len(keys)):
+                if keys[index - 1] != keys[index]:
+                    separator_specs.append((index - 0.5, color, width))
     y_positions = list(range(len(display_channels)))
     custom_values = np.empty(
-        (len(channel_labels), len(iteration_values), 3),
+        (len(channel_labels), len(iteration_values), 6),
         dtype=object,
     )
     for row_index, display_channel in enumerate(display_channels):
+        metadata = row_metadata_by_label.get(str(channel_labels[row_index]), {})
         for column_index, _iteration_value in enumerate(iteration_values):
             custom_values[row_index, column_index, 0] = count_values[row_index][column_index]
             custom_values[row_index, column_index, 1] = metric_values_grid[row_index][column_index]
-            custom_values[row_index, column_index, 2] = display_channel
+            custom_values[row_index, column_index, 2] = metadata.get("label", display_channel)
+            custom_values[row_index, column_index, 3] = metadata_value_label(metadata.get("exploration")) or ""
+            custom_values[row_index, column_index, 4] = metadata_value_label(metadata.get("gp_falloff")) or ""
+            custom_values[row_index, column_index, 5] = metadata_value_label(metadata.get("initial")) or ""
     hovertemplate = (
-        "Channel: %{customdata[2]}<br>"
+        "Condition: %{customdata[2]}<br>"
+        "Exploration: %{customdata[3]}<br>"
+        "GP falloff: %{customdata[4]}<br>"
+        "Initial points: %{customdata[5]}<br>"
         "Iteration: %{x}<br>"
         f"{color_value_label}: " + "%{z:.4g}<br>"
     )
     if color_value_column != "value":
         hovertemplate += f"{metric_label}: " + "%{customdata[1]:.4g}<br>"
     hovertemplate += "Rows averaged: %{customdata[0]:.0f}<extra></extra>"
-    fig = go.Figure(data=[go.Heatmap(
-        x=display_iterations,
-        y=y_positions,
-        z=z_values,
-        customdata=custom_values,
-        colorscale=value_colorscale,
-        zmin=color_min,
-        zmax=color_max,
-        colorbar={
-            "title": {"text": color_value_label, "side": "right"},
-            "tickformat": ".4g",
-            "ticks": "outside",
-            "thickness": 18,
-            "len": 0.78,
-        },
-        hovertemplate=hovertemplate,
-    )])
+    if sweep_metadata_present:
+        fig = make_subplots(
+            rows=1,
+            cols=4,
+            shared_yaxes=True,
+            horizontal_spacing=0.006,
+            column_widths=[0.025, 0.025, 0.025, 0.925],
+        )
+
+        def metadata_strip_values(key: str) -> list[list[float]]:
+            values = []
+            for channel_label in channel_labels:
+                numeric = _finite_float(
+                    row_metadata_by_label.get(str(channel_label), {}).get(key)
+                )
+                values.append([float(numeric) if numeric is not None else np.nan])
+            return values
+
+        def metadata_strip_customdata(key: str, label: str) -> np.ndarray:
+            data = np.empty((len(channel_labels), 1, 3), dtype=object)
+            for row_index, channel_label in enumerate(channel_labels):
+                metadata = row_metadata_by_label.get(str(channel_label), {})
+                data[row_index, 0, 0] = metadata.get("label", channel_label)
+                data[row_index, 0, 1] = label
+                data[row_index, 0, 2] = metadata_value_label(metadata.get(key)) or ""
+            return data
+
+        strip_colorscale = [[0.0, "white"], [1.0, "black"]]
+        strip_specs = tuple(
+            (metadata_key, metadata_key_options[metadata_key])
+            for metadata_key in ordered_metadata_keys
+        )
+        for column_index, (metadata_key, label) in enumerate(strip_specs, start=1):
+            fig.add_trace(
+                go.Heatmap(
+                    x=[label],
+                    y=y_positions,
+                    z=metadata_strip_values(metadata_key),
+                    customdata=metadata_strip_customdata(metadata_key, label),
+                    colorscale=strip_colorscale,
+                    showscale=False,
+                    meta={"bo_trace_role": "metadata_strip"},
+                    hovertemplate=(
+                        "Condition: %{customdata[0]}<br>"
+                        "%{customdata[1]}: %{customdata[2]}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=column_index,
+            )
+        fig.add_trace(
+            go.Heatmap(
+                x=display_iterations,
+                y=y_positions,
+                z=z_values,
+                customdata=custom_values,
+                colorscale=value_colorscale,
+                zmin=color_min,
+                zmax=color_max,
+                colorbar={
+                    "title": {"text": color_value_label, "side": "right"},
+                    "tickformat": ".4g",
+                    "ticks": "outside",
+                    "thickness": 18,
+                    "len": 0.78,
+                },
+                hovertemplate=hovertemplate,
+            ),
+            row=1,
+            col=4,
+        )
+    else:
+        fig = go.Figure(data=[go.Heatmap(
+            x=display_iterations,
+            y=y_positions,
+            z=z_values,
+            customdata=custom_values,
+            colorscale=value_colorscale,
+            zmin=color_min,
+            zmax=color_max,
+            colorbar={
+                "title": {"text": color_value_label, "side": "right"},
+                "tickformat": ".4g",
+                "ticks": "outside",
+                "thickness": 18,
+                "len": 0.78,
+            },
+            hovertemplate=hovertemplate,
+        )])
     fig.update_layout(
         title=(
             f"Measured {phase} {metric_label} | "
@@ -5965,19 +6284,67 @@ def _plot_real_channel_iteration_heatmap(
         height=max(360, min(900, 240 + 28 * len(channel_labels))),
         margin={"l": 90, "r": 120, "t": 60, "b": 65},
         xaxis={"title": "Iteration", "dtick": 1 if len(iteration_values) <= 60 else None},
-        yaxis={"title": "Channel", "autorange": "reversed"},
+        yaxis={
+            "title": "Simulation condition" if sweep_metadata_present else "Channel",
+            "autorange": "reversed",
+        },
         plot_bgcolor="white",
     )
-    fig.update_yaxes(
-        tickmode="array",
-        tickvals=y_positions,
-        ticktext=display_channels,
-    )
-    for boundary in separator_boundaries:
+    if sweep_metadata_present:
+        fig.update_layout(
+            meta={
+                "bo_metadata_strip_axes": [
+                    "xaxis",
+                    "xaxis2",
+                    "xaxis3",
+                    "yaxis",
+                    "yaxis2",
+                    "yaxis3",
+                ],
+            }
+        )
+        short_labels = {
+            "exploration": "E",
+            "gp_falloff": "GP",
+            "initial": "Init",
+        }
+        for column_index, (metadata_key, label) in enumerate(strip_specs, start=1):
+            fig.update_xaxes(
+                title_text="",
+                tickmode="array",
+                tickvals=[label],
+                ticktext=[short_labels.get(metadata_key, label)],
+                row=1,
+                col=column_index,
+            )
+        fig.update_xaxes(
+            title_text="Iteration",
+            dtick=1 if len(iteration_values) <= 60 else None,
+            row=1,
+            col=4,
+        )
+        fig.update_yaxes(
+            tickmode="array",
+            tickvals=y_positions,
+            ticktext=[""] * len(y_positions),
+            row=1,
+            col=1,
+        )
+        for column_index in range(2, 5):
+            fig.update_yaxes(showticklabels=False, row=1, col=column_index)
+    else:
+        fig.update_yaxes(
+            tickmode="array",
+            tickvals=y_positions,
+            ticktext=display_channels,
+        )
+    if sweep_metadata_present:
+        fig.update_layout(margin={"l": 70, "r": 120, "t": 60, "b": 65})
+    for boundary, color, width in sorted(separator_specs, key=lambda item: item[2]):
         fig.add_hline(
             y=boundary,
-            line_color="rgba(130,130,130,0.85)",
-            line_width=1.5,
+            line_color=color,
+            line_width=width,
         )
     return _apply_plotly_colorbar_height(fig)
 
@@ -6146,6 +6513,9 @@ def _plot_real_data_parallel_coordinates(
     x_positions = list(range(len(dimensions)))
     line_width = max(0.5, min(12.0, float(line_width)))
     line_opacity = max(0.05, min(1.0, float(line_opacity)))
+    text_size = _plot_text_size_points()
+    tick_font_size = max(1, round(text_size, 2))
+    axis_label_font_size = max(1, round(text_size * 1.2, 2))
 
     def color_with_alpha(color: str, alpha: float) -> str:
         match = re.fullmatch(
@@ -6258,19 +6628,21 @@ def _plot_real_data_parallel_coordinates(
                 x=axis_index - 0.045,
                 y=tick_y,
                 text=str(tick_label_value),
+                name="bo_parallel_tick_label",
                 showarrow=False,
                 xanchor="right",
                 yanchor="middle",
-                font={"size": 10, "color": "rgba(30,30,30,0.72)"},
+                font={"size": tick_font_size, "color": "rgba(30,30,30,0.72)"},
             )
         fig.add_annotation(
             x=axis_index,
             y=1.08,
             text=dimension_labels[column],
+            name="bo_parallel_axis_label",
             showarrow=False,
             xanchor="center",
             yanchor="bottom",
-            font={"size": 12},
+            font={"size": axis_label_font_size},
         )
 
     fig.add_trace(go.Scatter(
@@ -7049,7 +7421,7 @@ def _plot_real_data_landscape(
         margin={
             "l": 65,
             "r": (
-                150
+                230
                 if show_iteration_path and (
                     iteration_path is not None or metric_label != "Count"
                 )
@@ -14775,6 +15147,13 @@ def _plot_chronological_swv_stack(
         newest_edge[0] + 0.04 * axis_dx + normal_x * side_gap,
         newest_edge[1] + 0.04 * axis_dy + normal_y * side_gap,
     )
+    fig.subplots_adjust(left=.03, right=.96, bottom=.08, top=.84)
+    axis_display_vector = ax.transData.transform(axis_end) - ax.transData.transform(axis_start)
+    label_angle = math.degrees(math.atan2(axis_dy, axis_dx))
+    if label_angle > 90:
+        label_angle -= 180
+    elif label_angle < -90:
+        label_angle += 180
     ax.annotate(
         "",
         xy=axis_end,
@@ -14789,40 +15168,40 @@ def _plot_chronological_swv_stack(
         },
         zorder=8,
     )
+    midpoint = (
+        (axis_start[0] + axis_end[0]) / 2,
+        (axis_start[1] + axis_end[1]) / 2,
+    )
+    midpoint_display = ax.transData.transform(midpoint)
+    perpendicular = np.array(
+        [-axis_display_vector[1], axis_display_vector[0]],
+        dtype=float,
+    )
+    perpendicular_norm = float(np.linalg.norm(perpendicular))
+    if perpendicular_norm > 0:
+        perpendicular = perpendicular / perpendicular_norm
+        if perpendicular[1] > 0 or (
+            np.isclose(perpendicular[1], 0.0) and perpendicular[0] > 0
+        ):
+            perpendicular *= -1
+        label_position = ax.transData.inverted().transform(
+            midpoint_display + perpendicular * 18.0
+        )
+    else:
+        label_position = midpoint
     ax.text(
-        axis_end[0],
-        axis_end[1],
-        " chronological order",
+        label_position[0],
+        label_position[1],
+        "chronological order",
         fontsize=8,
         color="#222222",
-        ha="left" if axis_dx >= 0 else "right",
-        va="bottom" if axis_dy >= 0 else "top",
+        ha="center",
+        va="center",
+        rotation=label_angle,
+        rotation_mode="anchor",
+        transform_rotates_text=True,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 1.0},
         zorder=8,
-    )
-
-    newest = max(loaded, key=lambda row: int(row.get("stack_index", 0)))
-    oldest = min(loaded, key=lambda row: int(row.get("stack_index", 0)))
-    ax.annotate(
-        f"Oldest: iter {oldest['iteration']}",
-        xy=(
-            float(np.nanmin(oldest["voltage"])),
-            float(np.nanmin(oldest["current"])),
-        ),
-        xytext=(8, 8),
-        textcoords="offset points",
-        fontsize=8,
-        color="#666666",
-    )
-    ax.annotate(
-        f"Newest: iter {newest['iteration']}",
-        xy=(
-            float(np.nanmax(newest["voltage"])) + int(newest.get("stack_index", 0)) * x_step,
-            float(np.nanmax(newest["current"])) + int(newest.get("stack_index", 0)) * y_step,
-        ),
-        xytext=(-88, 8),
-        textcoords="offset points",
-        fontsize=8,
-        color="#111111",
     )
     channel_handles = [
         Line2D(
@@ -14888,7 +15267,6 @@ def _plot_chronological_swv_stack(
         rotation=90,
         fontsize=9,
     )
-    fig.subplots_adjust(left=.03, right=.96, bottom=.08, top=.84)
     return fig, errors
 
 
@@ -16948,11 +17326,14 @@ def _plot_colorbar_side() -> str:
 def _apply_plotly_colorbar_side(colorbar: Any) -> None:
     if colorbar is None:
         return
+    title_text = _plotly_colorbar_title_text(colorbar)
+    is_iteration_colorbar = str(title_text or "").strip().lower() == "iteration"
+    offset = 0.18 if is_iteration_colorbar else 0.0
     if _plot_colorbar_side() == "left":
-        colorbar.x = -0.12
+        colorbar.x = -0.12 - offset
         colorbar.xanchor = "right"
     else:
-        colorbar.x = 1.02
+        colorbar.x = 1.02 + offset
         colorbar.xanchor = "left"
 
 
@@ -17547,6 +17928,7 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
             if zaxis is not None:
                 _apply_optional_text_size(zaxis.label, z_label_override_size)
         for spine in ax.spines.values():
+            spine.set_visible(perimeter_width > 0)
             spine.set_linewidth(perimeter_width)
         if colorbar_label_override and is_colorbar_axis:
             position = ax.get_position()
@@ -17709,6 +18091,29 @@ def _plotly_colorbar_title_text(colorbar: Any) -> str | None:
     return str(text or "") or None
 
 
+def _plotly_colorbar_title_dict(colorbar: Any) -> dict[str, Any]:
+    title = getattr(colorbar, "title", None)
+    if title is None:
+        return {}
+    if isinstance(title, str):
+        return {"text": title}
+    if isinstance(title, dict):
+        return dict(title)
+    to_json = getattr(title, "to_plotly_json", None)
+    if callable(to_json):
+        data = to_json()
+        if isinstance(data, dict):
+            return dict(data)
+    data: dict[str, Any] = {}
+    text = getattr(title, "text", None)
+    if text:
+        data["text"] = text
+    side = getattr(title, "side", None)
+    if side:
+        data["side"] = side
+    return data
+
+
 def _apply_plotly_colorbar_text_style(
     colorbar: Any,
     *,
@@ -17721,22 +18126,53 @@ def _apply_plotly_colorbar_text_style(
         return
     colorbar.tickfont = {"size": max(1, round(text_size, 2))}
     title_text = title_override or _plotly_colorbar_title_text(colorbar)
+    title_update = _plotly_colorbar_title_dict(colorbar)
     title_size = max(
         1,
         round(
             float(title_size_override)
             if title_override and title_size_override is not None
-            else text_size,
+            else text_size * 1.05,
             2,
         ),
     )
-    title_update = {"font": {"size": title_size}}
+    title_font = dict(title_update.get("font") or {})
+    title_font["size"] = title_size
+    title_update["font"] = title_font
     if title_text:
         title_update["text"] = title_text
     colorbar.title = title_update
     if tick_update:
         for key, value in tick_update.items():
             setattr(colorbar, key, value)
+
+
+def _apply_plotly_annotation_text_style(fig: go.Figure, text_size: float) -> None:
+    if not fig.layout.annotations:
+        return
+    updated_annotations: list[dict[str, Any]] = []
+    for annotation in fig.layout.annotations:
+        to_json = getattr(annotation, "to_plotly_json", None)
+        annotation_update = (
+            dict(to_json())
+            if callable(to_json)
+            else dict(annotation)
+            if isinstance(annotation, dict)
+            else {}
+        )
+        name = str(annotation_update.get("name") or "")
+        if name == "bo_parallel_axis_label":
+            font_size = text_size * 1.2
+        elif name == "bo_parallel_tick_label":
+            font_size = text_size
+        else:
+            updated_annotations.append(annotation_update)
+            continue
+        font = dict(annotation_update.get("font") or {})
+        font["size"] = max(1, round(font_size, 2))
+        annotation_update["font"] = font
+        updated_annotations.append(annotation_update)
+    fig.update_layout(annotations=updated_annotations)
 
 
 def _plotly_trace_color_values(trace: Any) -> Any:
@@ -17759,6 +18195,8 @@ def _plotly_axis_font_update(
     draw_perimeter: bool = True,
 ) -> dict:
     tick_size = max(1, round(size, 2))
+    perimeter_width = _plot_perimeter_width() if draw_perimeter else 0.0
+    show_perimeter = bool(draw_perimeter and perimeter_width > 0)
     title_size = max(
         1,
         round(
@@ -17771,9 +18209,9 @@ def _plotly_axis_font_update(
     update = {
         "title": {"font": {"size": title_size}},
         "tickfont": {"size": tick_size},
-        "showline": bool(draw_perimeter),
-        "mirror": True,
-        "linewidth": _plot_perimeter_width() if draw_perimeter else 0,
+        "showline": show_perimeter,
+        "mirror": show_perimeter,
+        "linewidth": perimeter_width if show_perimeter else 0,
         "linecolor": "#222222",
         "showgrid": _plot_show_grid(),
     }
@@ -17873,6 +18311,12 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
         },
     }
     layout_json = fig.layout.to_plotly_json()
+    layout_meta = layout_json.get("meta", {})
+    metadata_strip_axes = set()
+    if isinstance(layout_meta, Mapping):
+        raw_strip_axes = layout_meta.get("bo_metadata_strip_axes", [])
+        if isinstance(raw_strip_axes, Sequence) and not isinstance(raw_strip_axes, (str, bytes)):
+            metadata_strip_axes = {str(axis_name) for axis_name in raw_strip_axes}
     existing_margin = (
         layout_json.get("margin", {})
         if isinstance(layout_json.get("margin", {}), Mapping)
@@ -17894,6 +18338,7 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
     for axis_name in plotly_2d_axis_names:
         axis_payload = layout_json.get(axis_name, {})
         if re.fullmatch(r"[xy]axis\d*", str(axis_name)):
+            is_metadata_strip_axis = str(axis_name) in metadata_strip_axes
             label_override = (
                 x_label_override
                 if str(axis_name).startswith("xaxis")
@@ -17912,8 +18357,20 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
                     if label_override and label_size_override is not None
                     else None
                 ),
-                draw_perimeter=not has_highlighted_slice_perimeter,
+                draw_perimeter=(
+                    not has_highlighted_slice_perimeter
+                    and not is_metadata_strip_axis
+                ),
             )
+            if is_metadata_strip_axis:
+                layout_updates[axis_name].update({
+                    "showgrid": False,
+                    "zeroline": False,
+                    "ticks": "",
+                    "showline": False,
+                    "mirror": False,
+                    "linewidth": 0,
+                })
             axis_key = "x" if str(axis_name).startswith("xaxis") else "y"
             layout_updates[axis_name].update(_plotly_scaled_tick_update(
                 _plotly_axis_numeric_range(fig, str(axis_name), axis_payload),
@@ -17990,14 +18447,21 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
             shape_json = _plotly_shape_dict(shape)
             if shape_json.get("name") == "bo_highlighted_slice_perimeter":
                 line = dict(shape_json.get("line") or {})
-                line["width"] = _plot_perimeter_width()
+                perimeter_width = _plot_perimeter_width()
+                line["width"] = perimeter_width
                 shape_json["line"] = line
+                shape_json["visible"] = perimeter_width > 0
             updated_shapes.append(shape_json)
         fig.update_layout(shapes=updated_shapes)
+    _apply_plotly_annotation_text_style(fig, text_size)
     for trace in fig.data:
         meta = _plotly_trace_meta_dict(trace)
         role = _plotly_trace_role(trace)
-        if colorscale_override is not None and hasattr(trace, "colorscale"):
+        if (
+            colorscale_override is not None
+            and role != "metadata_strip"
+            and hasattr(trace, "colorscale")
+        ):
             try:
                 current_colorscale = getattr(trace, "colorscale", None)
                 if current_colorscale is not None or getattr(trace, "colorbar", None) is not None:
@@ -18011,7 +18475,9 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
                 base_width = _finite_float(line.get("width")) or 2.0
                 meta["bo_base_line_width"] = float(base_width)
             if role == "highlighted_slice_outline":
-                line["width"] = max(0.1, _plot_perimeter_width())
+                perimeter_width = _plot_perimeter_width()
+                line["width"] = perimeter_width
+                trace.visible = True if perimeter_width > 0 else False
             else:
                 line["width"] = max(0.1, float(base_width) * line_scale)
             if (
@@ -18027,7 +18493,12 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
             trace.line = line
             trace.meta = meta
         marker = getattr(trace, "marker", None)
-        if colorscale_override is not None and marker is not None and hasattr(marker, "colorscale"):
+        if (
+            colorscale_override is not None
+            and role != "metadata_strip"
+            and marker is not None
+            and hasattr(marker, "colorscale")
+        ):
             try:
                 marker_uses_colorbar = (
                     getattr(marker, "colorscale", None) is not None
@@ -18105,6 +18576,12 @@ def _apply_global_plot_style(fig):
 
 def _plotly_chart_with_colorbars(container, fig: go.Figure, **kwargs):
     kwargs["use_container_width"] = False
+    key = kwargs.get("key")
+    if key is not None:
+        kwargs["key"] = (
+            f"{key}_w{_plot_width_px()}_h"
+            f"{_plot_height_px(_plotly_plot_kind(fig))}"
+        )
     return container.plotly_chart(
         _apply_global_plot_style(_apply_plotly_colorbar_height(fig)),
         **kwargs,
@@ -18409,12 +18886,15 @@ def _prepare_plotly_static_export(fig: go.Figure) -> go.Figure:
             line["width"] = max(5 * _plot_line_width_scale(), float(line.get("width") or 0))
             trace.line = line
         elif role == "highlighted_slice_outline":
+            perimeter_width = _plot_perimeter_width()
             line = trace_line_dict(trace)
-            line["width"] = max(
-                _plot_perimeter_width(),
+            line["width"] = perimeter_width if perimeter_width <= 0 else max(
+                perimeter_width,
                 float(line.get("width") or 0),
             )
             trace.line = line
+            if perimeter_width <= 0:
+                trace.visible = False
         elif role == "highlighted_slice_fill":
             opacity = _finite_float(getattr(trace, "opacity", None))
             if opacity is not None:
@@ -18473,6 +18953,8 @@ def _add_static_3d_line_marker_samples(fig: go.Figure) -> None:
     for trace in list(fig.data):
         role = _plotly_trace_role(trace)
         if role not in {"cube_edges", "highlighted_slice_outline"}:
+            continue
+        if role == "highlighted_slice_outline" and _plot_perimeter_width() <= 0:
             continue
         segments = _plotly_3d_trace_segments(trace)
         if not segments:
@@ -18732,20 +19214,22 @@ def _render_downloadable_plotly(
     eager_png: bool = True,
 ) -> Any:
     plot_column = _sized_plot_container(container, width_percent)
-    effective_export_width = int(export_width or width_percent)
+    effective_export_width = int(export_width or _plot_width_px())
     _apply_plotly_colorbar_height(fig)
     fig.update_layout(width=effective_export_width, autosize=False)
     _apply_global_plot_style(fig)
+    effective_export_height = int(export_height or fig.layout.height or 800)
+    chart_key = f"{key}_w{effective_export_width}_h{int(fig.layout.height or effective_export_height)}"
     if camera_storage_key:
         rendered_camera = _render_camera_persistent_plotly(
             plot_column,
             fig,
-            key=key,
+            key=chart_key,
             camera_storage_key=camera_storage_key,
-            height=export_height or int(fig.layout.height or 800),
+            height=effective_export_height,
             file_stem=file_stem,
             export_width=effective_export_width,
-            export_height=export_height,
+            export_height=effective_export_height,
             shared_camera_storage_key=shared_camera_storage_key,
             apply_sync_nonce=apply_sync_nonce,
             show_download=False,
@@ -18758,7 +19242,7 @@ def _render_downloadable_plotly(
             png_bytes = _plotly_png_bytes(
                 download_fig,
                 width=effective_export_width,
-                height=export_height or int(fig.layout.height or 800),
+                height=effective_export_height,
             )
             _render_browser_download_link(
                 plot_column,
@@ -18780,14 +19264,14 @@ def _render_downloadable_plotly(
             use_container_width=False,
             on_select=on_select,
             selection_mode=selection_mode,
-            key=key,
+            key=chart_key,
         )
     if eager_png:
         try:
             png_bytes = _plotly_png_bytes(
                 fig,
                 width=effective_export_width,
-                height=export_height or int(fig.layout.height or 800),
+                height=effective_export_height,
             )
             _render_browser_download_link(
                 plot_column,
@@ -21274,6 +21758,7 @@ def render_bo_session_app() -> None:
                     hp_voxel_internal_opacity = 1.0
                     hp_voxel_internal_point_size = 20
                     hp_voxel_internal_point_count = 1
+                    hp_draw_full_cube_edges = False
                     hp_parallel_line_width = 1.5
                     hp_parallel_line_opacity = 0.55
                     hp_parallel_draw_order = "Low response on top"
@@ -21298,7 +21783,7 @@ def render_bo_session_app() -> None:
                             NO_HIGHLIGHTED_SLICE_LABEL,
                             *hp_3d_slice_axes,
                         ]
-                        slice_control_columns = st.columns(3)
+                        slice_control_columns = st.columns(4)
                         _preserve_valid_widget_value(
                             "bo_hp_response_3d_slice_axis",
                             hp_3d_slice_axis_choices,
@@ -21341,6 +21826,18 @@ def render_bo_session_app() -> None:
                                 "Use rotate/view for normal 3D interaction. Switch "
                                 "to click-pick only when selecting a slice from the "
                                 "plot with the mouse."
+                            ),
+                        )
+                        hp_draw_full_cube_edges = slice_control_columns[3].checkbox(
+                            "Draw full cube edges",
+                            value=False,
+                            key=(
+                                f"bo_hp_response_full_cube_edges_"
+                                f"{trend_scope_key}_{hp_metric_key}_{hp_x}_{hp_y}_{hp_z}"
+                            ),
+                            help=(
+                                "Adds all 12 bounding-box edges to the 3D heatmap "
+                                "so the back cube faces are easier to read."
                             ),
                         )
                         st.caption(
@@ -21891,6 +22388,7 @@ def render_bo_session_app() -> None:
                                             ),
                                             slice_axis=hp_3d_slice_axis,
                                             slice_value=hp_3d_slice_value,
+                                            draw_cube_edges=hp_draw_full_cube_edges,
                                         )
                                     if hp_summary == "Iterations to Q target":
                                         channel_figure.update_layout(
@@ -21915,7 +22413,8 @@ def render_bo_session_app() -> None:
                                         f"{hp_z or 'none'}_ch_{hp_channel}_"
                                         f"{hp_summary}_{hp_aggregate}_"
                                         f"{hp_iteration}_{hp_q_target}_"
-                                        f"{int(hp_include_misses)}"
+                                        f"{int(hp_include_misses)}_"
+                                        f"edges_{int(hp_draw_full_cube_edges)}"
                                     )
                                     _plotly_chart_with_colorbars(
                                         _sized_plot_container(
@@ -22037,6 +22536,7 @@ def render_bo_session_app() -> None:
                                     hp_voxel_internal_opacity,
                                     hp_voxel_internal_point_size,
                                     hp_voxel_internal_point_count,
+                                    hp_draw_full_cube_edges,
                                     hp_parallel_line_width,
                                     hp_parallel_line_opacity,
                                     hp_parallel_draw_order,
@@ -22091,6 +22591,7 @@ def render_bo_session_app() -> None:
                                             voxel_internal_point_count=hp_voxel_internal_point_count,
                                             slice_axis=hp_3d_slice_axis,
                                             slice_value=hp_3d_slice_value,
+                                            draw_cube_edges=hp_draw_full_cube_edges,
                                         )
                                     if hp_summary == "Iterations to Q target":
                                         hp_figure.update_layout(
@@ -22587,6 +23088,9 @@ def render_bo_session_app() -> None:
                                                             ),
                                                             voxel_internal_point_count=(
                                                                 hp_voxel_internal_point_count
+                                                            ),
+                                                            draw_cube_edges=(
+                                                                hp_draw_full_cube_edges
                                                             ),
                                                         )
                                                     figure.update_layout(
@@ -23088,6 +23592,16 @@ def render_bo_session_app() -> None:
                     horizontal=True,
                     key=chronological_mode_key,
                 )
+                chronological_show_fluid_exchange_lines = chronological_form.checkbox(
+                    "Show fluid-exchange lines",
+                    value=True,
+                    key=f"bo_chronological_show_fluid_exchange_lines_{chronological_metric}",
+                )
+                chronological_show_iteration_lines = chronological_form.checkbox(
+                    "Show iteration lines",
+                    value=False,
+                    key=f"bo_chronological_show_iteration_lines_{chronological_metric}",
+                )
                 chronological_render_signature = (
                     session["state"].get("session_id", session["root"].name),
                     trend_scope_key,
@@ -23098,6 +23612,8 @@ def render_bo_session_app() -> None:
                     chronological_metric,
                     tuple(selected_chronological_channels),
                     chronological_mode,
+                    chronological_show_fluid_exchange_lines,
+                    chronological_show_iteration_lines,
                 )
                 chronological_render_key = "bo_chronological_render_signature"
                 if chronological_form.form_submit_button(
@@ -23115,7 +23631,9 @@ def render_bo_session_app() -> None:
                     f"{iteration_start}_{iteration_end}_"
                     f"{chronological_metric}_{chronological_mode}_"
                     f"groups_{chronological_group_token}_"
-                    f"{'_'.join(selected_chronological_channels)}"
+                    f"{'_'.join(selected_chronological_channels)}_"
+                    f"exchange_{int(chronological_show_fluid_exchange_lines)}_"
+                    f"iterlines_{int(chronological_show_iteration_lines)}"
                 )
                 chronological_events = []
                 if not render_chronological_plot:
@@ -23152,18 +23670,24 @@ def render_bo_session_app() -> None:
                                 phase_transitions,
                                 chronological_metric,
                                 "Average selected channels",
+                                chronological_show_fluid_exchange_lines,
+                                chronological_show_iteration_lines,
                             )
                             chronological_overlay_figure = _plot_chronological(
                                 chronological_raw_points,
                                 phase_transitions,
                                 chronological_metric,
                                 "Overlay selected channels",
+                                chronological_show_fluid_exchange_lines,
+                                chronological_show_iteration_lines,
                             )
                             chronological_separate_figure = _plot_chronological(
                                 chronological_raw_points,
                                 phase_transitions,
                                 chronological_metric,
                                 "Separate plots",
+                                chronological_show_fluid_exchange_lines,
+                                chronological_show_iteration_lines,
                             )
                             chronological_figures = [
                                 chronological_average_figure,
@@ -23176,6 +23700,8 @@ def render_bo_session_app() -> None:
                                 phase_transitions,
                                 chronological_metric,
                                 chronological_mode,
+                                chronological_show_fluid_exchange_lines,
+                                chronological_show_iteration_lines,
                             )
                             chronological_figures = [chronological_figure]
                         chronological_y_limits = _manual_y_axis_range_control(
@@ -23592,6 +24118,63 @@ def render_bo_session_app() -> None:
                         trace_voltage_max,
                         trace_voltage_min,
                     )
+                trace_y_min = None
+                trace_y_max = None
+                manual_trace_y_limits = st.checkbox(
+                    "Set SWV y-axis limits manually",
+                    key=(
+                        f"bo_trace_manual_y_limits_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{trace_transform_key}"
+                    ),
+                    help=(
+                        "Crops the displayed current axis for every SWV trace view, "
+                        "including overlays, per-channel plots, diagonal stacks, and GIFs."
+                    ),
+                )
+                if manual_trace_y_limits:
+                    default_trace_y_min = -0.2 if normalize_to_peak else -1.0
+                    default_trace_y_max = 1.2 if normalize_to_peak else 1.0
+                    trace_y_limit_columns = st.columns(2)
+                    trace_y_min_key = (
+                        f"bo_trace_y_min_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{trace_transform_key}"
+                    )
+                    trace_y_max_key = (
+                        f"bo_trace_y_max_"
+                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                        f"{trace_transform_key}"
+                    )
+                    st.session_state.setdefault(
+                        trace_y_min_key,
+                        default_trace_y_min,
+                    )
+                    st.session_state.setdefault(
+                        trace_y_max_key,
+                        default_trace_y_max,
+                    )
+                    trace_y_min = float(trace_y_limit_columns[0].number_input(
+                        "SWV y-axis minimum",
+                        value=float(st.session_state[trace_y_min_key]),
+                        step=0.1,
+                        format="%.4f",
+                        key=trace_y_min_key,
+                    ))
+                    trace_y_max = float(trace_y_limit_columns[1].number_input(
+                        "SWV y-axis maximum",
+                        value=float(st.session_state[trace_y_max_key]),
+                        step=0.1,
+                        format="%.4f",
+                        key=trace_y_max_key,
+                    ))
+                    if trace_y_min >= trace_y_max:
+                        st.warning(
+                            "SWV y-axis minimum must be less than the maximum; "
+                            "autoscale is being used."
+                        )
+                        trace_y_min = None
+                        trace_y_max = None
                 stack_x_offset = None
                 stack_y_offset = None
                 stack_trace_height = 1.0
@@ -23728,6 +24311,8 @@ def render_bo_session_app() -> None:
                     selected_trace_type,
                     trace_voltage_min,
                     trace_voltage_max,
+                    trace_y_min,
+                    trace_y_max,
                     stack_phase_display,
                     stack_x_offset,
                     stack_y_offset,
@@ -23841,11 +24426,18 @@ def render_bo_session_app() -> None:
                                         trace_voltage_min,
                                         trace_voltage_max,
                                     )
+                            if (
+                                trace_y_min is not None
+                                and trace_y_max is not None
+                                and figure.axes
+                            ):
+                                figure.axes[0].set_ylim(trace_y_min, trace_y_max)
                             trace_file_stem = (
                                 f"swv_traces_{selected_trace_type}_{trace_layout}_"
                                 f"{selected_group_label}_{selected_iteration_label}_"
                                 f"{selected_trace_phase_label}_"
                                 f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                                f"{f'y_{trace_y_min:g}_{trace_y_max:g}_' if trace_y_min is not None and trace_y_max is not None else ''}"
                                 f"{phase_label + '_' if phase_label else ''}"
                                 f"{'_'.join(map(str, channel_group)) or 'all_channels'}"
                             )
@@ -23858,6 +24450,8 @@ def render_bo_session_app() -> None:
                                     f"{selected_trace_type}_{phase_label or 'all'}_"
                                     f"{selected_trace_phase_label}_"
                                     f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                                    f"{trace_y_min if trace_y_min is not None else 'auto'}_"
+                                    f"{trace_y_max if trace_y_max is not None else 'auto'}_"
                                     f"{'_'.join(map(str, channel_group))}"
                                 ),
                                 file_stem=trace_file_stem,
@@ -23872,6 +24466,8 @@ def render_bo_session_app() -> None:
                             f"{selected_iteration_scope}_{trace_layout}_{selected_trace_type}_"
                             f"{selected_trace_phase_label}_"
                             f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
+                            f"{trace_y_min if trace_y_min is not None else 'auto'}_"
+                            f"{trace_y_max if trace_y_max is not None else 'auto'}_"
                             f"{'_'.join(selected_channels)}"
                         )
                         if st.button(
@@ -23916,6 +24512,11 @@ def render_bo_session_app() -> None:
                                         trace_voltage_min,
                                         trace_voltage_max,
                                     )
+                                    if (
+                                        trace_y_min is not None
+                                        and trace_y_max is not None
+                                    ):
+                                        gif_y_limits = (trace_y_min, trace_y_max)
 
                                     def swv_frames():
                                         for frame_observation in frame_observations:
@@ -26245,6 +26846,11 @@ def render_bo_session_app() -> None:
                                 )
                     real_heatmap_color_value_column = "value"
                     real_heatmap_color_value_label = display_real_metric
+                    real_heatmap_metadata_hierarchy = (
+                        "exploration",
+                        "gp_falloff",
+                        "initial",
+                    )
                     if real_view == "Channel x iteration heatmap":
                         combined_real_points = _add_optimum_distance_columns(
                             combined_real_points,
@@ -26338,6 +26944,41 @@ def render_bo_session_app() -> None:
                                 "scaling for the selected parameter; hover still "
                                 "shows the measured metric."
                             )
+                        metadata_hierarchy_labels = {
+                            "exploration": "Exploration",
+                            "gp_falloff": "GP falloff",
+                            "initial": "Initial points",
+                        }
+                        metadata_hierarchy_options = list(metadata_hierarchy_labels)
+                        metadata_hierarchy_columns = real_view_form.columns(3)
+                        selected_metadata_hierarchy = []
+                        for order_index, column in enumerate(metadata_hierarchy_columns):
+                            key = (
+                                f"bo_real_heatmap_metadata_hierarchy_{order_index}_"
+                                f"{real_control_scope_key}_{real_metric}_{real_phase}_"
+                                f"{real_channel_mode}"
+                            )
+                            _preserve_valid_widget_value(
+                                key,
+                                metadata_hierarchy_options,
+                                real_heatmap_metadata_hierarchy[order_index],
+                            )
+                            selected_metadata_hierarchy.append(column.selectbox(
+                                f"Metadata level {order_index + 1}",
+                                metadata_hierarchy_options,
+                                format_func=lambda value: metadata_hierarchy_labels[value],
+                                key=key,
+                            ))
+                        real_heatmap_metadata_hierarchy = tuple(
+                            dict.fromkeys(selected_metadata_hierarchy)
+                        )
+                        real_heatmap_metadata_hierarchy = (
+                            *real_heatmap_metadata_hierarchy,
+                            *[
+                                option for option in metadata_hierarchy_options
+                                if option not in real_heatmap_metadata_hierarchy
+                            ],
+                        )[:3]
                     real_log_frequency_key = "bo_real_log_frequency"
                     real_log_frequency_preference_key = (
                         f"{real_log_frequency_key}__preferred"
@@ -26972,6 +27613,7 @@ def render_bo_session_app() -> None:
                         ),
                         real_value_range,
                         real_heatmap_color_value_column,
+                        real_heatmap_metadata_hierarchy,
                         real_log_frequency,
                         real_draw_full_cube_edges,
                         real_show_iteration_path,
@@ -27048,6 +27690,7 @@ def render_bo_session_app() -> None:
                                         else None
                                     ),
                                     value_colorscale=real_value_colorscale,
+                                    metadata_hierarchy=real_heatmap_metadata_hierarchy,
                                 )
                                 series_token = (
                                     "all"
@@ -27062,16 +27705,17 @@ def render_bo_session_app() -> None:
                                         f"{real_plot_state_key}_{phase}_{series_token}_"
                                         f"{real_metric}_{real_channel_mode}_"
                                         f"{real_scope_key}_"
-                                        f"{real_heatmap_color_value_column}"
+                                        f"{real_heatmap_color_value_column}_"
+                                        f"{'_'.join(real_heatmap_metadata_hierarchy)}"
                                     ),
                                     file_stem=(
                                         f"real_data_{phase}_{series_token}_"
                                         f"{real_metric}_channel_iteration_heatmap_"
                                         "colored_by_"
-                                        f"{_safe_download_stem(real_heatmap_color_value_column)}"
+                                        f"{_safe_download_stem(real_heatmap_color_value_column)}_"
+                                        f"metadata_{'_'.join(real_heatmap_metadata_hierarchy)}"
                                     ),
                                     width_percent=plot_width_percent,
-                                    export_height=int(real_figure.layout.height or 500),
                                 )
                     elif real_view == "Parallel coordinates":
                         parallel_plot_items = (
@@ -27135,7 +27779,6 @@ def render_bo_session_app() -> None:
                                         f"{real_metric}_parallel_coordinates"
                                     ),
                                     width_percent=plot_width_percent,
-                                    export_height=int(real_figure.layout.height or 500),
                                 )
                     elif real_phase == "both" and real_view == "1D slice":
                         if real_channel_mode == real_metadata_overlay_mode:
