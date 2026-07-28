@@ -24120,7 +24120,22 @@ def render_bo_session_app() -> None:
                     )
                 trace_y_min = None
                 trace_y_max = None
-                manual_trace_y_limits = st.checkbox(
+                default_trace_y_min = -0.2 if normalize_to_peak else -1.0
+                default_trace_y_max = 1.2 if normalize_to_peak else 1.0
+                trace_y_min_key = (
+                    f"bo_trace_y_min_"
+                    f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                    f"{trace_transform_key}"
+                )
+                trace_y_max_key = (
+                    f"bo_trace_y_max_"
+                    f"{selected_observation_group_scope}_{selected_iteration_scope}_"
+                    f"{trace_transform_key}"
+                )
+                st.session_state.setdefault(trace_y_min_key, default_trace_y_min)
+                st.session_state.setdefault(trace_y_max_key, default_trace_y_max)
+                trace_y_limit_columns = st.columns([1.2, 1, 1])
+                manual_trace_y_limits = trace_y_limit_columns[0].checkbox(
                     "Set SWV y-axis limits manually",
                     key=(
                         f"bo_trace_manual_y_limits_"
@@ -24132,42 +24147,25 @@ def render_bo_session_app() -> None:
                         "including overlays, per-channel plots, diagonal stacks, and GIFs."
                     ),
                 )
+                draft_trace_y_min = float(trace_y_limit_columns[1].number_input(
+                    "SWV y-axis minimum",
+                    value=float(st.session_state[trace_y_min_key]),
+                    step=0.1,
+                    format="%.4f",
+                    key=trace_y_min_key,
+                    disabled=not manual_trace_y_limits,
+                ))
+                draft_trace_y_max = float(trace_y_limit_columns[2].number_input(
+                    "SWV y-axis maximum",
+                    value=float(st.session_state[trace_y_max_key]),
+                    step=0.1,
+                    format="%.4f",
+                    key=trace_y_max_key,
+                    disabled=not manual_trace_y_limits,
+                ))
                 if manual_trace_y_limits:
-                    default_trace_y_min = -0.2 if normalize_to_peak else -1.0
-                    default_trace_y_max = 1.2 if normalize_to_peak else 1.0
-                    trace_y_limit_columns = st.columns(2)
-                    trace_y_min_key = (
-                        f"bo_trace_y_min_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{trace_transform_key}"
-                    )
-                    trace_y_max_key = (
-                        f"bo_trace_y_max_"
-                        f"{selected_observation_group_scope}_{selected_iteration_scope}_"
-                        f"{trace_transform_key}"
-                    )
-                    st.session_state.setdefault(
-                        trace_y_min_key,
-                        default_trace_y_min,
-                    )
-                    st.session_state.setdefault(
-                        trace_y_max_key,
-                        default_trace_y_max,
-                    )
-                    trace_y_min = float(trace_y_limit_columns[0].number_input(
-                        "SWV y-axis minimum",
-                        value=float(st.session_state[trace_y_min_key]),
-                        step=0.1,
-                        format="%.4f",
-                        key=trace_y_min_key,
-                    ))
-                    trace_y_max = float(trace_y_limit_columns[1].number_input(
-                        "SWV y-axis maximum",
-                        value=float(st.session_state[trace_y_max_key]),
-                        step=0.1,
-                        format="%.4f",
-                        key=trace_y_max_key,
-                    ))
+                    trace_y_min = draft_trace_y_min
+                    trace_y_max = draft_trace_y_max
                     if trace_y_min >= trace_y_max:
                         st.warning(
                             "SWV y-axis minimum must be less than the maximum; "
