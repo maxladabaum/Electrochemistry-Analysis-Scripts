@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 
@@ -21,6 +21,16 @@ from .processing import find_peak_candidates
 
 
 # ---- helpers
+
+def _channel_sort_key(channel: Any) -> tuple:
+    text = str(channel)
+    match = re.fullmatch(r"(\d+)(?:\s+group\s+(\d+))?", text, re.IGNORECASE)
+    if match:
+        return (0, int(match.group(1)), int(match.group(2) or 0), text)
+    try:
+        return (0, int(channel), 0, text)
+    except (TypeError, ValueError):
+        return (1, text, 0, text)
 
 _CONCENTRATION_UNIT_TO_M = {
     "M": 1.0,
@@ -947,7 +957,7 @@ def plot_metric_vs_scan(
 
     metric: str,
 
-    channels: Optional[List[int]] = None,
+    channels: Optional[List[Any]] = None,
 
     title: Optional[str] = None,
 
@@ -962,11 +972,11 @@ def plot_metric_vs_scan(
     figsize: Tuple[int, int] = (10, 4),
     xlabel: str = "Scan number",
 
-    highlight_channel: Optional[int] = None,
+    highlight_channel: Optional[Any] = None,
 
 ) -> Optional[plt.Figure]:
 
-    all_ch = sorted({r["channel"] for r in all_results})
+    all_ch = sorted({r["channel"] for r in all_results}, key=_channel_sort_key)
 
     channels = [ch for ch in channels if ch in all_ch] if channels else all_ch
 
@@ -1527,7 +1537,7 @@ def plot_drift_vs_scan(
 
     drift_metric: str,
 
-    channels: Optional[List[int]] = None,
+    channels: Optional[List[Any]] = None,
 
     title: Optional[str] = None,
 
@@ -1539,7 +1549,7 @@ def plot_drift_vs_scan(
 
     scan_range: Optional[Tuple[int, int]] = None,
 
-    highlight_channel: Optional[int] = None,
+    highlight_channel: Optional[Any] = None,
 
     figsize: Tuple[int, int] = (10, 4),
 
@@ -1547,7 +1557,7 @@ def plot_drift_vs_scan(
 
 ) -> Optional[plt.Figure]:
 
-    all_ch = sorted({r["channel"] for r in all_results})
+    all_ch = sorted({r["channel"] for r in all_results}, key=_channel_sort_key)
 
     channels = [ch for ch in channels if ch in all_ch] if channels else all_ch
 

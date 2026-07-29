@@ -1485,6 +1485,114 @@ def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
     return metrics
 
 
+def _best_q_parameters_by_channel_frame(
+    history: pd.DataFrame,
+    selected_channels: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    if history is None or history.empty:
+        return pd.DataFrame()
+
+    parameter_columns = {
+        "Frequency (Hz)": "frequency",
+        "Amplitude (V)": "amplitude",
+        "Step size (V)": "step_potential",
+    }
+    if not {"iteration", *parameter_columns.values()}.issubset(history.columns):
+        return pd.DataFrame()
+
+    rows = []
+    selected_channel_set = (
+        {str(channel) for channel in selected_channels}
+        if selected_channels is not None
+        else None
+    )
+    channel_q_columns: dict[str, str] = {}
+    for preferred_metric in ("Q_channel", "paired_Q_channel", "classic_Q"):
+        for column in history.columns:
+            q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
+            component_match = re.fullmatch(
+                r"ch(\d+)_(.+)",
+                str(column),
+                re.IGNORECASE,
+            )
+            if q_match:
+                channel, metric = q_match.group(1), "Q_channel"
+            elif component_match:
+                channel, metric = component_match.group(1), component_match.group(2)
+            else:
+                continue
+            if metric != preferred_metric or channel in channel_q_columns:
+                continue
+            values = pd.to_numeric(history[column], errors="coerce")
+            if values.notna().any():
+                channel_q_columns[channel] = str(column)
+        if channel_q_columns:
+            break
+    if channel_q_columns:
+        for channel, q_column in sorted(
+            channel_q_columns.items(),
+            key=lambda item: _channel_sort_key(item[0]),
+        ):
+            if (
+                selected_channel_set is not None
+                and str(channel) not in selected_channel_set
+            ):
+                continue
+            q_values = pd.to_numeric(history[q_column], errors="coerce")
+            iterations = pd.to_numeric(history["iteration"], errors="coerce")
+            valid = q_values.notna() & iterations.notna()
+            if not valid.any():
+                continue
+            best_index = q_values.loc[valid].idxmax()
+            best_row = history.loc[best_index]
+            rows.append({
+                "Channel": str(channel),
+                "Best Q iteration": int(iterations.loc[best_index]),
+                "Best Q": float(q_values.loc[best_index]),
+                **{
+                    label: _finite_float(best_row.get(column))
+                    for label, column in parameter_columns.items()
+                },
+            })
+        return pd.DataFrame(rows)
+
+    if (
+        "ground_truth_channel" not in history.columns
+        or "observed_value" not in history.columns
+    ):
+        return pd.DataFrame()
+    work = history[history["ground_truth_channel"].notna()].copy()
+    work["_channel"] = work["ground_truth_channel"].astype(str)
+    if selected_channel_set is not None:
+        work = work[work["_channel"].isin(selected_channel_set)]
+    work["_q"] = pd.to_numeric(work["observed_value"], errors="coerce")
+    work["_iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+    work = work.dropna(subset=["_channel", "_q", "_iteration"])
+    if work.empty:
+        return pd.DataFrame()
+    best_indices = work.groupby("_channel", sort=False)["_q"].idxmax()
+    for _index, best_row in (
+        work.loc[best_indices]
+        .assign(_sort_key=lambda frame: frame["_channel"].map(_channel_sort_key))
+        .sort_values("_sort_key")
+        .iterrows()
+    ):
+        output_row = {
+            "Channel": str(best_row["_channel"]),
+            "Best Q iteration": int(best_row["_iteration"]),
+            "Best Q": float(best_row["_q"]),
+            **{
+                label: _finite_float(best_row.get(column))
+                for label, column in parameter_columns.items()
+            },
+        }
+        run_label = best_row.get("run_label")
+        if run_label is not None and not pd.isna(run_label):
+            output_row["Run"] = str(run_label)
+        rows.append(output_row)
+    return pd.DataFrame(rows)
+
+
 def _metric_label(metric: str) -> str:
     replacements = {
         "best_Q": "Best Q",
@@ -21016,6 +21124,17 @@ def render_bo_session_app() -> None:
                     <= int(observation.get("iteration", 0))
                     <= iteration_end
                 ]
+            best_q_parameters_frame = _best_q_parameters_by_channel_frame(
+                trend_history,
+                selected_history_channels if trend_channel_options else None,
+            )
+            if not best_q_parameters_frame.empty:
+                st.markdown("#### Best Q parameters by channel")
+                st.dataframe(
+                    best_q_parameters_frame,
+                    use_container_width=True,
+                    hide_index=True,
+                )
             channel_metrics = _channel_metric_columns(trend_history)
             if trend_scope_key != "all":
                 selected_trend_groups = [
@@ -36235,25 +36354,6 @@ def render_bo_session_app() -> None:
                             ),
                             eager_png=False,
                         )
-                        st.dataframe(
-                            _simulation_history_display_frame(
-                                (
-                                    pd.concat(
-                                        [
-                                            run["history"]
-                                            for run in nonempty_runs
-                                            if run.get("history") is not None
-                                            and not run["history"].empty
-                                        ],
-                                        ignore_index=True,
-                                    )
-                                    if len(nonempty_runs) > 1
-                                    else sim_history
-                                )
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
                         combined_history = (
                             pd.concat(
                                 [
@@ -36265,6 +36365,23 @@ def render_bo_session_app() -> None:
                                 ignore_index=True,
                             )
                             if nonempty_runs else sim_history
+                        )
+                        best_parameters_frame = (
+                            _best_q_parameters_by_channel_frame(
+                                combined_history
+                            )
+                        )
+                        if not best_parameters_frame.empty:
+                            st.markdown("#### Best Q parameters by channel")
+                            st.dataframe(
+                                best_parameters_frame,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        st.dataframe(
+                            _simulation_history_display_frame(combined_history),
+                            use_container_width=True,
+                            hide_index=True,
                         )
                         download_columns = st.columns(2)
                         download_columns[0].download_button(

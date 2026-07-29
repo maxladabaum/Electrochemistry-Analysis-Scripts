@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import zipfile
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -573,8 +573,8 @@ def build_plot_grid_page(
 def build_export_pdf(
     analysis_mode: str,
     results: List[dict],
-    ok_results_by_channel: Dict[int, List[dict]],
-    channels: List[int],
+    ok_results_by_channel: Dict[Any, List[dict]],
+    channels: List[Any],
     metric_cfg: Dict[str, Tuple[str, str]],
     drift_cfg: Dict[str, Tuple[str, str, str]],
     active_vlines: List[Tuple[float, str]],
@@ -582,8 +582,8 @@ def build_export_pdf(
     xlabel: str,
     metrics_layout: str = "Combined",
     drift_layout: str = "Combined",
-    highlight_metric_channel: Optional[int] = None,
-    highlight_drift_channel: Optional[int] = None,
+    highlight_metric_channel: Optional[Any] = None,
+    highlight_drift_channel: Optional[Any] = None,
 ) -> bytes:
     pdf_buf = io.BytesIO()
 
@@ -1289,6 +1289,66 @@ def filter_vlines_to_results_axis(
     return in_range
 
 
+def _channel_display_sort_key(channel: Any) -> tuple:
+    text = str(channel)
+    match = re.fullmatch(r"(\d+)(?:\s+group\s+(\d+))?", text, re.IGNORECASE)
+    if match:
+        channel_number = int(match.group(1))
+        group_number = int(match.group(2) or 0)
+        return (0, channel_number, group_number, text)
+    try:
+        return (0, int(channel), 0, text)
+    except (TypeError, ValueError):
+        return (1, text, 0, text)
+
+
+def _channel_option_value(option: str) -> Any:
+    text = option.removeprefix("Ch")
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _swv_modulo_channel_label(channel: Any, group_index: int) -> str:
+    return f"{channel} group {group_index}"
+
+
+def apply_swv_modulo_split_for_display(
+    results: List[dict],
+    modulo_count: int,
+) -> List[dict]:
+    if modulo_count <= 1:
+        return list(results)
+
+    def _scan_sort_key(row: dict) -> float:
+        scan_number = row.get("scan_number")
+        return float(scan_number) if scan_number is not None else float("inf")
+
+    rows_by_channel: Dict[Any, List[dict]] = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel is None:
+            continue
+        rows_by_channel.setdefault(channel, []).append(row)
+
+    replacements: Dict[int, dict] = {}
+    for channel, channel_rows in rows_by_channel.items():
+        for index, row in enumerate(sorted(channel_rows, key=_scan_sort_key)):
+            group_index = (index % modulo_count) + 1
+            updated = dict(row)
+            group_trace_index = (index // modulo_count) + 1
+            updated["original_channel"] = channel
+            updated["modulo_group"] = group_index
+            updated["modulo_group_trace_index"] = group_trace_index
+            updated["modulo_source_scan_number"] = row.get("scan_number")
+            updated["scan_number"] = group_trace_index
+            updated["channel"] = _swv_modulo_channel_label(channel, group_index)
+            replacements[id(row)] = updated
+
+    return [replacements.get(id(row), dict(row)) for row in results]
+
+
 def build_channel_indexes(
     results: List[dict],
     scan_range: Optional[Tuple[int, int]] = None,
@@ -1706,6 +1766,38 @@ with st.sidebar:
             channels_to_plot = [int(c.strip()) for c in channels_input.split(",") if c.strip()]
         except ValueError:
             st.error("Invalid channel list  use integers separated by commas.")
+    use_swv_modulo_split = False
+    swv_modulo_split_count = 2
+    if analysis_mode == "SWV":
+        mod_c1, mod_c2 = st.columns([1, 1])
+        use_swv_modulo_split = mod_c1.checkbox(
+            "Modulo split",
+            value=False,
+            key="swv_modulo_split",
+            help=(
+                "Split each channel's chronological SWV traces into repeating "
+                "setting groups before plotting."
+            ),
+        )
+        swv_modulo_split_count = int(mod_c2.number_input(
+            "Modulo groups",
+            min_value=2,
+            max_value=20,
+            value=2,
+            step=1,
+            disabled=not use_swv_modulo_split,
+            key="swv_modulo_split_count",
+            help=(
+                "For m groups, traces are assigned per channel as group 1, "
+                "group 2, ... group m, then repeated."
+            ),
+        ))
+        if use_swv_modulo_split:
+            st.caption(
+                f"Modulo split is active: each selected channel is plotted as "
+                f"{swv_modulo_split_count} chronological groups. Scan vlines are "
+                "interpreted on the group-local scan axis."
+            )
 
     st.divider()
 
@@ -2139,9 +2231,49 @@ channel_indexes = build_channel_indexes(results, scan_range=plot_scan_range)
 results_by_channel = channel_indexes["all_by_channel"]
 failed_results_by_channel = channel_indexes["failed_by_channel"]
 ok_plot_results_by_channel = channel_indexes["ok_in_range_by_channel"]
-all_channels   = sorted(results_by_channel)
+all_channels   = sorted(results_by_channel, key=_channel_display_sort_key)
 channels_display = channels_to_plot if channels_to_plot else all_channels
-ch_options = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
+
+plot_results = results
+plot_active_vlines = active_vlines
+plot_x_axis_label = x_axis_label
+plot_display_scan_range = plot_scan_range
+plot_channel_indexes = channel_indexes
+plot_results_by_channel = results_by_channel
+plot_failed_results_by_channel = failed_results_by_channel
+plot_ok_results_by_channel = ok_plot_results_by_channel
+plot_channels_display = channels_display
+if analysis_mode == "SWV" and use_swv_modulo_split:
+    plot_results = apply_swv_modulo_split_for_display(
+        results,
+        swv_modulo_split_count,
+    )
+    compute_drift_fields(plot_results)
+    plot_active_vlines = active_vlines
+    plot_x_axis_label = "Modulo group scan number"
+    plot_display_scan_range = None
+    plot_channel_indexes = build_channel_indexes(
+        plot_results,
+        scan_range=plot_display_scan_range,
+    )
+    plot_results_by_channel = plot_channel_indexes["all_by_channel"]
+    plot_failed_results_by_channel = plot_channel_indexes["failed_by_channel"]
+    plot_ok_results_by_channel = plot_channel_indexes["ok_in_range_by_channel"]
+    selected_channel_set = (
+        {str(channel) for channel in channels_display}
+        if channels_display
+        else None
+    )
+    plot_channels_display = [
+        channel
+        for channel in sorted(plot_results_by_channel, key=_channel_display_sort_key)
+        if (
+            selected_channel_set is None
+            or str(channel).split(" group ", 1)[0] in selected_channel_set
+        )
+    ]
+
+ch_options = ["All channels"] + [f"Ch{ch}" for ch in plot_channels_display]
 
 #  Summary banner 
 c1, c2, c3, c4 = st.columns(4)
@@ -2213,11 +2345,11 @@ if view == "Overlays":
         }
         y_key = key_map[trace_type]
 
-        for ch in channels_display:
-            ch_res = ok_plot_results_by_channel.get(ch, [])
+        for ch in plot_channels_display:
+            ch_res = plot_ok_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
-            with st.expander(f"Channel {ch}  ({len(ch_res)} cycles)", expanded=len(channels_display) <= 4):
+            with st.expander(f"Channel {ch}  ({len(ch_res)} cycles)", expanded=len(plot_channels_display) <= 4):
                 fig = plot_cv_overlaid_cycles(
                     ch_res,
                     y_key=y_key,
@@ -2267,11 +2399,11 @@ if view == "Overlays":
         normalize_to_peak = trace_type == "Normalized Smoothed Corrected"
         overlay_ylabel = "Normalized current (peak = 1)" if normalize_to_peak else "Current (uA)"
 
-        for ch in channels_display:
-            ch_res = ok_plot_results_by_channel.get(ch, [])
+        for ch in plot_channels_display:
+            ch_res = plot_ok_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
-            with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(channels_display) <= 4):
+            with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
                 fig = plot_overlaid_traces(
                     ch_res, y_key=y_key,
                     title=f"{trace_type}  Ch{ch}",
@@ -2317,12 +2449,14 @@ if view == "Metrics":
                 "offset from the raw trace, recenters each scan to its channel reference background, and then "
                 "reruns the usual SWV correction workflow for the recentered peak only."
             )
-    ch_options   = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
+    ch_options   = ["All channels"] + [f"Ch{ch}" for ch in plot_channels_display]
+    if st.session_state.get("metric_ch_sel") not in ch_options:
+        st.session_state["metric_ch_sel"] = "All channels"
     ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel",
                                    help="Selecting one channel dims the others.")
     highlight_ch = None
     if ch_selection != "All channels":
-        highlight_ch = int(ch_selection.replace("Ch", ""))
+        highlight_ch = _channel_option_value(ch_selection)
 
     view_mode = st.radio("View mode", ["Combined", "Individual channels"],
                           horizontal=True, key="metric_view_mode")
@@ -2349,9 +2483,9 @@ if view == "Metrics":
 
         if view_mode == "Combined":
             fig = plot_metric_vs_scan(
-                results, metric=metric, channels=channels_display,
-                title=label, ylabel=ylabel, vlines=active_vlines,
-                scan_range=plot_scan_range, highlight_channel=highlight_ch, xlabel=x_axis_label,
+                plot_results, metric=metric, channels=plot_channels_display,
+                title=label, ylabel=ylabel, vlines=plot_active_vlines,
+                scan_range=plot_display_scan_range, highlight_channel=highlight_ch, xlabel=plot_x_axis_label,
             )
             if fig:
                 render_downloadable_pyplot(
@@ -2361,15 +2495,15 @@ if view == "Metrics":
                     file_stem=f"metric_{label}_combined",
                 )
         else:
-            cols = st.columns(min(len(channels_display), 3))
-            for i, ch in enumerate(channels_display):
+            cols = st.columns(min(len(plot_channels_display), 3))
+            for i, ch in enumerate(plot_channels_display):
                 fig = plot_metric_vs_scan(
-                    results, metric=metric, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=active_vlines,
-                    scan_range=plot_scan_range, figsize=(5, 3), xlabel=x_axis_label,
+                    plot_results, metric=metric, channels=[ch],
+                    title=f"Ch{ch}", ylabel=ylabel, vlines=plot_active_vlines,
+                    scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
                 )
                 if fig:
-                    with cols[i % min(len(channels_display), 3)]:
+                    with cols[i % min(len(plot_channels_display), 3)]:
                         render_downloadable_pyplot(
                             st,
                             fig,
@@ -2390,7 +2524,7 @@ if view == "Metrics":
                     scan_windows=None,
                     scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
-                    highlight_channel=highlight_ch,
+                    highlight_channel=highlight_ch if not use_swv_modulo_split else None,
                 )
                 if fig:
                     render_downloadable_pyplot(
@@ -2439,7 +2573,7 @@ if view == "Metrics":
                         scan_windows=None,
                         scan_range=plot_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
-                        highlight_channel=highlight_ch,
+                        highlight_channel=highlight_ch if not use_swv_modulo_split else None,
                         fit_langmuir=True,
                         fit_channels=[highlight_ch] if highlight_ch is not None else None,
                         concentration_unit=titration_concentration_unit,
@@ -2517,10 +2651,12 @@ if view == "Drift":
         options=list(drift_options.keys()),
         default=list(drift_options.keys()),
     )
+    if st.session_state.get("drift_ch_sel") not in ch_options:
+        st.session_state["drift_ch_sel"] = "All channels"
     dr_ch_sel = dr_c2.selectbox("Highlight channel", ch_options, key="drift_ch_sel")
     drift_highlight = None
     if dr_ch_sel != "All channels":
-        drift_highlight = int(dr_ch_sel.replace("Ch", ""))
+        drift_highlight = _channel_option_value(dr_ch_sel)
 
     drift_view_mode = st.radio("View mode", ["Combined", "Individual channels"],
                                horizontal=True, key="drift_view_mode")
@@ -2532,9 +2668,9 @@ if view == "Drift":
 
         if drift_view_mode == "Combined":
             fig = plot_drift_vs_scan(
-                results, drift_metric=drift_key, channels=channels_display,
-                title=label, ylabel=ylabel, vlines=active_vlines,
-                scan_range=plot_scan_range, highlight_channel=drift_highlight, xlabel=x_axis_label,
+                plot_results, drift_metric=drift_key, channels=plot_channels_display,
+                title=label, ylabel=ylabel, vlines=plot_active_vlines,
+                scan_range=plot_display_scan_range, highlight_channel=drift_highlight, xlabel=plot_x_axis_label,
             )
             if fig:
                 render_downloadable_pyplot(
@@ -2546,15 +2682,15 @@ if view == "Drift":
             else:
                 st.warning(f"No data available for {label}.")
         else:
-            cols = st.columns(min(len(channels_display), 3))
-            for i, ch in enumerate(channels_display):
+            cols = st.columns(min(len(plot_channels_display), 3))
+            for i, ch in enumerate(plot_channels_display):
                 fig = plot_drift_vs_scan(
-                    results, drift_metric=drift_key, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=active_vlines,
-                    scan_range=plot_scan_range, figsize=(5, 3), xlabel=x_axis_label,
+                    plot_results, drift_metric=drift_key, channels=[ch],
+                    title=f"Ch{ch}", ylabel=ylabel, vlines=plot_active_vlines,
+                    scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
                 )
                 if fig:
-                    with cols[i % min(len(channels_display), 3)]:
+                    with cols[i % min(len(plot_channels_display), 3)]:
                         render_downloadable_pyplot(
                             st,
                             fig,
@@ -2592,8 +2728,8 @@ if view == "Failures":
             st.dataframe(fail_df, use_container_width=True, height=220)
             st.divider()
 
-            for ch in channels_display:
-                ch_failed = failed_results_by_channel.get(ch, [])
+            for ch in plot_channels_display:
+                ch_failed = plot_failed_results_by_channel.get(ch, [])
                 if not ch_failed:
                     continue
                 with st.expander(f"Ch{ch}  {len(ch_failed)} failed cycles", expanded=False):
@@ -2657,8 +2793,8 @@ if view == "Failures":
             st.dataframe(fail_df, use_container_width=True, height=200)
             st.divider()
 
-            for ch in channels_display:
-                ch_failed = failed_results_by_channel.get(ch, [])
+            for ch in plot_channels_display:
+                ch_failed = plot_failed_results_by_channel.get(ch, [])
                 if not ch_failed:
                     continue
                 to_plot = ch_failed[:int(max_failed)]
@@ -3101,14 +3237,14 @@ if view == "Export":
     if st.button("  Build all plots PDF", use_container_width=True):
         pdf_bytes = build_export_pdf(
             analysis_mode=analysis_mode,
-            results=results,
-            ok_results_by_channel=ok_plot_results_by_channel,
-            channels=channels_display,
+            results=plot_results,
+            ok_results_by_channel=plot_ok_results_by_channel,
+            channels=plot_channels_display,
             metric_cfg=metric_cfg,
             drift_cfg=drift_export_cfg,
-            active_vlines=active_vlines,
-            scan_range=plot_scan_range,
-            xlabel=x_axis_label,
+            active_vlines=plot_active_vlines,
+            scan_range=plot_display_scan_range,
+            xlabel=plot_x_axis_label,
             metrics_layout=pdf_metric_layout,
             drift_layout=pdf_drift_layout,
         )
@@ -3138,9 +3274,9 @@ if view == "Export":
                 plt.close(fig)
 
             for title, (metric, ylabel) in metric_cfg.items():
-                fig = plot_metric_vs_scan(results, metric=metric, channels=channels_display,
+                fig = plot_metric_vs_scan(plot_results, metric=metric, channels=plot_channels_display,
                                           title=title, ylabel=ylabel,
-                                          vlines=active_vlines, scan_range=plot_scan_range, xlabel=x_axis_label)
+                                          vlines=plot_active_vlines, scan_range=plot_display_scan_range, xlabel=plot_x_axis_label)
                 if fig:
                     _save(fig, f"metrics/{metric}.{fig_format}")
 
@@ -3178,14 +3314,14 @@ if view == "Export":
                             _save(fig, f"titration/langmuir/{metric}.{fig_format}")
 
             for title, (dk, ylabel, _caption) in drift_export_cfg.items():
-                fig = plot_drift_vs_scan(results, drift_metric=dk, channels=channels_display,
+                fig = plot_drift_vs_scan(plot_results, drift_metric=dk, channels=plot_channels_display,
                                          title=title, ylabel=ylabel,
-                                         vlines=active_vlines, scan_range=plot_scan_range, xlabel=x_axis_label)
+                                         vlines=plot_active_vlines, scan_range=plot_display_scan_range, xlabel=plot_x_axis_label)
                 if fig:
                     _save(fig, f"drift/{dk}.{fig_format}")
 
-            for ch in channels_display:
-                ch_res = ok_plot_results_by_channel.get(ch, [])
+            for ch in plot_channels_display:
+                ch_res = plot_ok_results_by_channel.get(ch, [])
                 if analysis_mode == "CV":
                     for yk, lbl in (
                         ("smoothed_current", "smoothed"),
