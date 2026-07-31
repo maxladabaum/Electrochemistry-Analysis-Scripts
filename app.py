@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import is_color_like, to_hex
 import numpy as np
 import pandas as pd
 import pywt
@@ -32,6 +33,7 @@ from core import (
     plot_cv_trace,
     plot_drift_vs_scan,
     plot_failed_traces,
+    plot_grouped_overlaid_traces,
     plot_metric_vs_scan,
     plot_overlaid_traces,
     plot_single_trace,
@@ -93,6 +95,60 @@ def _clear_loaded_analysis_state() -> None:
     st.session_state.swv_annotated_results = None
 
 
+ANALYSIS_CACHE_SCHEMA_VERSION = 2
+
+
+def _analysis_input_signature(folders: Tuple[str, ...]) -> tuple:
+    """Fingerprint measurement and method files that affect a batch result."""
+    candidate_paths = set()
+    for folder_text in folders:
+        folder = Path(folder_text)
+        if folder.is_file():
+            candidate_paths.add(folder)
+            search_folder = folder.parent
+        elif folder.is_dir():
+            search_folder = folder
+            try:
+                candidate_paths.update(
+                    path for path in search_folder.iterdir()
+                    if path.is_file() and path.suffix.lower() == ".csv"
+                )
+            except OSError:
+                continue
+        else:
+            continue
+
+        method_folders = []
+        for method_parent in (search_folder, search_folder.parent):
+            try:
+                method_folders.extend(
+                    path for path in method_parent.iterdir()
+                    if (
+                        path.is_dir()
+                        and path.name.lower().replace(" ", "_") == "methods_used"
+                    )
+                )
+            except OSError:
+                continue
+        for method_folder in method_folders:
+            try:
+                candidate_paths.update(
+                    path for path in method_folder.iterdir()
+                    if path.is_file() and path.suffix.lower() == ".ms"
+                )
+            except OSError:
+                continue
+
+    records = []
+    for path in sorted(candidate_paths, key=lambda item: str(item).lower()):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        records.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
+    return (ANALYSIS_CACHE_SCHEMA_VERSION, tuple(records))
+
+
 def _measurement_voltage_bounds(
     folders: Tuple[str, ...],
     mode: str,
@@ -122,6 +178,193 @@ def safe_download_stem(label: str) -> str:
     return stem or "plot"
 
 
+def _parse_numeric_list(text: str) -> List[float]:
+    values = []
+    for token in re.split(r"[\n,]+", str(text or "")):
+        try:
+            value = float(token.strip())
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _parse_text_list(text: str) -> List[str]:
+    return [
+        token.strip()
+        for token in re.split(r"[\n,]+", str(text or ""))
+        if token.strip()
+    ]
+
+
+def _apply_swv_plot_formatting(
+    fig: plt.Figure,
+    dpi: int,
+    plot_kind: Optional[str] = None,
+) -> None:
+    width_px = int(st.session_state.get("swv_plot_width_px", 1200))
+    height_px = int(st.session_state.get("swv_plot_height_px", 600))
+    text_size = float(st.session_state.get("swv_plot_text_size_points", 10.0))
+    line_scale = float(st.session_state.get("swv_plot_line_width_scale", 1.0))
+    perimeter_width = float(st.session_state.get("swv_plot_perimeter_width", 0.8))
+    perimeter_color = str(
+        st.session_state.get("swv_plot_perimeter_color", "#222222") or "#222222"
+    ).strip()
+    if not is_color_like(perimeter_color):
+        perimeter_color = "#222222"
+    marker_size = float(st.session_state.get("swv_plot_marker_size", 6.0))
+    marker_opacity = float(st.session_state.get("swv_plot_marker_opacity", 0.85))
+    show_legend = bool(st.session_state.get("swv_plot_show_legend", True))
+    show_grid = bool(st.session_state.get("swv_plot_show_grid", False))
+    line_color = str(st.session_state.get("swv_plot_line_color_override", "") or "").strip()
+    if line_color and not is_color_like(line_color):
+        line_color = ""
+
+    fig.set_size_inches(width_px / float(dpi), height_px / float(dpi), forward=True)
+    title_override = str(st.session_state.get("swv_plot_title_override", "") or "").strip()
+    x_label_override = str(st.session_state.get("swv_plot_x_label_override", "") or "").strip()
+    y_label_override = str(st.session_state.get("swv_plot_y_label_override", "") or "").strip()
+    colorbar_label_override = str(
+        st.session_state.get("swv_plot_colorbar_label_override", "") or ""
+    ).strip()
+
+    main_axes = [
+        axis for axis in fig.axes
+        if not bool(getattr(axis, "_swv_colorbar_axis", False))
+        and axis.get_label() != "<colorbar>"
+    ]
+    colorbar_axes = [axis for axis in fig.axes if axis not in main_axes]
+    for axis in main_axes:
+        if title_override:
+            axis.set_title(title_override)
+        if x_label_override:
+            axis.set_xlabel(x_label_override)
+        if y_label_override:
+            axis.set_ylabel(y_label_override)
+        axis.title.set_fontsize(text_size * 1.2)
+        axis.xaxis.label.set_fontsize(text_size)
+        axis.yaxis.label.set_fontsize(text_size)
+        axis.tick_params(labelsize=text_size * 0.9)
+        if show_grid:
+            axis.grid(True, alpha=0.2)
+        else:
+            axis.grid(False)
+        for spine in axis.spines.values():
+            spine.set_visible(perimeter_width > 0)
+            spine.set_linewidth(perimeter_width)
+            spine.set_edgecolor(perimeter_color)
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.set_visible(show_legend)
+            for legend_text in legend.get_texts():
+                legend_text.set_fontsize(text_size * 0.8)
+            legend.get_title().set_fontsize(text_size * 0.9)
+        for line in axis.lines:
+            line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+            if line_color:
+                line.set_color(line_color)
+        for collection in axis.collections:
+            if hasattr(collection, "get_sizes") and hasattr(collection, "set_sizes"):
+                sizes = collection.get_sizes()
+                if len(sizes):
+                    collection.set_sizes(np.full_like(sizes, marker_size ** 2, dtype=float))
+            collection.set_alpha(marker_opacity)
+
+        if (
+            plot_kind == "swv_trace"
+            and st.session_state.get("swv_plot_manual_x_limits", False)
+        ):
+            x_min = float(st.session_state.get("swv_plot_x_min", axis.get_xlim()[0]))
+            x_max = float(st.session_state.get("swv_plot_x_max", axis.get_xlim()[1]))
+            if x_min < x_max:
+                axis.set_xlim(x_min, x_max)
+        if (
+            plot_kind == "swv_trace"
+            and st.session_state.get("swv_plot_manual_y_limits", False)
+        ):
+            y_min = float(st.session_state.get("swv_plot_y_min", axis.get_ylim()[0]))
+            y_max = float(st.session_state.get("swv_plot_y_max", axis.get_ylim()[1]))
+            if y_min < y_max:
+                axis.set_ylim(y_min, y_max)
+
+        for axis_key, matplotlib_axis in (("x", axis.xaxis), ("y", axis.yaxis)):
+            labels = _parse_text_list(
+                st.session_state.get(f"swv_plot_{axis_key}_tick_labels", "")
+            )
+            if not labels:
+                continue
+            positions = _parse_numeric_list(
+                st.session_state.get(f"swv_plot_{axis_key}_tick_positions", "")
+            )
+            if not positions:
+                positions = list(matplotlib_axis.get_ticklocs())
+            count = min(len(positions), len(labels))
+            if count:
+                matplotlib_axis.set_ticks(positions[:count], labels=labels[:count])
+
+    colorbar_tick_labels = _parse_text_list(
+        st.session_state.get("swv_plot_colorbar_tick_labels", "")
+    )
+    colorbar_tick_positions = _parse_numeric_list(
+        st.session_state.get("swv_plot_colorbar_tick_positions", "")
+    )
+    for axis in colorbar_axes:
+        axis.tick_params(labelsize=text_size * 0.8)
+        axis.title.set_fontsize(text_size * 0.9)
+        if colorbar_label_override:
+            axis.set_ylabel(colorbar_label_override)
+        axis.yaxis.label.set_fontsize(text_size * 0.8)
+        if colorbar_tick_labels:
+            positions = colorbar_tick_positions or list(axis.yaxis.get_ticklocs())
+            count = min(len(positions), len(colorbar_tick_labels))
+            if count:
+                axis.set_yticks(positions[:count], labels=colorbar_tick_labels[:count])
+
+
+def _position_swv_colorbars(fig: plt.Figure) -> None:
+    if bool(getattr(fig, "_swv_manual_layout", False)):
+        return
+    main_axes = [
+        axis for axis in fig.axes
+        if axis.get_label() != "<colorbar>"
+        and not bool(getattr(axis, "_swv_colorbar_axis", False))
+    ]
+    colorbar_axes = [axis for axis in fig.axes if axis not in main_axes]
+    if not main_axes or not colorbar_axes:
+        return
+    main_position = main_axes[0].get_position()
+    side = str(st.session_state.get("swv_colorbar_side", "right")).lower()
+    height_fraction = min(
+        1.0,
+        max(
+            0.2,
+            float(st.session_state.get("swv_colorbar_height_percent", 85)) / 100.0,
+        ),
+    )
+    bar_height = main_position.height * height_fraction
+    bar_bottom = main_position.y0 + (main_position.height - bar_height) / 2.0
+    for index, colorbar_axis in enumerate(colorbar_axes):
+        current_position = colorbar_axis.get_position()
+        bar_width = min(max(current_position.width, 0.015), 0.025)
+        if side == "left":
+            bar_left = max(
+                0.01,
+                main_position.x0 - 0.035 - bar_width - index * (bar_width + 0.03),
+            )
+        else:
+            bar_left = min(
+                0.98 - bar_width,
+                main_position.x1 + 0.025 + index * (bar_width + 0.03),
+            )
+        colorbar_axis.set_position([
+            bar_left,
+            bar_bottom,
+            bar_width,
+            bar_height,
+        ])
+
+
 def render_downloadable_pyplot(
     container,
     fig: plt.Figure,
@@ -129,16 +372,177 @@ def render_downloadable_pyplot(
     key: str,
     file_stem: str,
     dpi: int = 150,
+    plot_kind: Optional[str] = None,
 ) -> None:
+    if globals().get("analysis_mode") == "SWV":
+        _apply_swv_plot_formatting(fig, dpi, plot_kind=plot_kind)
+    plot_slot = container.empty()
+    download_col, settings_col = container.columns([1, 1])
+
+    primary_axis = fig.axes[0] if fig.axes else None
+    default_title = primary_axis.get_title() if primary_axis is not None else ""
+    default_xlabel = primary_axis.get_xlabel() if primary_axis is not None else ""
+    default_ylabel = primary_axis.get_ylabel() if primary_axis is not None else ""
+    legend = primary_axis.get_legend() if primary_axis is not None else None
+    default_legend_title = (
+        legend.get_title().get_text()
+        if legend is not None
+        else ""
+    )
+    default_legend_labels = (
+        [text.get_text() for text in legend.get_texts()]
+        if legend is not None
+        else []
+    )
+    series_artists = (
+        [
+            line for line in primary_axis.lines
+            if str(line.get_label()) and not str(line.get_label()).startswith("_")
+        ]
+        if primary_axis is not None
+        else []
+    )
+    default_series_colors = []
+    for artist in series_artists:
+        try:
+            default_series_colors.append(to_hex(artist.get_color(), keep_alpha=True))
+        except (TypeError, ValueError):
+            default_series_colors.append(str(artist.get_color()))
+
+    with settings_col.popover("Plot settings", use_container_width=True):
+        override_plot_text = st.checkbox(
+            "Override plot text",
+            key=f"{key}_override_plot_text",
+        )
+        custom_title = st.text_input(
+            "Title",
+            value=default_title,
+            key=f"{key}_custom_title",
+            disabled=not override_plot_text,
+        )
+        custom_xlabel = st.text_input(
+            "X-axis label",
+            value=default_xlabel,
+            key=f"{key}_custom_xlabel",
+            disabled=not override_plot_text,
+        )
+        custom_ylabel = st.text_input(
+            "Y-axis label",
+            value=default_ylabel,
+            key=f"{key}_custom_ylabel",
+            disabled=not override_plot_text,
+        )
+        show_legend = st.checkbox(
+            "Show legend",
+            value=legend is not None and legend.get_visible(),
+            key=f"{key}_show_legend",
+            disabled=legend is None,
+        )
+        custom_legend_title = st.text_input(
+            "Legend title",
+            value=default_legend_title,
+            key=f"{key}_custom_legend_title",
+            disabled=not override_plot_text or legend is None,
+        )
+        custom_legend_labels_text = st.text_area(
+            "Legend entries (one per line)",
+            value="\n".join(default_legend_labels),
+            height=min(180, max(80, 28 * len(default_legend_labels))),
+            key=f"{key}_custom_legend_labels",
+            disabled=not override_plot_text or legend is None,
+            help="Entries correspond to the existing legend items in their current order.",
+        )
+        override_series_colors = st.checkbox(
+            "Override series colors",
+            key=f"{key}_override_series_colors",
+            disabled=not series_artists,
+            help="Applies colors to plotted series in their current legend order.",
+        )
+        custom_series_colors_text = st.text_area(
+            "Series colors (one per line)",
+            value="\n".join(default_series_colors),
+            height=min(180, max(80, 28 * len(default_series_colors))),
+            key=f"{key}_custom_series_colors",
+            disabled=not override_series_colors or not series_artists,
+            help=(
+                "Use Matplotlib/CSS colors such as tab:blue, crimson, #4b0082, "
+                "or rgba-compatible hex values."
+            ),
+        )
+        requested_series_colors = [
+            color.strip() for color in custom_series_colors_text.splitlines()
+        ]
+        invalid_series_colors = [
+            color for color in requested_series_colors
+            if color and not is_color_like(color)
+        ]
+        if override_series_colors and invalid_series_colors:
+            st.caption(
+                "Invalid color(s) ignored: " + ", ".join(invalid_series_colors)
+            )
+
+    if primary_axis is not None:
+        if override_plot_text:
+            primary_axis.set_title(custom_title)
+            primary_axis.set_xlabel(custom_xlabel)
+            primary_axis.set_ylabel(custom_ylabel)
+        if legend is not None:
+            legend.set_visible(show_legend)
+            if override_plot_text:
+                legend.get_title().set_text(custom_legend_title)
+                custom_legend_labels = custom_legend_labels_text.splitlines()
+                for index, legend_text in enumerate(legend.get_texts()):
+                    if index < len(custom_legend_labels):
+                        legend_text.set_text(custom_legend_labels[index])
+        if override_series_colors:
+            legend_handles = []
+            if legend is not None:
+                legend_handles = list(
+                    getattr(
+                        legend,
+                        "legend_handles",
+                        getattr(legend, "legendHandles", []),
+                    )
+                )
+            for index, artist in enumerate(series_artists):
+                if index >= len(requested_series_colors):
+                    break
+                color = requested_series_colors[index]
+                if color and is_color_like(color):
+                    artist.set_color(color)
+                    if index < len(legend_handles):
+                        legend_handle = legend_handles[index]
+                        if hasattr(legend_handle, "set_color"):
+                            legend_handle.set_color(color)
+                        if hasattr(legend_handle, "set_facecolor"):
+                            legend_handle.set_facecolor(color)
+                        if hasattr(legend_handle, "set_edgecolor"):
+                            legend_handle.set_edgecolor(color)
+        if not bool(getattr(fig, "_swv_manual_layout", False)):
+            try:
+                margin_px = int(st.session_state.get("swv_plot_margin_px", 40))
+                fig.tight_layout(pad=max(0.5, margin_px / 30.0))
+            except (RuntimeError, ValueError):
+                pass
+        if globals().get("analysis_mode") == "SWV":
+            _position_swv_colorbars(fig)
+
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
-    container.pyplot(fig)
-    container.download_button(
+    if globals().get("analysis_mode") == "SWV":
+        plot_slot.image(
+            buffer.getvalue(),
+            width=int(st.session_state.get("swv_plot_width_px", 1200)),
+        )
+    else:
+        plot_slot.pyplot(fig)
+    download_col.download_button(
         "Download plot",
         data=buffer.getvalue(),
         file_name=f"{safe_download_stem(file_stem)}.png",
         mime="image/png",
         key=f"{key}_download",
+        use_container_width=True,
     )
     plt.close(fig)
 
@@ -184,7 +588,10 @@ def cached_run_batch(
     use_wavelet_for_correction,
     edge_trim_fraction,
     min_peak_prominence_uA,
+    input_signature,
 ):
+    # Used by Streamlit as part of the cache key.
+    del input_signature
     if analysis_mode == "CV":
         return run_cv_batch(
             folders=list(folders),
@@ -751,7 +1158,17 @@ def build_export_pdf(
 
 LANGMUIR_METRIC_KEY = "peak_current_selected"
 DEFAULT_SWV_VLINES_TEXT = ""
-DEFAULT_SWV_CROP_RANGE = (-1.0, 1.0)
+DEFAULT_SWV_CROP_RANGE = (-0.5, -0.1)
+DEFAULT_SWV_MIN_START_VOLTAGE = -0.6
+SWV_VOLTAGE_DEFAULTS_VERSION = 2
+DEFAULT_SWV_GROUP_COLORMAPS = (
+    "plasma",
+    "viridis",
+    "inferno",
+    "cividis",
+    "magma",
+    "turbo",
+)
 VLINE_ANNOTATION_HELP = (
     "One marker per line: scan,label. The scan is the x-axis position. "
     "For titration Kd, start the label with the concentration for the interval after that marker. "
@@ -775,6 +1192,21 @@ VLINE_ANNOTATION_PLACEHOLDER = (
 
 def supports_langmuir(metric_key: str) -> bool:
     return metric_key == LANGMUIR_METRIC_KEY
+
+
+def parse_colormap_names(text: str) -> Tuple[List[str], List[str]]:
+    available = {name.lower(): name for name in plt.colormaps()}
+    parsed = []
+    invalid = []
+    for token in (part.strip() for part in str(text or "").split(",")):
+        if not token:
+            continue
+        canonical = available.get(token.lower())
+        if canonical is None:
+            invalid.append(token)
+        else:
+            parsed.append(canonical)
+    return parsed, invalid
 
 
 def build_drift_options(analysis_mode: str, compute_skew: bool = True) -> Dict[str, Tuple[str, str, str]]:
@@ -1152,6 +1584,159 @@ def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
     return vlines, errors
 
 
+_AUTOTITRATION_MEASUREMENT_RE = re.compile(
+    r"Queue start ->\s*"
+    r"(?P<concentration>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"(?P<unit>pM|nM|[uµμ]M|mM|M)\s*\|"
+    r".*?MUX ch\s*(?P<channel>\d+)"
+    r".*?rep\s*(?P<replicate>\d+)\s*/\s*(?P<replicate_count>\d+)",
+    re.IGNORECASE,
+)
+_AUTOTITRATION_TAG_RE = re.compile(
+    r"\[Tag\].*?_(?P<scan>\d+)_ch(?P<channel>\d+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _autotitration_session_logs(folders: List[str]) -> List[Path]:
+    logs: List[Path] = []
+    seen: set[Path] = set()
+    for raw_folder in folders:
+        selected = Path(raw_folder).expanduser()
+        start = selected.parent if selected.is_file() else selected
+        for candidate_root in [start, *list(start.parents)[:4]]:
+            candidate = candidate_root / "session_log.txt"
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    logs.append(resolved)
+                    seen.add(resolved)
+        if start.is_dir():
+            try:
+                descendants = start.rglob("session_log.txt")
+                for candidate in descendants:
+                    if not candidate.is_file():
+                        continue
+                    resolved = candidate.resolve()
+                    if resolved not in seen:
+                        logs.append(resolved)
+                        seen.add(resolved)
+            except OSError:
+                continue
+    return logs
+
+
+def detect_autotitration_vlines(
+    folders: List[str],
+    results: List[dict],
+) -> Tuple[List[Tuple[float, str]], List[Path]]:
+    """Map logged autotitration concentrations onto the active result scan axis."""
+    logs = _autotitration_session_logs(folders)
+    logged_measurements: Dict[Tuple[int, int], Tuple[str, str]] = {}
+    used_logs: List[Path] = []
+    for log_path in logs:
+        pending_measurement: Optional[Tuple[str, str, int]] = None
+        matched_count = 0
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            measurement_match = _AUTOTITRATION_MEASUREMENT_RE.search(line)
+            if measurement_match:
+                unit = measurement_match.group("unit").replace("µ", "u").replace("μ", "u")
+                pending_measurement = (
+                    measurement_match.group("concentration"),
+                    unit,
+                    int(measurement_match.group("channel")),
+                )
+                continue
+            tag_match = _AUTOTITRATION_TAG_RE.search(line)
+            if tag_match and pending_measurement is not None:
+                concentration, unit, expected_channel = pending_measurement
+                tag_channel = int(tag_match.group("channel"))
+                if tag_channel == expected_channel:
+                    logged_measurements[
+                        (int(tag_match.group("scan")), tag_channel)
+                    ] = (concentration, unit)
+                    matched_count += 1
+                pending_measurement = None
+        if matched_count:
+            used_logs.append(log_path)
+
+    matched_rows = []
+    for row in results:
+        try:
+            key = (int(row.get("scan_id_from_name")), int(row.get("channel")))
+            plotted_scan = float(row.get("scan_number"))
+        except (TypeError, ValueError):
+            continue
+        concentration = logged_measurements.get(key)
+        if concentration is None or not math.isfinite(plotted_scan):
+            continue
+        matched_rows.append({
+            "global_scan": key[0],
+            "channel": key[1],
+            "plotted_scan": plotted_scan,
+            "concentration": concentration[0],
+            "unit": concentration[1],
+        })
+    if not matched_rows:
+        return [], used_logs
+
+    matched_rows.sort(key=lambda row: (row["global_scan"], row["channel"]))
+    segments: List[dict] = []
+    for row in matched_rows:
+        identity = (row["concentration"], row["unit"])
+        if not segments or segments[-1]["identity"] != identity:
+            segments.append({"identity": identity, "rows": []})
+        segments[-1]["rows"].append(row)
+
+    detected_vlines: List[Tuple[float, str]] = []
+    for segment in segments:
+        first_by_channel: Dict[int, float] = {}
+        for row in segment["rows"]:
+            channel = int(row["channel"])
+            first_by_channel[channel] = min(
+                first_by_channel.get(channel, float("inf")),
+                float(row["plotted_scan"]),
+            )
+        if not first_by_channel:
+            continue
+        boundary = float(np.median(list(first_by_channel.values())))
+        if np.isclose(boundary, round(boundary)):
+            boundary = float(round(boundary))
+        concentration, unit = segment["identity"]
+        if detected_vlines and boundary <= detected_vlines[-1][0]:
+            continue
+        detected_vlines.append((boundary, f"{concentration} {unit}"))
+
+    if detected_vlines and segments:
+        last_by_channel: Dict[int, float] = {}
+        for row in segments[-1]["rows"]:
+            channel = int(row["channel"])
+            last_by_channel[channel] = max(
+                last_by_channel.get(channel, float("-inf")),
+                float(row["plotted_scan"]),
+            )
+        if last_by_channel:
+            closing_boundary = float(
+                np.median([value + 1.0 for value in last_by_channel.values()])
+            )
+            if np.isclose(closing_boundary, round(closing_boundary)):
+                closing_boundary = float(round(closing_boundary))
+            if closing_boundary > detected_vlines[-1][0]:
+                detected_vlines.append((closing_boundary, "end"))
+    return detected_vlines, used_logs
+
+
+def _vlines_input_text(vlines: List[Tuple[float, str]]) -> str:
+    return "\n".join(
+        f"{int(scan) if float(scan).is_integer() else scan:g},{label}"
+        for scan, label in vlines
+    )
+
+
 def scan_in_windows(scan_number: float, scan_windows: List[Tuple[int, int]]) -> bool:
     return any(start <= scan_number < end for start, end in scan_windows)
 
@@ -1291,7 +1876,11 @@ def filter_vlines_to_results_axis(
 
 def _channel_display_sort_key(channel: Any) -> tuple:
     text = str(channel)
-    match = re.fullmatch(r"(\d+)(?:\s+group\s+(\d+))?", text, re.IGNORECASE)
+    match = re.fullmatch(
+        r"(\d+)(?:\s+group\s+(\d+))?(?:\s*\|.*)?",
+        text,
+        re.IGNORECASE,
+    )
     if match:
         channel_number = int(match.group(1))
         group_number = int(match.group(2) or 0)
@@ -1314,6 +1903,85 @@ def _swv_modulo_channel_label(channel: Any, group_index: int) -> str:
     return f"{channel} group {group_index}"
 
 
+SWV_SETTING_FIELDS = (
+    "swv_frequency_hz",
+    "swv_sweep_start_V",
+    "swv_sweep_end_V",
+    "swv_step_size_V",
+    "swv_amplitude_V",
+)
+
+
+def _swv_setting_value(row: dict, key: str) -> Optional[float]:
+    try:
+        value = float(row.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def swv_settings_signature(row: dict) -> Tuple[Optional[float], ...]:
+    return tuple(_swv_setting_value(row, key) for key in SWV_SETTING_FIELDS)
+
+
+def format_swv_settings_label(row: dict) -> str:
+    frequency, sweep_start, sweep_end, step_size, amplitude = swv_settings_signature(row)
+    parts = []
+    if frequency is not None:
+        parts.append(f"{frequency:g} Hz")
+    if sweep_start is not None and sweep_end is not None:
+        parts.append(f"sweep {sweep_start:g}→{sweep_end:g} V")
+    elif sweep_start is not None:
+        parts.append(f"start {sweep_start:g} V")
+    elif sweep_end is not None:
+        parts.append(f"end {sweep_end:g} V")
+    if step_size is not None:
+        parts.append(f"step {step_size:g} V")
+    if amplitude is not None:
+        parts.append(f"amplitude {amplitude:g} V")
+    return "; ".join(parts) if parts else "SWV settings unavailable"
+
+
+def apply_swv_settings_split_for_display(results: List[dict]) -> List[dict]:
+    """Split each channel by its complete SWV method settings."""
+    def _scan_sort_key(row: dict) -> float:
+        scan_number = row.get("scan_number")
+        return float(scan_number) if scan_number is not None else float("inf")
+
+    rows_by_channel: Dict[Any, List[dict]] = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel is not None:
+            rows_by_channel.setdefault(channel, []).append(row)
+
+    replacements: Dict[int, dict] = {}
+    for channel, channel_rows in rows_by_channel.items():
+        group_indexes: Dict[Tuple[Optional[float], ...], int] = {}
+        group_counts: Dict[Tuple[Optional[float], ...], int] = {}
+        for row in sorted(channel_rows, key=_scan_sort_key):
+            signature = swv_settings_signature(row)
+            if signature not in group_indexes:
+                group_indexes[signature] = len(group_indexes) + 1
+                group_counts[signature] = 0
+            group_counts[signature] += 1
+            settings_label = format_swv_settings_label(row)
+            updated = dict(row)
+            updated["original_channel"] = channel
+            updated["swv_settings_group"] = group_indexes[signature]
+            updated["swv_settings_signature"] = signature
+            updated["swv_settings_label"] = settings_label
+            updated["display_group_index"] = group_indexes[signature]
+            updated["display_group_trace_index"] = group_counts[signature]
+            updated["display_group_source_scan_number"] = row.get("scan_number")
+            updated["scan_number"] = group_counts[signature]
+            updated["channel"] = (
+                f"{channel} group {group_indexes[signature]} | {settings_label}"
+            )
+            replacements[id(row)] = updated
+
+    return [replacements.get(id(row), dict(row)) for row in results]
+
+
 def apply_swv_modulo_split_for_display(
     results: List[dict],
     modulo_count: int,
@@ -1334,19 +2002,133 @@ def apply_swv_modulo_split_for_display(
 
     replacements: Dict[int, dict] = {}
     for channel, channel_rows in rows_by_channel.items():
-        for index, row in enumerate(sorted(channel_rows, key=_scan_sort_key)):
+        ordered_rows = sorted(channel_rows, key=_scan_sort_key)
+        settings_by_group: Dict[int, List[str]] = {}
+        for index, row in enumerate(ordered_rows):
+            group_index = (index % modulo_count) + 1
+            settings_label = format_swv_settings_label(row)
+            group_settings = settings_by_group.setdefault(group_index, [])
+            if settings_label not in group_settings:
+                group_settings.append(settings_label)
+
+        for index, row in enumerate(ordered_rows):
             group_index = (index % modulo_count) + 1
             updated = dict(row)
             group_trace_index = (index // modulo_count) + 1
+            group_settings = settings_by_group[group_index]
+            group_settings_label = (
+                group_settings[0]
+                if len(group_settings) == 1
+                else f"mixed settings ({len(group_settings)} methods)"
+            )
             updated["original_channel"] = channel
             updated["modulo_group"] = group_index
             updated["modulo_group_trace_index"] = group_trace_index
             updated["modulo_source_scan_number"] = row.get("scan_number")
+            updated["swv_settings_label"] = format_swv_settings_label(row)
+            updated["modulo_group_settings_label"] = group_settings_label
+            updated["display_group_index"] = group_index
+            updated["display_group_trace_index"] = group_trace_index
+            updated["display_group_source_scan_number"] = row.get("scan_number")
             updated["scan_number"] = group_trace_index
-            updated["channel"] = _swv_modulo_channel_label(channel, group_index)
+            updated["channel"] = (
+                f"{_swv_modulo_channel_label(channel, group_index)} | "
+                f"{group_settings_label}"
+            )
             replacements[id(row)] = updated
 
     return [replacements.get(id(row), dict(row)) for row in results]
+
+
+def remap_vlines_to_swv_display_group(
+    vlines: List[Tuple[float, str]],
+    group_rows: List[dict],
+) -> List[Tuple[float, str]]:
+    """Map source-axis annotation intervals onto one group-local iteration axis."""
+    if not vlines or not group_rows:
+        return []
+    ordered_vlines = sorted(
+        [(float(x), str(label)) for x, label in vlines],
+        key=lambda item: item[0],
+    )
+    source_and_local = sorted(
+        [
+            (
+                float(row["display_group_source_scan_number"]),
+                float(row["scan_number"]),
+            )
+            for row in group_rows
+            if row.get("display_group_source_scan_number") is not None
+            and row.get("scan_number") is not None
+        ],
+        key=lambda item: item[0],
+    )
+    if not source_and_local:
+        return []
+
+    remapped: List[Tuple[float, str]] = []
+    final_local_value: Optional[float] = None
+    for index, (interval_start, label) in enumerate(ordered_vlines[:-1]):
+        interval_end = ordered_vlines[index + 1][0]
+        local_values = [
+            local
+            for source, local in source_and_local
+            if interval_start <= source < interval_end
+        ]
+        if not local_values:
+            continue
+        local_start = min(local_values)
+        if not remapped or not np.isclose(remapped[-1][0], local_start):
+            remapped.append((local_start, label))
+        final_local_value = max(local_values)
+
+    if final_local_value is not None and remapped:
+        closing_value = final_local_value + 1.0
+        if closing_value > remapped[-1][0]:
+            remapped.append((closing_value, ordered_vlines[-1][1]))
+    return remapped
+
+
+def merge_group_vlines(
+    grouped_vlines: List[List[Tuple[float, str]]],
+) -> List[Tuple[float, str]]:
+    merged: List[Tuple[float, str]] = []
+    for vlines in grouped_vlines:
+        for x, label in vlines:
+            if any(
+                np.isclose(existing_x, x) and existing_label == label
+                for existing_x, existing_label in merged
+            ):
+                continue
+            merged.append((float(x), str(label)))
+    return sorted(merged, key=lambda item: (item[0], item[1]))
+
+
+def group_swv_display_channels(
+    results: List[dict],
+    channels: List[Any],
+) -> Dict[Any, List[Any]]:
+    """Map each original SWV channel to its ordered display groups."""
+    selected_channels = set(channels)
+    grouped: Dict[Any, List[Any]] = {}
+    group_order: Dict[Any, int] = {}
+    for row in results:
+        display_channel = row.get("channel")
+        original_channel = row.get("original_channel")
+        if (
+            display_channel not in selected_channels
+            or original_channel is None
+            or row.get("display_group_index") is None
+        ):
+            continue
+        display_channels = grouped.setdefault(original_channel, [])
+        if display_channel not in display_channels:
+            display_channels.append(display_channel)
+            group_order[display_channel] = int(row["display_group_index"])
+
+    for display_channels in grouped.values():
+        display_channels.sort(key=lambda channel: group_order[channel])
+    return dict(sorted(grouped.items(), key=lambda item: _channel_display_sort_key(item[0])))
 
 
 def build_channel_indexes(
@@ -1377,6 +2159,7 @@ def build_channel_indexes(
 
     if scan_range is None:
         ok_in_range_by_channel = ok_by_channel
+        failed_in_range_by_channel = failed_by_channel
     else:
         start, end = scan_range
         ok_in_range_by_channel = {
@@ -1386,12 +2169,20 @@ def build_channel_indexes(
             ]
             for channel, rows in ok_by_channel.items()
         }
+        failed_in_range_by_channel = {
+            channel: [
+                row for row in rows
+                if row.get("scan_number") is not None and start <= row["scan_number"] <= end
+            ]
+            for channel, rows in failed_by_channel.items()
+        }
 
     return {
         "all_by_channel": all_by_channel,
         "ok_by_channel": ok_by_channel,
         "failed_by_channel": failed_by_channel,
         "ok_in_range_by_channel": ok_in_range_by_channel,
+        "failed_in_range_by_channel": failed_in_range_by_channel,
     }
 
 
@@ -1585,13 +2376,19 @@ with st.sidebar:
     st.subheader(" Voltage / Crop")
     col1, col2 = st.columns(2)
     if analysis_mode == "SWV":
-        crop_state_key = ("SWV", tuple(folders))
+        crop_state_key = ("SWV", tuple(folders), DEFAULT_SWV_CROP_RANGE)
         if st.session_state.get("swv_crop_folder_key") != crop_state_key:
-            bounds = _measurement_voltage_bounds(tuple(folders), mode="swv")
-            crop_defaults = bounds if bounds is not None else DEFAULT_SWV_CROP_RANGE
-            st.session_state.swv_crop_min = crop_defaults[0]
-            st.session_state.swv_crop_max = crop_defaults[1]
+            st.session_state.swv_crop_min = DEFAULT_SWV_CROP_RANGE[0]
+            st.session_state.swv_crop_max = DEFAULT_SWV_CROP_RANGE[1]
             st.session_state.swv_crop_folder_key = crop_state_key
+        if (
+            st.session_state.get("_swv_voltage_defaults_version")
+            != SWV_VOLTAGE_DEFAULTS_VERSION
+        ):
+            st.session_state.swv_min_start_voltage = DEFAULT_SWV_MIN_START_VOLTAGE
+            st.session_state["_swv_voltage_defaults_version"] = (
+                SWV_VOLTAGE_DEFAULTS_VERSION
+            )
         crop_min = col1.number_input(
             "Crop min (V)",
             value=float(st.session_state.get("swv_crop_min", DEFAULT_SWV_CROP_RANGE[0])),
@@ -1607,7 +2404,13 @@ with st.sidebar:
             key="swv_crop_max",
         )
         min_start_voltage = st.number_input(
-            "Min start voltage (V)", value=-0.70, step=0.01, format="%.3f",
+            "Min start voltage (V)",
+            value=float(st.session_state.get(
+                "swv_min_start_voltage",
+                DEFAULT_SWV_MIN_START_VOLTAGE,
+            )),
+            step=0.01,
+            format="%.3f",
             help="Skip files whose first voltage point is below this value.",
             key="swv_min_start_voltage",
         )
@@ -1766,20 +2569,29 @@ with st.sidebar:
             channels_to_plot = [int(c.strip()) for c in channels_input.split(",") if c.strip()]
         except ValueError:
             st.error("Invalid channel list  use integers separated by commas.")
+    swv_grouping_mode = "None"
+    use_swv_settings_grouping = False
     use_swv_modulo_split = False
     swv_modulo_split_count = 2
+    swv_group_overlay_colormaps = list(DEFAULT_SWV_GROUP_COLORMAPS)
+    swv_plot_show_legend = True
+    swv_plot_show_grid = False
+    swv_colorbar_height_fraction = 0.85
+    swv_colorbar_side = "right"
     if analysis_mode == "SWV":
-        mod_c1, mod_c2 = st.columns([1, 1])
-        use_swv_modulo_split = mod_c1.checkbox(
-            "Modulo split",
-            value=False,
-            key="swv_modulo_split",
+        group_c1, group_c2 = st.columns([2, 1])
+        swv_grouping_mode = group_c1.selectbox(
+            "Group plotted traces by",
+            ["None", "SWV settings", "Modulo sequence"],
+            key="swv_grouping_mode",
             help=(
-                "Split each channel's chronological SWV traces into repeating "
-                "setting groups before plotting."
+                "SWV settings uses the method-file frequency, sweep bounds, step size, "
+                "and amplitude. Modulo sequence is available as a metadata-free fallback."
             ),
         )
-        swv_modulo_split_count = int(mod_c2.number_input(
+        use_swv_settings_grouping = swv_grouping_mode == "SWV settings"
+        use_swv_modulo_split = swv_grouping_mode == "Modulo sequence"
+        swv_modulo_split_count = int(group_c2.number_input(
             "Modulo groups",
             min_value=2,
             max_value=20,
@@ -1792,11 +2604,252 @@ with st.sidebar:
                 "group 2, ... group m, then repeated."
             ),
         ))
-        if use_swv_modulo_split:
+        if use_swv_settings_grouping:
             st.caption(
-                f"Modulo split is active: each selected channel is plotted as "
+                "Traces with identical frequency, sweep start/end, step size, and "
+                "amplitude are grouped together per channel."
+            )
+        elif use_swv_modulo_split:
+            st.caption(
+                f"Modulo fallback is active: each selected channel is plotted as "
                 f"{swv_modulo_split_count} chronological groups. Scan vlines are "
                 "interpreted on the group-local scan axis."
+            )
+        group_colormap_text = st.text_input(
+            "Group overlay colormaps",
+            value=",".join(DEFAULT_SWV_GROUP_COLORMAPS),
+            key="swv_group_overlay_colormaps",
+            disabled=not (use_swv_settings_grouping or use_swv_modulo_split),
+            help=(
+                "Comma-separated Matplotlib colormap names. Group 1 uses the first, "
+                "group 2 the second, and so on; the list cycles if needed."
+            ),
+        )
+        parsed_group_colormaps, invalid_group_colormaps = parse_colormap_names(
+            group_colormap_text
+        )
+        if invalid_group_colormaps:
+            st.warning(
+                "Unknown colormap(s): "
+                + ", ".join(invalid_group_colormaps)
+                + ". Valid entries will still be used."
+            )
+        if parsed_group_colormaps:
+            swv_group_overlay_colormaps = parsed_group_colormaps
+        else:
+            swv_group_overlay_colormaps = list(DEFAULT_SWV_GROUP_COLORMAPS)
+
+        with st.expander("SWV Plot Formatting & Exploration", expanded=False):
+            st.slider(
+                "Plot width",
+                min_value=600,
+                max_value=2200,
+                value=1200,
+                step=20,
+                format="%d px",
+                key="swv_plot_width_px",
+                help="Exact width used for browser plots and downloaded PNGs.",
+            )
+            st.slider(
+                "Plot height",
+                min_value=300,
+                max_value=1200,
+                value=600,
+                step=20,
+                format="%d px",
+                key="swv_plot_height_px",
+                help="Exact height used for browser plots and downloaded PNGs.",
+            )
+            st.slider(
+                "Plot text size",
+                min_value=6.0,
+                max_value=36.0,
+                value=10.0,
+                step=0.5,
+                format="%.1f pt",
+                key="swv_plot_text_size_points",
+            )
+            st.slider(
+                "Line thickness",
+                min_value=0.25,
+                max_value=5.0,
+                value=1.0,
+                step=0.25,
+                format="%.2fx",
+                key="swv_plot_line_width_scale",
+            )
+            line_color_override = st.text_input(
+                "Line color override",
+                key="swv_plot_line_color_override",
+                help=(
+                    "Optional Matplotlib/CSS color. Leave blank to preserve the "
+                    "selected colormaps."
+                ),
+            )
+            if line_color_override.strip() and not is_color_like(line_color_override):
+                st.caption("Unrecognized line color; the selected colormaps are being used.")
+            st.slider(
+                "Outer plot margin",
+                min_value=0,
+                max_value=200,
+                value=40,
+                step=5,
+                format="%d px",
+                key="swv_plot_margin_px",
+            )
+            st.slider(
+                "Plot perimeter thickness",
+                min_value=0.0,
+                max_value=5.0,
+                value=0.8,
+                step=0.2,
+                key="swv_plot_perimeter_width",
+            )
+            swv_perimeter_color = st.text_input(
+                "Plot perimeter color",
+                value="#222222",
+                key="swv_plot_perimeter_color",
+                help="Use a Matplotlib/CSS color name or hex value.",
+            )
+            if (
+                swv_perimeter_color.strip()
+                and not is_color_like(swv_perimeter_color)
+            ):
+                st.caption(
+                    "Unrecognized perimeter color; #222222 is being used."
+                )
+            swv_plot_show_legend = st.checkbox(
+                "Show plot legends",
+                value=True,
+                key="swv_plot_show_legend",
+            )
+            swv_plot_show_grid = st.checkbox(
+                "Show background grid",
+                value=False,
+                key="swv_plot_show_grid",
+            )
+            marker_columns = st.columns(2)
+            marker_columns[0].slider(
+                "Marker size",
+                min_value=2.0,
+                max_value=20.0,
+                value=6.0,
+                step=1.0,
+                key="swv_plot_marker_size",
+            )
+            marker_columns[1].slider(
+                "Marker opacity",
+                min_value=0.05,
+                max_value=1.0,
+                value=0.85,
+                step=0.05,
+                key="swv_plot_marker_opacity",
+            )
+
+            st.markdown("**Displayed axis limits**")
+            st.checkbox(
+                "Set voltage limits manually",
+                key="swv_plot_manual_x_limits",
+            )
+            x_limit_columns = st.columns(2)
+            x_limit_columns[0].number_input(
+                "Voltage minimum",
+                value=float(crop_min),
+                step=0.01,
+                format="%.4f",
+                key="swv_plot_x_min",
+                disabled=not st.session_state.get("swv_plot_manual_x_limits", False),
+            )
+            x_limit_columns[1].number_input(
+                "Voltage maximum",
+                value=float(crop_max),
+                step=0.01,
+                format="%.4f",
+                key="swv_plot_x_max",
+                disabled=not st.session_state.get("swv_plot_manual_x_limits", False),
+            )
+            st.checkbox(
+                "Set current limits manually",
+                key="swv_plot_manual_y_limits",
+            )
+            y_limit_columns = st.columns(2)
+            y_limit_columns[0].number_input(
+                "Current minimum",
+                value=-0.1,
+                step=0.1,
+                format="%.4f",
+                key="swv_plot_y_min",
+                disabled=not st.session_state.get("swv_plot_manual_y_limits", False),
+            )
+            y_limit_columns[1].number_input(
+                "Current maximum",
+                value=1.5,
+                step=0.1,
+                format="%.4f",
+                key="swv_plot_y_max",
+                disabled=not st.session_state.get("swv_plot_manual_y_limits", False),
+            )
+
+            st.markdown("**Global text overrides**")
+            st.text_input(
+                "Title override",
+                key="swv_plot_title_override",
+                help="Leave blank to use each plot's generated title.",
+            )
+            st.text_input(
+                "X-axis label override",
+                key="swv_plot_x_label_override",
+            )
+            st.text_input(
+                "Y-axis label override",
+                key="swv_plot_y_label_override",
+            )
+            st.text_input(
+                "Colorbar label override",
+                key="swv_plot_colorbar_label_override",
+            )
+
+            st.markdown("**Tick label overrides**")
+            st.caption(
+                "Enter comma-separated original positions and displayed labels. "
+                "Leave positions blank to relabel existing ticks in order."
+            )
+            for axis_key, axis_label in (
+                ("x", "X axis"),
+                ("y", "Y axis"),
+                ("colorbar", "Colorbar"),
+            ):
+                st.caption(axis_label)
+                tick_columns = st.columns(2)
+                tick_columns[0].text_input(
+                    "Positions",
+                    key=f"swv_plot_{axis_key}_tick_positions",
+                    label_visibility="collapsed",
+                    placeholder="0, 1, 2",
+                )
+                tick_columns[1].text_input(
+                    "Labels",
+                    key=f"swv_plot_{axis_key}_tick_labels",
+                    label_visibility="collapsed",
+                    placeholder="A, B, C",
+                )
+
+            colorbar_columns = st.columns(2)
+            colorbar_height_percent = colorbar_columns[0].slider(
+                "Colorbar height",
+                min_value=20,
+                max_value=100,
+                value=85,
+                step=5,
+                format="%d%%",
+                key="swv_colorbar_height_percent",
+            )
+            swv_colorbar_height_fraction = colorbar_height_percent / 100.0
+            swv_colorbar_side = colorbar_columns[1].radio(
+                "Colorbar side",
+                ["right", "left"],
+                horizontal=True,
+                key="swv_colorbar_side",
             )
 
     st.divider()
@@ -1887,6 +2940,7 @@ if run_clicked and folders and not folder_errors:
                     use_wavelet_for_correction=use_wavelet_for_correction,
                     edge_trim_fraction=edge_trim_fraction,
                     min_peak_prominence_uA=min_peak_prominence,
+                    input_signature=_analysis_input_signature(tuple(folders)),
                 )
         else:
             progress_bar = st.progress(0)
@@ -2145,12 +3199,81 @@ if analysis_mode == "SWV":
             "without rerunning the expensive analysis."
         )
 
+    detected_autotitration_vlines, autotitration_logs = (
+        detect_autotitration_vlines(folders, results)
+    )
+    detected_autotitration_text = _vlines_input_text(
+        detected_autotitration_vlines
+    )
+    autotitration_log_signature = tuple(
+        (
+            str(path),
+            path.stat().st_mtime_ns,
+            path.stat().st_size,
+        )
+        for path in autotitration_logs
+        if path.is_file()
+    )
+    autotitration_detection_key = (
+        current_selection_key,
+        autotitration_log_signature,
+        tuple(selected_swv_method_groups),
+        len(results),
+    )
+    if (
+        detected_autotitration_text
+        and st.session_state.get("_swv_autotitration_detection_key")
+        != autotitration_detection_key
+    ):
+        current_vline_text = str(
+            st.session_state.get(
+                "swv_post_vlines_input",
+                DEFAULT_SWV_VLINES_TEXT,
+            )
+            or ""
+        )
+        previous_auto_text = str(
+            st.session_state.get("_swv_autotitration_generated_vlines", "")
+            or ""
+        )
+        if not current_vline_text.strip() or current_vline_text == previous_auto_text:
+            st.session_state["swv_post_vlines_input"] = (
+                detected_autotitration_text
+            )
+        st.session_state["_swv_autotitration_generated_vlines"] = (
+            detected_autotitration_text
+        )
+        st.session_state["_swv_autotitration_detection_key"] = (
+            autotitration_detection_key
+        )
+
     with st.expander("Scan Annotations", expanded=False):
+        if detected_autotitration_vlines:
+            detected_concentrations = [
+                label
+                for _scan, label in detected_autotitration_vlines
+                if label != "end"
+            ]
+            st.success(
+                "Autotitration detected. Loaded concentration boundaries for "
+                + ", ".join(detected_concentrations)
+                + "."
+            )
+            st.caption(
+                "The detected indices are loaded into Vline annotations below "
+                "and can be edited before applying the display controls."
+            )
         with st.form("swv_post_analysis_controls"):
             st.caption(
                 "Vlines are written as scan,label. They use the current plotted scan axis, "
                 "including subsection-relative numbering."
             )
+            if use_swv_settings_grouping or use_swv_modulo_split:
+                st.caption(
+                    "Enter annotations on the source scan axis. Metrics plots "
+                    "automatically remap them to each SWV-settings or modulo "
+                    "group's local iteration axis."
+                )
             st.caption(
                 "For titration, consecutive vlines define steps. The concentration at the left vline "
                 "is used for that step; the last vline simply closes the final interval."
@@ -2229,7 +3352,7 @@ ok_results     = [r for r in results if r.get("status") == "OK"]
 failed_results = [r for r in results if r.get("status") == "FAILED"]
 channel_indexes = build_channel_indexes(results, scan_range=plot_scan_range)
 results_by_channel = channel_indexes["all_by_channel"]
-failed_results_by_channel = channel_indexes["failed_by_channel"]
+failed_results_by_channel = channel_indexes["failed_in_range_by_channel"]
 ok_plot_results_by_channel = channel_indexes["ok_in_range_by_channel"]
 all_channels   = sorted(results_by_channel, key=_channel_display_sort_key)
 channels_display = channels_to_plot if channels_to_plot else all_channels
@@ -2243,21 +3366,30 @@ plot_results_by_channel = results_by_channel
 plot_failed_results_by_channel = failed_results_by_channel
 plot_ok_results_by_channel = ok_plot_results_by_channel
 plot_channels_display = channels_display
-if analysis_mode == "SWV" and use_swv_modulo_split:
-    plot_results = apply_swv_modulo_split_for_display(
-        results,
-        swv_modulo_split_count,
-    )
+plot_vlines_by_channel: Dict[Any, List[Tuple[float, str]]] = {}
+use_swv_display_grouping = (
+    analysis_mode == "SWV"
+    and (use_swv_settings_grouping or use_swv_modulo_split)
+)
+if use_swv_display_grouping:
+    if use_swv_settings_grouping:
+        plot_results = apply_swv_settings_split_for_display(results)
+        plot_x_axis_label = "SWV setting iteration"
+    else:
+        plot_results = apply_swv_modulo_split_for_display(
+            results,
+            swv_modulo_split_count,
+        )
+        plot_x_axis_label = "Modulo group iteration"
     compute_drift_fields(plot_results)
     plot_active_vlines = active_vlines
-    plot_x_axis_label = "Modulo group scan number"
     plot_display_scan_range = None
     plot_channel_indexes = build_channel_indexes(
         plot_results,
         scan_range=plot_display_scan_range,
     )
     plot_results_by_channel = plot_channel_indexes["all_by_channel"]
-    plot_failed_results_by_channel = plot_channel_indexes["failed_by_channel"]
+    plot_failed_results_by_channel = plot_channel_indexes["failed_in_range_by_channel"]
     plot_ok_results_by_channel = plot_channel_indexes["ok_in_range_by_channel"]
     selected_channel_set = (
         {str(channel) for channel in channels_display}
@@ -2269,9 +3401,19 @@ if analysis_mode == "SWV" and use_swv_modulo_split:
         for channel in sorted(plot_results_by_channel, key=_channel_display_sort_key)
         if (
             selected_channel_set is None
-            or str(channel).split(" group ", 1)[0] in selected_channel_set
+            or str(plot_results_by_channel[channel][0].get("original_channel")) in selected_channel_set
         )
     ]
+    plot_vlines_by_channel = {
+        display_channel: remap_vlines_to_swv_display_group(
+            active_vlines,
+            plot_results_by_channel.get(display_channel, []),
+        )
+        for display_channel in plot_channels_display
+    }
+    plot_active_vlines = merge_group_vlines(
+        list(plot_vlines_by_channel.values())
+    )
 
 ch_options = ["All channels"] + [f"Ch{ch}" for ch in plot_channels_display]
 
@@ -2293,6 +3435,157 @@ st.divider()
 if not results:
     st.info("No measurements match the current SWV method filter.")
     st.stop()
+
+if use_swv_display_grouping:
+    setting_summary = []
+    for display_channel in plot_channels_display:
+        group_rows = plot_results_by_channel.get(display_channel, [])
+        if not group_rows:
+            continue
+        first_row = group_rows[0]
+        settings_label = (
+            first_row.get("swv_settings_label")
+            if use_swv_settings_grouping
+            else first_row.get("modulo_group_settings_label")
+        )
+        settings_are_consistent = not str(settings_label).startswith("mixed settings")
+        setting_summary.append({
+            "Channel": first_row.get("original_channel"),
+            "Group": first_row.get("display_group_index"),
+            "SWV settings": settings_label,
+            "Frequency (Hz)": first_row.get("swv_frequency_hz") if settings_are_consistent else None,
+            "Sweep start (V)": first_row.get("swv_sweep_start_V") if settings_are_consistent else None,
+            "Sweep end (V)": first_row.get("swv_sweep_end_V") if settings_are_consistent else None,
+            "Step (V)": first_row.get("swv_step_size_V") if settings_are_consistent else None,
+            "Amplitude (V)": first_row.get("swv_amplitude_V") if settings_are_consistent else None,
+            "Measurements": len(group_rows),
+        })
+    with st.expander(
+        (
+            f"Detected SWV Setting Groups ({len(setting_summary)})"
+            if use_swv_settings_grouping
+            else f"Modulo Groups and Detected Settings ({len(setting_summary)})"
+        ),
+        expanded=True,
+    ):
+        if setting_summary:
+            st.dataframe(pd.DataFrame(setting_summary), use_container_width=True, hide_index=True)
+            if any(
+                row.get("swv_settings_label") == "SWV settings unavailable"
+                for row in plot_results
+            ):
+                missing_method_count = sum(
+                    1 for row in plot_results
+                    if (
+                        row.get("swv_settings_label") == "SWV settings unavailable"
+                        and not row.get("method_exists")
+                    )
+                )
+                unparsed_method_count = sum(
+                    1 for row in plot_results
+                    if (
+                        row.get("swv_settings_label") == "SWV settings unavailable"
+                        and row.get("method_exists")
+                    )
+                )
+                st.warning(
+                    "Some measurements do not contain parseable SWV settings "
+                    f"({missing_method_count} missing method files; "
+                    f"{unparsed_method_count} method files found but not parsed). "
+                    "Run Analysis again after method files are added or changed."
+                )
+            if any(
+                str(row.get("modulo_group_settings_label", "")).startswith("mixed settings")
+                for row in plot_results
+            ):
+                st.warning(
+                    "At least one modulo group contains multiple SWV methods. Use "
+                    "'SWV settings' grouping for an unambiguous comparison."
+                )
+        else:
+            st.info("No SWV setting metadata is available for the selected channels.")
+
+if analysis_mode == "SWV":
+    iteration_values = [
+        int(row["scan_number"])
+        for row in plot_results
+        if row.get("scan_number") is not None
+    ]
+    if iteration_values:
+        iteration_min = min(iteration_values)
+        iteration_max = max(iteration_values)
+        with st.expander("Plot Iteration Range", expanded=False):
+            limit_plot_iteration_range = st.checkbox(
+                "Limit plotted iterations",
+                key="swv_limit_plot_iteration_range",
+                help=(
+                    "Filters displayed and exported SWV plots without rerunning analysis. "
+                    "When traces are grouped, the values use the group-local iteration axis."
+                ),
+            )
+            range_signature = (
+                iteration_min,
+                iteration_max,
+                swv_grouping_mode,
+                int(swv_modulo_split_count),
+                tuple(str(channel) for channel in plot_channels_display),
+            )
+            if st.session_state.get("_swv_plot_iteration_range_signature") != range_signature:
+                st.session_state["_swv_plot_iteration_range_signature"] = range_signature
+                st.session_state["swv_plot_iteration_start"] = iteration_min
+                st.session_state["swv_plot_iteration_end"] = iteration_max
+
+            range_c1, range_c2 = st.columns(2)
+            iteration_start = int(range_c1.number_input(
+                "First iteration",
+                min_value=iteration_min,
+                max_value=iteration_max,
+                step=1,
+                key="swv_plot_iteration_start",
+                disabled=not limit_plot_iteration_range,
+            ))
+            iteration_end = int(range_c2.number_input(
+                "Last iteration",
+                min_value=iteration_min,
+                max_value=iteration_max,
+                step=1,
+                key="swv_plot_iteration_end",
+                disabled=not limit_plot_iteration_range,
+            ))
+
+            if limit_plot_iteration_range:
+                selected_iteration_range = (
+                    min(iteration_start, iteration_end),
+                    max(iteration_start, iteration_end),
+                )
+                plot_display_scan_range = selected_iteration_range
+                plot_active_vlines = [
+                    (x, label)
+                    for x, label in plot_active_vlines
+                    if selected_iteration_range[0] <= x <= selected_iteration_range[1]
+                ]
+                plot_vlines_by_channel = {
+                    channel: [
+                        (x, label)
+                        for x, label in channel_vlines
+                        if selected_iteration_range[0]
+                        <= x
+                        <= selected_iteration_range[1]
+                    ]
+                    for channel, channel_vlines
+                    in plot_vlines_by_channel.items()
+                }
+                plot_channel_indexes = build_channel_indexes(
+                    plot_results,
+                    scan_range=plot_display_scan_range,
+                )
+                plot_results_by_channel = plot_channel_indexes["all_by_channel"]
+                plot_failed_results_by_channel = plot_channel_indexes["failed_in_range_by_channel"]
+                plot_ok_results_by_channel = plot_channel_indexes["ok_in_range_by_channel"]
+                st.caption(
+                    f"Plotting iterations {selected_iteration_range[0]}–"
+                    f"{selected_iteration_range[1]} (inclusive)."
+                )
 
 # 
 # Tabs
@@ -2337,6 +3630,15 @@ if view == "Overlays":
             value=True,
             help="Adds vertical lines for initial, average, and final oxidation/reduction peak voltages in the displayed cycles.",
         )
+        overlay_line_alpha = st.slider(
+            "Overlay line opacity",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.90,
+            step=0.05,
+            key="cv_overlay_line_alpha",
+            help="Lower values make overlaid trace lines more transparent.",
+        )
 
         key_map = {
             "Raw": "raw_current",
@@ -2356,6 +3658,7 @@ if view == "Overlays":
                     title=f"{trace_type}  Ch{ch}",
                     ylabel="Current (uA)",
                     colormap_name=cmap_name,
+                    alpha=overlay_line_alpha,
                     show_peak_markers=show_peak_markers,
                     show_zero_baseline=(y_key == "detrended_current"),
                     show_baseline=show_baseline,
@@ -2371,65 +3674,205 @@ if view == "Overlays":
                 else:
                     st.warning("No plottable traces for this channel.")
     else:
+        overlay_groups_by_channel = False
+        if use_swv_display_grouping:
+            overlay_layout = st.radio(
+                "Group layout",
+                ["Separate group plots", "Overlay groups by channel"],
+                horizontal=True,
+                key="swv_overlay_group_layout",
+                help=(
+                    "Overlay groups by channel creates one plot per original channel "
+                    "and assigns each group its sidebar colormap."
+                ),
+            )
+            overlay_groups_by_channel = overlay_layout == "Overlay groups by channel"
+
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
-        trace_type_options = ["Corrected", "Smoothed Corrected", "Normalized Smoothed Corrected", "Raw", "Smoothed"]
+        trace_type_options = [
+            "Corrected",
+            "Smoothed Corrected",
+            "Normalized Smoothed Corrected",
+            "Raw",
+            "Offset Raw",
+            "Smoothed",
+        ]
         if has_wavelet_denoised_trace:
             trace_type_options.append("Wavelet Denoised")
         trace_type   = ov_c1.radio("Trace type", trace_type_options,
                                     horizontal=True, key="overlay_type")
         cmap_name    = ov_c2.selectbox("Colour map",
                                        ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
-                                       key="overlay_cmap")
+                                       key="overlay_cmap",
+                                       disabled=overlay_groups_by_channel,
+                                       help=(
+                                           "Used for separate plots. Grouped overlays use "
+                                           "the colormap list in the left sidebar."
+                                       ))
         show_anchors = ov_c3.checkbox("Show correction anchors", value=True,
                                       help="Dots mark the two bracketing-minima points used for baseline correction.")
         show_peak_markers = ov_c4.checkbox("Show peak points", value=False,
                                            help="Marks the detected peak on each displayed trace.")
         show_baseline = ov_c5.checkbox("Show 0 baseline", value=True,
                                        help="Draws a dashed horizontal zero-current reference line.")
+        overlay_line_alpha = st.slider(
+            "Overlay line opacity",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.85,
+            step=0.05,
+            key="swv_overlay_line_alpha",
+            help="Lower values make overlaid trace lines more transparent.",
+        )
 
         key_map = {
             "Corrected": "corrected_current",
             "Smoothed Corrected": "smoothed_corrected_current",
             "Normalized Smoothed Corrected": "smoothed_corrected_current",
             "Raw": "raw_current",
+            "Offset Raw": "raw_current",
             "Smoothed": "smoothed_current",
             "Wavelet Denoised": "wavelet_denoised_current",
         }
         y_key = key_map[trace_type]
         normalize_to_peak = trace_type == "Normalized Smoothed Corrected"
-        overlay_ylabel = "Normalized current (peak = 1)" if normalize_to_peak else "Current (uA)"
+        offset_to_baseline = trace_type == "Offset Raw"
+        overlay_ylabel = (
+            "Normalized current (peak = 1)"
+            if normalize_to_peak
+            else ("Offset raw current (uA)" if offset_to_baseline else "Current (uA)")
+        )
 
-        for ch in plot_channels_display:
-            ch_res = plot_ok_results_by_channel.get(ch, [])
-            if not ch_res:
-                continue
-            with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
-                fig = plot_overlaid_traces(
-                    ch_res, y_key=y_key,
-                    title=f"{trace_type}  Ch{ch}",
-                    ylabel=overlay_ylabel,
-                    colormap_name=cmap_name,
-                    show_anchors=show_anchors,
-                    show_peak_markers=(show_peak_markers and y_key != "wavelet_denoised_current"),
-                    show_zero_baseline=(show_baseline and y_key in ("corrected_current", "smoothed_corrected_current")),
-                    normalize_to_peak=normalize_to_peak,
-                )
-                if fig:
-                    render_downloadable_pyplot(
-                        st,
-                        fig,
-                        key=f"swv_overlay_{ch}_{y_key}_{normalize_to_peak}",
-                        file_stem=f"swv_overlay_ch{ch}_{trace_type}",
+        if overlay_groups_by_channel:
+            grouped_channels = group_swv_display_channels(
+                plot_results,
+                plot_channels_display,
+            )
+            for original_ch, display_groups in grouped_channels.items():
+                grouped_trace_sets = []
+                total_trace_count = 0
+                for group_position, display_group in enumerate(display_groups):
+                    group_rows = plot_ok_results_by_channel.get(display_group, [])
+                    if not group_rows:
+                        continue
+                    first_row = group_rows[0]
+                    if use_swv_settings_grouping:
+                        group_label = str(first_row.get("swv_settings_label") or display_group)
+                    else:
+                        group_label = (
+                            f"Group {first_row.get('display_group_index')} | "
+                            f"{first_row.get('modulo_group_settings_label') or 'settings unavailable'}"
+                        )
+                    group_colormap = swv_group_overlay_colormaps[
+                        group_position % len(swv_group_overlay_colormaps)
+                    ]
+                    grouped_trace_sets.append(
+                        (group_label, group_rows, group_colormap)
                     )
-                else:
-                    st.warning("No plottable traces for this channel.")
+                    total_trace_count += len(group_rows)
+                if not grouped_trace_sets:
+                    continue
+                with st.expander(
+                    (
+                        f"Channel {original_ch} ({len(grouped_trace_sets)} groups, "
+                        f"{total_trace_count} traces)"
+                    ),
+                    expanded=len(grouped_channels) <= 4,
+                ):
+                    fig = plot_grouped_overlaid_traces(
+                        grouped_trace_sets,
+                        y_key=y_key,
+                        title=f"{trace_type}  Ch{original_ch}",
+                        ylabel=overlay_ylabel,
+                        alpha=overlay_line_alpha,
+                        show_anchors=show_anchors,
+                        show_peak_markers=(
+                            show_peak_markers and y_key != "wavelet_denoised_current"
+                        ),
+                        show_zero_baseline=(
+                            show_baseline
+                            and (
+                                y_key in ("corrected_current", "smoothed_corrected_current")
+                                or offset_to_baseline
+                            )
+                        ),
+                        normalize_to_peak=normalize_to_peak,
+                        offset_to_baseline=offset_to_baseline,
+                        colorbar_height_fraction=swv_colorbar_height_fraction,
+                        colorbar_side=swv_colorbar_side,
+                        show_legend=swv_plot_show_legend,
+                        show_grid=swv_plot_show_grid,
+                        outer_margin_fraction=(
+                            float(st.session_state.get("swv_plot_margin_px", 40))
+                            / max(
+                                float(st.session_state.get("swv_plot_width_px", 1200)),
+                                1.0,
+                            )
+                        ),
+                    )
+                    if fig:
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=(
+                                f"swv_grouped_overlay_{original_ch}_{y_key}_"
+                                f"{normalize_to_peak}_{offset_to_baseline}"
+                            ),
+                            file_stem=(
+                                f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
+                            ),
+                            plot_kind="swv_trace",
+                        )
+                    else:
+                        st.warning("No plottable traces for this channel.")
+        else:
+            for ch in plot_channels_display:
+                ch_res = plot_ok_results_by_channel.get(ch, [])
+                if not ch_res:
+                    continue
+                with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
+                    fig = plot_overlaid_traces(
+                        ch_res, y_key=y_key,
+                        title=f"{trace_type}  Ch{ch}",
+                        ylabel=overlay_ylabel,
+                        colormap_name=cmap_name,
+                        alpha=overlay_line_alpha,
+                        show_anchors=show_anchors,
+                        show_peak_markers=(show_peak_markers and y_key != "wavelet_denoised_current"),
+                        show_zero_baseline=(
+                            show_baseline
+                            and (
+                                y_key in ("corrected_current", "smoothed_corrected_current")
+                                or offset_to_baseline
+                            )
+                        ),
+                        normalize_to_peak=normalize_to_peak,
+                        offset_to_baseline=offset_to_baseline,
+                    )
+                    if fig:
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=(
+                                f"swv_overlay_{ch}_{y_key}_{normalize_to_peak}_"
+                                f"{offset_to_baseline}"
+                            ),
+                            file_stem=f"swv_overlay_ch{ch}_{trace_type}",
+                            plot_kind="swv_trace",
+                        )
+                    else:
+                        st.warning("No plottable traces for this channel.")
 
 
 # 
 # TAB: Metrics
 # 
 if view == "Metrics":
-    st.subheader("Metrics vs cycle number" if analysis_mode == "CV" else "Metrics vs scan number")
+    st.subheader(
+        "Metrics vs cycle number"
+        if analysis_mode == "CV"
+        else ("Metrics vs grouped iteration" if use_swv_display_grouping else "Metrics vs scan number")
+    )
 
     m_c1, m_c2 = st.columns([3, 1])
     selected_metrics = m_c1.multiselect(
@@ -2458,8 +3901,39 @@ if view == "Metrics":
     if ch_selection != "All channels":
         highlight_ch = _channel_option_value(ch_selection)
 
-    view_mode = st.radio("View mode", ["Combined", "Individual channels"],
-                          horizontal=True, key="metric_view_mode")
+    metric_view_options = ["Combined", "Individual channels"]
+    grouped_overlay_view = None
+    if use_swv_settings_grouping:
+        grouped_overlay_view = "Overlay SWV settings by channel"
+    elif use_swv_modulo_split:
+        grouped_overlay_view = "Overlay modulo groups by channel"
+    if grouped_overlay_view is not None:
+        metric_view_options.append(grouped_overlay_view)
+    if st.session_state.get("metric_view_mode") not in metric_view_options:
+        st.session_state["metric_view_mode"] = "Combined"
+    view_mode = st.radio(
+        "View mode",
+        metric_view_options,
+        horizontal=True,
+        key="metric_view_mode",
+    )
+    grouped_channels_by_original = (
+        group_swv_display_channels(plot_results, plot_channels_display)
+        if view_mode == grouped_overlay_view
+        else {}
+    )
+    if grouped_overlay_view is not None and view_mode == grouped_overlay_view:
+        if use_swv_settings_grouping:
+            st.caption(
+                "Each plot represents one original channel. Curves are grouped by the "
+                "full SWV settings shown in the legend and overlaid on their shared "
+                "setting-local iteration axis."
+            )
+        else:
+            st.caption(
+                "Each plot represents one original channel. Its modulo groups are overlaid "
+                "against their shared group-local iteration axis."
+            )
 
     if enable_titration_analysis:
         if not titration_ready:
@@ -2494,12 +3968,17 @@ if view == "Metrics":
                     key=f"metric_combined_{metric}_{highlight_ch or 'all'}",
                     file_stem=f"metric_{label}_combined",
                 )
-        else:
+        elif view_mode == "Individual channels":
             cols = st.columns(min(len(plot_channels_display), 3))
             for i, ch in enumerate(plot_channels_display):
                 fig = plot_metric_vs_scan(
                     plot_results, metric=metric, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=plot_active_vlines,
+                    title=f"Ch{ch}", ylabel=ylabel,
+                    vlines=(
+                        plot_vlines_by_channel.get(ch, plot_active_vlines)
+                        if use_swv_display_grouping
+                        else plot_active_vlines
+                    ),
                     scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
                 )
                 if fig:
@@ -2509,6 +3988,36 @@ if view == "Metrics":
                             fig,
                             key=f"metric_ch{ch}_{metric}",
                             file_stem=f"metric_{label}_ch{ch}",
+                        )
+        else:
+            original_channels = list(grouped_channels_by_original)
+            cols = st.columns(min(len(original_channels), 3))
+            for i, (original_ch, display_groups) in enumerate(grouped_channels_by_original.items()):
+                original_channel_results = [
+                    row for row in plot_results
+                    if row.get("channel") in display_groups
+                ]
+                fig = plot_metric_vs_scan(
+                    original_channel_results,
+                    metric=metric,
+                    channels=display_groups,
+                    title=f"Ch{original_ch}",
+                    ylabel=ylabel,
+                    vlines=merge_group_vlines([
+                        plot_vlines_by_channel.get(display_group, [])
+                        for display_group in display_groups
+                    ]),
+                    scan_range=plot_display_scan_range,
+                    figsize=(5, 3),
+                    xlabel=plot_x_axis_label,
+                )
+                if fig:
+                    with cols[i % min(len(original_channels), 3)]:
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=f"metric_group_overlay_ch{original_ch}_{metric}_{swv_grouping_mode}",
+                            file_stem=f"metric_{label}_ch{original_ch}_group_overlay",
                         )
 
         if titration_ready:
@@ -2524,7 +4033,7 @@ if view == "Metrics":
                     scan_windows=None,
                     scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
-                    highlight_channel=highlight_ch if not use_swv_modulo_split else None,
+                    highlight_channel=highlight_ch if not use_swv_display_grouping else None,
                 )
                 if fig:
                     render_downloadable_pyplot(
@@ -2573,7 +4082,7 @@ if view == "Metrics":
                         scan_windows=None,
                         scan_range=plot_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
-                        highlight_channel=highlight_ch if not use_swv_modulo_split else None,
+                        highlight_channel=highlight_ch if not use_swv_display_grouping else None,
                         fit_langmuir=True,
                         fit_channels=[highlight_ch] if highlight_ch is not None else None,
                         concentration_unit=titration_concentration_unit,

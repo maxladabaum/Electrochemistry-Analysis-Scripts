@@ -21,13 +21,13 @@ from .processing import (
     rotate_offset_using_bracketing_minima,
 )
 
-SWV_LOOP_RE = re.compile(
-    r"meas_loop_swv\s+\S+\s+\S+\s+\S+\s+\S+\s+"
-    r"(?P<start>[-\d.]+m)\s+"
-    r"(?P<end>[-\d.]+m)\s+"
-    r"(?P<step>[-\d.]+m)\s+"
-    r"(?P<amplitude>[-\d.]+m)\s+"
-    r"(?P<frequency>[-\d.]+)",
+_NUMBER_TOKEN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+SWV_SETTINGS_RE = re.compile(
+    rf"(?P<start>{_NUMBER_TOKEN}m?)[\s,]+"
+    rf"(?P<end>{_NUMBER_TOKEN}m?)[\s,]+"
+    rf"(?P<step>{_NUMBER_TOKEN}m?)[\s,]+"
+    rf"(?P<amplitude>{_NUMBER_TOKEN}m?)[\s,]+"
+    rf"(?P<frequency>{_NUMBER_TOKEN})(?=\s|$)",
     re.IGNORECASE,
 )
 
@@ -40,7 +40,34 @@ def _file_signature(filepath: str) -> Tuple[int, int]:
 def _infer_method_path(csv_path: str) -> str:
     folder = os.path.dirname(csv_path)
     stem, _ = os.path.splitext(os.path.basename(csv_path))
+    search_roots = [
+        os.path.join(folder, "methods_used"),
+        os.path.join(folder, "Methods Used"),
+        os.path.join(os.path.dirname(folder), "methods_used"),
+        os.path.join(os.path.dirname(folder), "Methods Used"),
+    ]
+    wanted_names = {f"{stem}.ms".lower(), f"{stem}.csv.ms".lower()}
+    for search_root in search_roots:
+        if not os.path.isdir(search_root):
+            continue
+        try:
+            names = os.listdir(search_root)
+        except OSError:
+            continue
+        matching_name = next(
+            (name for name in names if name.lower() in wanted_names),
+            None,
+        )
+        if matching_name is not None:
+            return os.path.join(search_root, matching_name)
     return os.path.join(folder, "methods_used", f"{stem}.ms")
+
+
+def _parse_voltage_token(token: str) -> float:
+    text = token.strip()
+    if text.lower().endswith("m"):
+        return float(text[:-1]) / 1000.0
+    return float(text)
 
 
 def _format_frequency_label(frequency_hz: Optional[float]) -> str:
@@ -52,7 +79,14 @@ def _format_frequency_label(frequency_hz: Optional[float]) -> str:
 
 
 @lru_cache(maxsize=512)
-def load_swv_method_metadata(method_path: str) -> dict:
+def _load_swv_method_metadata_cached(
+    method_path: str,
+    method_mtime_ns: Optional[int],
+    method_size: Optional[int],
+) -> dict:
+    # File metadata is part of the cache key so newly created or updated method
+    # files cannot remain stuck behind an earlier "missing" or stale parse.
+    del method_mtime_ns, method_size
     meta = {
         "method_path": method_path,
         "method_exists": False,
@@ -66,18 +100,34 @@ def load_swv_method_metadata(method_path: str) -> dict:
     with open(method_path, "r", encoding="utf-8", errors="replace") as fh:
         text = fh.read()
 
-    loop_match = SWV_LOOP_RE.search(text)
-    if not loop_match:
+    settings_match = None
+    for line in text.splitlines():
+        if "meas_loop_swv" not in line.lower():
+            continue
+        matches = list(SWV_SETTINGS_RE.finditer(line))
+        if matches:
+            settings_match = matches[-1]
+            break
+    if settings_match is None:
         return meta
 
-    frequency_hz = float(loop_match.group("frequency"))
+    frequency_hz = float(settings_match.group("frequency"))
     meta["swv_frequency_hz"] = frequency_hz
     meta["swv_method_group"] = _format_frequency_label(frequency_hz)
-    meta["swv_sweep_start_V"] = float(loop_match.group("start").rstrip("m"))
-    meta["swv_sweep_end_V"] = float(loop_match.group("end").rstrip("m"))
-    meta["swv_step_size_V"] = float(loop_match.group("step").rstrip("m"))
-    meta["swv_amplitude_V"] = float(loop_match.group("amplitude").rstrip("m"))
+    meta["swv_sweep_start_V"] = _parse_voltage_token(settings_match.group("start"))
+    meta["swv_sweep_end_V"] = _parse_voltage_token(settings_match.group("end"))
+    meta["swv_step_size_V"] = _parse_voltage_token(settings_match.group("step"))
+    meta["swv_amplitude_V"] = _parse_voltage_token(settings_match.group("amplitude"))
     return meta
+
+
+def load_swv_method_metadata(method_path: str) -> dict:
+    try:
+        stat = os.stat(method_path)
+        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        signature = (None, None)
+    return _load_swv_method_metadata_cached(method_path, *signature)
 
 
 @lru_cache(maxsize=512)
@@ -657,7 +707,7 @@ def _remap_scan_number(
 
 def run_batch(
     folders: List[str],
-    crop_range: Tuple[float, float] = (-0.6, -0.2),
+    crop_range: Tuple[float, float] = (-0.5, -0.1),
     voltage_col: str = "Potential (V)",
     current_col: Optional[str] = None,
     smooth_window: int = 9,

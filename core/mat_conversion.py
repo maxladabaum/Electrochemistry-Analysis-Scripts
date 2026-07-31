@@ -57,8 +57,8 @@ def _method_text(voltage: np.ndarray, frequency_hz: float) -> str:
     end_mv = float(voltage[-1] * 1000.0)
     steps = np.abs(np.diff(voltage))
     step_mv = float(np.median(steps[steps > 0]) * 1000.0) if np.any(steps > 0) else 0.0
-    # This line follows the native method parser's meas_loop_swv format. Only the
-    # frequency affects grouping; the remaining values preserve useful provenance.
+    # This line follows the native method parser's meas_loop_swv format. All five
+    # settings are retained for provenance and settings-based grouping.
     return (
         "meas_loop_swv imported mat file data "
         f"{start_mv:g}m {end_mv:g}m {step_mv:g}m 0m {frequency_hz:g}\n"

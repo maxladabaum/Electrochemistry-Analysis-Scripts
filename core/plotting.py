@@ -10,6 +10,7 @@ import numpy as np
 from matplotlib import cm
 
 from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
 from scipy.interpolate import PchipInterpolator
 from scipy.optimize import OptimizeWarning, curve_fit
 import warnings
@@ -119,6 +120,8 @@ def _cmap_fig(
 
     normalize_to_peak: bool = False,
 
+    offset_to_baseline: bool = False,
+
 ) -> plt.Figure:
 
     n = len(results)
@@ -141,6 +144,12 @@ def _cmap_fig(
             continue
 
         y_plot = np.asarray(r[y_key], dtype=float)
+        if offset_to_baseline:
+            y_plot = _offset_trace_to_anchor_baseline(
+                y_plot,
+                r.get("left_min_idx"),
+                r.get("right_min_idx"),
+            )
         peak_idx_key = (
             "peak_idx_corr"
             if y_key in ("corrected_current", "smoothed_corrected_current")
@@ -235,13 +244,13 @@ def _cmap_fig(
 
 
 
-        # Correction anchor dots - only meaningful on corrected traces
+        # Correction anchor dots - meaningful on corrected and offset-raw traces.
 
-        if show_anchors and y_key == "corrected_current":
+        if show_anchors and (y_key == "corrected_current" or offset_to_baseline):
 
             v = r["voltage"]
 
-            y = r[y_key]
+            y = y_plot
 
             for idx_key in ("left_min_idx", "right_min_idx"):
 
@@ -304,6 +313,34 @@ def _cmap_fig(
     fig.tight_layout()
 
     return fig
+
+
+def _offset_trace_to_anchor_baseline(
+    y: np.ndarray,
+    left_idx: Optional[int],
+    right_idx: Optional[int],
+) -> np.ndarray:
+    """Subtract the straight line joining a trace's detected minima anchors."""
+    values = np.asarray(y, dtype=float)
+    if left_idx is None or right_idx is None:
+        raise ValueError("Trace has no detected left/right minima to offset.")
+    left = int(left_idx)
+    right = int(right_idx)
+    if not (
+        0 <= left < len(values)
+        and 0 <= right < len(values)
+        and np.isfinite(values[left])
+        and np.isfinite(values[right])
+    ):
+        raise ValueError("Trace minima are outside the trace or non-finite.")
+    if left == right:
+        return values - float(values[left])
+    baseline = np.interp(
+        np.arange(len(values), dtype=float),
+        [float(left), float(right)],
+        [float(values[left]), float(values[right])],
+    )
+    return values - baseline
 
 
 
@@ -835,8 +872,24 @@ def plot_overlaid_traces(
 
     normalize_to_peak: bool = False,
 
+    offset_to_baseline: bool = False,
+
 ) -> Optional[plt.Figure]:
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
+
+    if offset_to_baseline:
+        offset_usable = []
+        for r in usable:
+            try:
+                _offset_trace_to_anchor_baseline(
+                    np.asarray(r[y_key], dtype=float),
+                    r.get("left_min_idx"),
+                    r.get("right_min_idx"),
+                )
+            except (TypeError, ValueError):
+                continue
+            offset_usable.append(r)
+        usable = offset_usable
 
     if normalize_to_peak:
         peak_idx_key = (
@@ -871,7 +924,208 @@ def plot_overlaid_traces(
 
                      show_minima_candidates=show_minima_candidates,
 
-                     normalize_to_peak=normalize_to_peak)
+                     normalize_to_peak=normalize_to_peak,
+
+                     offset_to_baseline=offset_to_baseline)
+
+
+def plot_grouped_overlaid_traces(
+    grouped_results: List[Tuple[str, List[dict], str]],
+    y_key: str = "corrected_current",
+    title: str = "Grouped Overlaid Traces",
+    ylabel: str = "Current (uA)",
+    linewidth: float = 0.9,
+    alpha: float = 0.85,
+    show_anchors: bool = False,
+    show_peak_markers: bool = False,
+    show_zero_baseline: bool = False,
+    normalize_to_peak: bool = False,
+    offset_to_baseline: bool = False,
+    colorbar_height_fraction: float = 0.85,
+    colorbar_side: str = "right",
+    show_legend: bool = True,
+    show_grid: bool = False,
+    outer_margin_fraction: float = 0.04,
+) -> Optional[plt.Figure]:
+    """Overlay multiple SWV groups, using a separate time-gradient colormap per group."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if show_zero_baseline:
+        ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
+
+    legend_handles = []
+    group_colorbars = []
+    plotted_trace_count = 0
+    for group_number, (group_label, results, colormap_name) in enumerate(
+        grouped_results,
+        start=1,
+    ):
+        usable = [
+            row for row in results
+            if row.get(y_key) is not None and row.get("voltage") is not None
+        ]
+        if not usable:
+            continue
+        cmap = plt.get_cmap(colormap_name, max(len(usable), 2))
+        norm = Normalize(vmin=0, vmax=max(len(usable) - 1, 1))
+        group_trace_count = 0
+        for index, row in enumerate(usable):
+            voltage = np.asarray(row["voltage"], dtype=float)
+            y_plot = np.asarray(row[y_key], dtype=float)
+            try:
+                if offset_to_baseline:
+                    y_plot = _offset_trace_to_anchor_baseline(
+                        y_plot,
+                        row.get("left_min_idx"),
+                        row.get("right_min_idx"),
+                    )
+                peak_idx_key = (
+                    "peak_idx_corr"
+                    if y_key in ("corrected_current", "smoothed_corrected_current")
+                    else "peak_idx"
+                )
+                peak_idx = row.get(peak_idx_key)
+                if normalize_to_peak:
+                    if peak_idx is None or not 0 <= int(peak_idx) < len(y_plot):
+                        continue
+                    peak_height = float(y_plot[int(peak_idx)])
+                    if not np.isfinite(peak_height) or np.isclose(peak_height, 0.0):
+                        continue
+                    y_plot = y_plot / peak_height
+            except (TypeError, ValueError):
+                continue
+
+            color = cmap(norm(index))
+            ax.plot(voltage, y_plot, color=color, lw=linewidth, alpha=alpha)
+            group_trace_count += 1
+            plotted_trace_count += 1
+
+            if show_anchors and (y_key == "corrected_current" or offset_to_baseline):
+                for idx_key in ("left_min_idx", "right_min_idx"):
+                    anchor_idx = row.get(idx_key)
+                    if anchor_idx is not None and 0 <= int(anchor_idx) < len(voltage):
+                        ax.scatter(
+                            voltage[int(anchor_idx)],
+                            y_plot[int(anchor_idx)],
+                            color=color,
+                            s=18,
+                            zorder=5,
+                            edgecolors="white",
+                            linewidths=0.5,
+                        )
+
+            if show_peak_markers and peak_idx is not None and 0 <= int(peak_idx) < len(voltage):
+                ax.scatter(
+                    voltage[int(peak_idx)],
+                    y_plot[int(peak_idx)],
+                    color=color,
+                    s=28,
+                    zorder=6,
+                    edgecolors="white",
+                    linewidths=0.8,
+                )
+
+        if group_trace_count:
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=cmap(0.65),
+                    lw=3,
+                    label=f"G{group_number} · {group_label} ({group_trace_count})",
+                )
+            )
+            scalar_mappable = cm.ScalarMappable(cmap=cmap, norm=norm)
+            scalar_mappable.set_array([])
+            group_colorbars.append(
+                (scalar_mappable, group_number, group_trace_count)
+            )
+
+    if not plotted_trace_count:
+        plt.close(fig)
+        return None
+
+    ax.set_title(title)
+    ax.set_xlabel("Voltage (V)")
+    ax.set_ylabel(ylabel)
+    if normalize_to_peak:
+        ax.set_ylim(-0.2, 1.2)
+    if legend_handles and show_legend:
+        ax.legend(
+            handles=legend_handles,
+            title="SWV group",
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.14),
+            ncol=min(2, len(legend_handles)),
+            fontsize=8,
+        )
+    if group_colorbars:
+        colorbar_side = "left" if str(colorbar_side).lower() == "left" else "right"
+        bar_count = len(group_colorbars)
+        bar_width = 0.018
+        bar_gap = 0.045
+        reserved_width = 0.035 + bar_count * (bar_width + bar_gap)
+        outer_margin = min(0.20, max(0.01, float(outer_margin_fraction)))
+        bottom_margin = max(
+            outer_margin,
+            0.22 if show_legend and legend_handles else 0.12,
+        )
+        if colorbar_side == "right":
+            fig.subplots_adjust(
+                left=max(0.08, outer_margin),
+                right=max(0.48, 1.0 - outer_margin - reserved_width),
+                bottom=bottom_margin,
+                top=min(0.96, 1.0 - outer_margin),
+            )
+        else:
+            fig.subplots_adjust(
+                left=min(0.52, outer_margin + reserved_width),
+                right=min(0.96, 1.0 - outer_margin),
+                bottom=bottom_margin,
+                top=min(0.96, 1.0 - outer_margin),
+            )
+        main_position = ax.get_position()
+        height_fraction = min(1.0, max(0.2, float(colorbar_height_fraction)))
+        bar_height = main_position.height * height_fraction
+        bar_bottom = main_position.y0 + (main_position.height - bar_height) / 2.0
+        for bar_index, (scalar_mappable, group_number, group_trace_count) in enumerate(
+            group_colorbars
+        ):
+            if colorbar_side == "right":
+                bar_left = (
+                    main_position.x1
+                    + 0.020
+                    + bar_index * (bar_width + bar_gap)
+                )
+            else:
+                bar_left = (
+                    main_position.x0
+                    - 0.020
+                    - bar_width
+                    - bar_index * (bar_width + bar_gap)
+                )
+            colorbar_axis = fig.add_axes([
+                bar_left,
+                bar_bottom,
+                bar_width,
+                bar_height,
+            ])
+            colorbar_axis._swv_colorbar_axis = True
+            colorbar = fig.colorbar(scalar_mappable, cax=colorbar_axis)
+            colorbar.ax.set_title(f"G{group_number}", fontsize=8, pad=4)
+            if group_trace_count == 1:
+                colorbar.set_ticks([0])
+                colorbar.set_ticklabels(["1"])
+            else:
+                colorbar.set_ticks([0, group_trace_count - 1])
+                colorbar.set_ticklabels(["1", str(group_trace_count)])
+            colorbar.set_label("Iteration", fontsize=7, labelpad=2)
+            colorbar.ax.tick_params(labelsize=7)
+    if show_grid:
+        ax.grid(True, alpha=0.2)
+    else:
+        ax.grid(False)
+    fig._swv_manual_layout = True
+    return fig
 
 
 

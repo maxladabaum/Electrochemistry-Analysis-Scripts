@@ -14,6 +14,7 @@ from .cv_analysis import analyze_cv_file, compute_cv_drift_fields, run_cv_batch
 from .plotting import (
     build_titration_langmuir_summary_table,
     build_titration_step_table,
+    plot_grouped_overlaid_traces,
     plot_overlaid_traces,
     plot_failed_traces,
     plot_metric_vs_scan,

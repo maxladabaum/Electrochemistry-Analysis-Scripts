@@ -24,7 +24,14 @@ from typing import Any, Callable, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap, Normalize, is_color_like, to_hex, to_rgb
+from matplotlib.colors import (
+    LinearSegmentedColormap,
+    Normalize,
+    is_color_like,
+    to_hex,
+    to_rgb,
+    to_rgba,
+)
 from matplotlib.lines import Line2D
 from matplotlib.text import Text
 from matplotlib.ticker import FixedFormatter, FixedLocator
@@ -665,6 +672,7 @@ def _normalize_simulated_channel_identities(
     if (
         not normalized_history.empty
         and "ground_truth_channel" in normalized_history.columns
+        and not normalized_history["ground_truth_channel"].dropna().empty
         and "Q_run" in normalized_history.columns
     ):
         q_channel_columns = [
@@ -675,11 +683,13 @@ def _normalize_simulated_channel_identities(
             columns=q_channel_columns,
             errors="ignore",
         )
-        for channel in normalized_history["ground_truth_channel"].dropna().astype(str).unique():
+        canonical_channels = normalized_history["ground_truth_channel"].map(
+            _simulation_channel_identity_text
+        )
+        normalized_history["ground_truth_channel"] = canonical_channels
+        for channel in canonical_channels.dropna().unique():
             column = _simulation_history_channel_column(channel)
-            channel_rows = (
-                normalized_history["ground_truth_channel"].astype(str) == channel
-            )
+            channel_rows = canonical_channels == channel
             normalized_history.loc[channel_rows, column] = normalized_history.loc[
                 channel_rows,
                 "Q_run",
@@ -700,7 +710,7 @@ def _normalize_simulated_channel_identities(
             or simulation_truth.get("ground_truth_channel")
         )
         if channel is not None:
-            channel_text = str(channel)
+            channel_text = _simulation_channel_identity_text(channel)
             channel_values = _simulation_channel_list_value(channel_text)
             q_run = _finite_float(
                 normalized.get("Q_run", quality.get("Q_run"))
@@ -775,6 +785,7 @@ def _normalize_simulated_channel_identities(
         isinstance(config, dict)
         and not normalized_history.empty
         and "ground_truth_channel" in normalized_history.columns
+        and not normalized_history["ground_truth_channel"].dropna().empty
     ):
         normalized_config = json.loads(json.dumps(config))
         real_channels = sorted(
@@ -3968,15 +3979,32 @@ def _plot_channel_trend(
     )
     records = []
     frame_channels = (
-        frame["ground_truth_channel"].astype(str)
+        frame["ground_truth_channel"].map(_simulation_channel_identity_text)
         if "ground_truth_channel" in frame.columns
         else None
+    )
+    # True per-channel columns (Q_ch1, ch1_Q_channel, etc.) are already sparse
+    # to their own channel. The row-level ground_truth_channel filter is only
+    # needed when one global column is deliberately reused for multiple channel
+    # traces. Applying it to channel-specific columns can erase valid simulated
+    # values when saved-channel and ground-truth metadata differ.
+    selected_column_names = [
+        channel_columns[channel]
+        for channel in selected_channels
+        if channel in channel_columns
+    ]
+    shared_global_column = (
+        len(selected_column_names) > 1
+        and len(set(selected_column_names)) < len(selected_column_names)
     )
     for channel in selected_channels:
         values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
         valid = iterations.notna() & values.notna()
-        if frame_channels is not None:
-            valid = valid & (frame_channels == str(channel))
+        if frame_channels is not None and shared_global_column:
+            valid = valid & (
+                frame_channels
+                == _simulation_channel_identity_text(channel)
+            )
         for index in frame.index[valid]:
             group_id = group_ids.loc[index]
             group_name = group_names.loc[index] or f"Group {group_id}"
@@ -8730,6 +8758,63 @@ def _simulation_clip01(value: Any) -> float:
     return max(0.0, min(1.0, numeric))
 
 
+def _simulation_fit_exportable_gp(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    length_scales: np.ndarray,
+    noise: float,
+    *,
+    config: dict,
+    fixed_length_scales: bool,
+):
+    """Fit the sklearn GP used by BO so a full simulation can preserve it."""
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import ConstantKernel
+    from sklearn.gaussian_process.kernels import Matern as SklearnMatern
+    from sklearn.gaussian_process.kernels import WhiteKernel as SklearnWhiteKernel
+    import warnings
+
+    if fixed_length_scales:
+        matern = SklearnMatern(
+            length_scale=np.asarray(length_scales, dtype=float),
+            length_scale_bounds="fixed",
+            nu=2.5,
+        )
+        restarts = 0
+    else:
+        matern = SklearnMatern(
+            length_scale=np.ones(x_train.shape[1]),
+            nu=2.5,
+        )
+        restarts = max(
+            0,
+            int(
+                (config.get("acquisition") or {}).get(
+                    "gp_optimizer_restarts",
+                    2,
+                )
+            ),
+        )
+    gp = GaussianProcessRegressor(
+        kernel=(
+            ConstantKernel(1.0, constant_value_bounds="fixed")
+            * matern
+            + SklearnWhiteKernel(
+                noise_level=max(float(noise), 1e-10),
+                noise_level_bounds=(1e-8, 1e-1),
+            )
+        ),
+        normalize_y=True,
+        random_state=int(config.get("random_seed", 42)),
+        n_restarts_optimizer=restarts,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        gp.fit(x_train, y_train)
+    return gp
+
+
 def _simulation_is_log_parameter(definition: dict) -> bool:
     scale = str(definition.get("scale", definition.get("encoding", ""))).lower()
     return scale in ("log", "log10")
@@ -10981,6 +11066,8 @@ def _simulation_surrogate_artifact_frame(
     history: pd.DataFrame,
     axes: tuple[str, str, str],
     value_column: str = "ground_truth_value",
+    *,
+    config: dict | None = None,
 ) -> pd.DataFrame:
     x_name, y_name, z_name = axes
     frame = ground_truth.copy()
@@ -11003,53 +11090,102 @@ def _simulation_surrogate_artifact_frame(
                 ]
             else:
                 frame[name] = DEFAULT_INITIAL_METHOD[name]
-    frame["predicted_mean_Q"] = pd.to_numeric(frame[value_column], errors="coerce")
     observed = history.dropna(subset=[x_name, y_name, z_name])
-    if observed.empty:
-        frame["predicted_std_Q"] = 1.0
-        frame["already_tested"] = False
-    else:
-        candidate_coords = frame[[x_name, y_name, z_name]].apply(
-            pd.to_numeric,
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        observed_coords = observed[[x_name, y_name, z_name]].apply(
-            pd.to_numeric,
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        spans = np.nanmax(candidate_coords, axis=0) - np.nanmin(candidate_coords, axis=0)
-        spans = np.where(np.isfinite(spans) & (spans > 0), spans, 1.0)
-        distances = np.sqrt(
-            np.sum(
-                (
-                    (candidate_coords[:, None, :] - observed_coords[None, :, :])
-                    / spans[None, None, :]
-                ) ** 2,
-                axis=2,
-            )
+    cfg = _simulation_normalized_bo_config(config)
+    candidate_params = [
+        _simulation_resolve_candidate(
+            {name: float(row[name]) for name in PARAMETERS},
+            cfg,
         )
-        nearest = np.nanmin(distances, axis=1)
-        frame["predicted_std_Q"] = np.maximum(nearest, 0.02)
-        observed_keys = {
-            tuple(round(float(row[name]), 9) for name in (x_name, y_name, z_name))
-            for _idx, row in observed.iterrows()
-        }
-        frame["already_tested"] = [
-            tuple(round(float(row[name]), 9) for name in (x_name, y_name, z_name))
-            in observed_keys
-            for _idx, row in frame.iterrows()
-        ]
-    best = float(pd.to_numeric(history.get("observed_value"), errors="coerce").max())
-    if not np.isfinite(best):
-        best = float(frame["predicted_mean_Q"].max())
-    improvement = frame["predicted_mean_Q"] - best - 0.01
-    std = np.maximum(frame["predicted_std_Q"].to_numpy(dtype=float), 1e-12)
-    z_score = improvement.to_numpy(dtype=float) / std
-    expected = improvement.to_numpy(dtype=float) * ndtr(z_score) + (
-        std * np.exp(-0.5 * z_score ** 2) / np.sqrt(2.0 * np.pi)
+        for _index, row in frame.iterrows()
+    ]
+    observed_params = [
+        _simulation_history_row_params(row, cfg, axes)
+        for _index, row in observed.iterrows()
+    ]
+    observed_values = pd.to_numeric(
+        observed.get("observed_value"),
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    if len(observed_values) >= 2:
+        acquisition = cfg.get("acquisition") or {}
+        falloffs = dict(
+            acquisition.get("gp_falloff_fractions")
+            or acquisition.get("gp_length_scales")
+            or {}
+        )
+        fixed = all(
+            name in falloffs and float(falloffs[name]) > 0
+            for name in PARAMETERS
+        )
+        length_scales = np.asarray(
+            [max(1e-9, float(falloffs.get(name, 1.0))) for name in PARAMETERS],
+            dtype=float,
+        )
+        means, stds = _simulation_gp_predict(
+            _simulation_encode_bo_candidates(observed_params, cfg),
+            observed_values,
+            _simulation_encode_bo_candidates(candidate_params, cfg),
+            length_scales,
+            max(
+                1e-10,
+                float(acquisition.get("gp_noise_level", 1e-4) or 1e-4),
+            ),
+            config=cfg,
+            fixed_length_scales=fixed,
+        )
+    elif len(observed_values) == 1:
+        means = np.full(len(frame), float(observed_values[0]))
+        observed_encoded = _simulation_encode_bo_candidates(observed_params, cfg)[0]
+        candidate_encoded = _simulation_encode_bo_candidates(candidate_params, cfg)
+        stds = np.maximum(
+            np.sqrt(
+                np.sum(
+                    (candidate_encoded - observed_encoded[None, :]) ** 2,
+                    axis=1,
+                )
+            ),
+            0.05,
+        )
+    else:
+        means = pd.to_numeric(frame[value_column], errors="coerce").to_numpy(dtype=float)
+        stds = np.ones(len(frame), dtype=float)
+    frame["predicted_mean_Q"] = means
+    frame["predicted_std_Q"] = stds
+    observed_keys = {_simulation_candidate_key(params) for params in observed_params}
+    frame["already_tested"] = [
+        _simulation_candidate_key(params) in observed_keys
+        for params in candidate_params
+    ]
+    objective_means = np.asarray(
+        [_simulation_objective_value(value, cfg) for value in means],
+        dtype=float,
     )
-    frame["acquisition_value"] = frame["predicted_mean_Q"] + 0.25 * expected
-    return frame[[*PARAMETERS, "predicted_mean_Q", "predicted_std_Q", "acquisition_value", "already_tested"]]
+    objective_observed = [
+        _simulation_objective_value(value, cfg)
+        for value in observed_values
+    ]
+    best = (
+        max(objective_observed)
+        if objective_observed
+        else float(np.nanmax(objective_means))
+    )
+    exploration = _simulation_clip01(
+        (cfg.get("acquisition") or {}).get("exploration", 0.35)
+    )
+    frame["acquisition_value"] = [
+        _simulation_acquisition_score(mean, std, best, exploration)
+        for mean, std in zip(objective_means, stds)
+    ]
+    frame["simulation_gp_exact"] = True
+    return frame[[
+        *PARAMETERS,
+        "predicted_mean_Q",
+        "predicted_std_Q",
+        "acquisition_value",
+        "already_tested",
+        "simulation_gp_exact",
+    ]]
 
 
 def _simulation_history_row_params(
@@ -11167,7 +11303,22 @@ def _simulation_saved_channel_identity(
             channel = history["ground_truth_channel"].dropna().astype(str).iloc[0]
     if channel is None:
         channel = fallback_channel
-    return str(channel)
+    return _simulation_channel_identity_text(channel)
+
+
+def _simulation_channel_identity_text(channel: Any) -> str | None:
+    """Keep numeric simulation channel IDs stable across JSON and CSV."""
+    if channel is None:
+        return None
+    try:
+        if pd.isna(channel):
+            return None
+    except (TypeError, ValueError):
+        pass
+    numeric = _finite_float(channel)
+    if numeric is not None and float(numeric).is_integer():
+        return str(int(numeric))
+    return str(channel).strip()
 
 
 def _simulation_channel_list_value(channel: str) -> list[int | str]:
@@ -11178,7 +11329,8 @@ def _simulation_channel_list_value(channel: str) -> list[int | str]:
 
 
 def _simulation_history_channel_column(channel: str) -> str:
-    safe_channel = re.sub(r"[^A-Za-z0-9]+", "_", str(channel)).strip("_")
+    channel = _simulation_channel_identity_text(channel)
+    safe_channel = re.sub(r"[^A-Za-z0-9]+", "_", channel).strip("_")
     return f"Q_ch{safe_channel or 'simulation'}"
 
 
@@ -11302,6 +11454,7 @@ def _write_simulated_surrogate_artifacts(
     *,
     axes: tuple[str, str, str],
     group_id: int,
+    config: dict,
     candidate_pool: pd.DataFrame | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
     progress_start: float = 0.0,
@@ -11309,6 +11462,8 @@ def _write_simulated_surrogate_artifacts(
 ) -> None:
     surrogate_dir = session_root / "surrogate"
     surrogate_dir.mkdir(parents=True, exist_ok=True)
+    acquisition_dir = session_root / "acquisition"
+    acquisition_dir.mkdir(parents=True, exist_ok=True)
     artifact_source = (
         candidate_pool
         if candidate_pool is not None and not candidate_pool.empty
@@ -11340,11 +11495,96 @@ def _write_simulated_surrogate_artifacts(
             artifact_source,
             partial_history,
             axes,
+            config=config,
         )
         artifact.to_csv(
             surrogate_dir / f"group_{int(group_id):02d}_iter_{int(iteration):03d}_candidate_predictions.csv",
             index=False,
         )
+        stem = f"group_{int(group_id):02d}_iter_{int(iteration):03d}"
+        artifact.to_csv(
+            acquisition_dir / f"{stem}_acquisition_values.csv",
+            index=False,
+        )
+        if len(partial_history) >= 2:
+            try:
+                import pickle
+
+                cfg = _simulation_normalized_bo_config(config)
+                acquisition = cfg.get("acquisition") or {}
+                falloffs = dict(
+                    acquisition.get("gp_falloff_fractions")
+                    or acquisition.get("gp_length_scales")
+                    or {}
+                )
+                fixed = all(
+                    name in falloffs and float(falloffs[name]) > 0
+                    for name in PARAMETERS
+                )
+                length_scales = np.asarray(
+                    [
+                        max(1e-9, float(falloffs.get(name, 1.0)))
+                        for name in PARAMETERS
+                    ],
+                    dtype=float,
+                )
+                observed_params = [
+                    _simulation_history_row_params(row, cfg, axes)
+                    for _index, row in partial_history.iterrows()
+                ]
+                gp = _simulation_fit_exportable_gp(
+                    _simulation_encode_bo_candidates(observed_params, cfg),
+                    pd.to_numeric(
+                        partial_history["observed_value"],
+                        errors="coerce",
+                    ).to_numpy(dtype=float),
+                    length_scales,
+                    max(
+                        1e-10,
+                        float(
+                            acquisition.get("gp_noise_level", 1e-4)
+                            or 1e-4
+                        ),
+                    ),
+                    config=cfg,
+                    fixed_length_scales=fixed,
+                )
+                with (surrogate_dir / f"{stem}_gp_model.pkl").open(
+                    "wb"
+                ) as handle:
+                    pickle.dump(gp, handle)
+                metadata = {
+                    "backend": "scikit_learn_gaussian_process",
+                    "observation_count": int(len(partial_history)),
+                    "candidate_count": int(len(artifact)),
+                    "exploration": _simulation_clip01(
+                        acquisition.get("exploration", 0.35)
+                    ),
+                    "kernel": str(gp.kernel_),
+                    "log_marginal_likelihood": float(
+                        gp.log_marginal_likelihood_value_
+                    ),
+                }
+                with (surrogate_dir / f"{stem}_surrogate_metadata.json").open(
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(metadata, handle, indent=2)
+            except Exception as exc:
+                with (surrogate_dir / f"{stem}_surrogate_metadata.json").open(
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(
+                        {
+                            "backend": "numpy_gaussian_process",
+                            "observation_count": int(len(partial_history)),
+                            "candidate_count": int(len(artifact)),
+                            "gp_pickle_error": str(exc),
+                        },
+                        handle,
+                        indent=2,
+                    )
     _report_simulation_write_progress(
         progress_callback,
         progress_end,
@@ -11693,6 +11933,7 @@ def _write_simulated_bo_session(
             history,
             axes=axes,
             group_id=1,
+            config=config,
             candidate_pool=candidate_pool,
             progress_callback=progress_callback,
             progress_start=0.78,
@@ -12063,12 +12304,28 @@ def _write_simulated_bo_session_bundle(
                     run_candidate_pool["ground_truth_channel"].astype(str)
                     == str(run_channel)
                 ].copy()
+            run_config = json.loads(json.dumps(config))
+            run_config.setdefault("acquisition", {})
+            if run.get("exploration") is not None:
+                run_config["acquisition"]["exploration"] = float(
+                    run["exploration"]
+                )
+            if run.get("falloff_fractions"):
+                run_config["acquisition"]["gp_falloff_fractions"] = dict(
+                    run["falloff_fractions"]
+                )
+                run_config["acquisition"]["gp_length_scales"] = dict(
+                    run["falloff_fractions"]
+                )
+            if run.get("seed") is not None:
+                run_config["random_seed"] = int(run["seed"])
             _write_simulated_surrogate_artifacts(
                 session_root,
                 run_ground_truth,
                 run["history"],
                 axes=axes,
                 group_id=group_id,
+                config=run_config,
                 candidate_pool=run_candidate_pool,
                 progress_callback=progress_callback,
                 progress_start=0.78 + 0.18 * (group_id - 1) / total_artifact_runs,
@@ -15826,6 +16083,22 @@ def _recompute_group_surrogate(
             ]
             corrected.loc[selected_mask, "selected_next"] = True
     config = session.get("config") or {}
+    saved_columns = {
+        "predicted_mean_Q",
+        "predicted_std_Q",
+        "acquisition_value",
+    }
+    exact_saved = (
+        "simulation_gp_exact" in corrected.columns
+        and corrected["simulation_gp_exact"].fillna(False).astype(bool).all()
+    )
+    if exact_saved and saved_columns.issubset(corrected.columns):
+        saved_values = corrected[list(saved_columns)].apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        if np.isfinite(saved_values.to_numpy(dtype=float)).all():
+            return corrected
     group_id = session.get("selected_group_id")
     if group_id is None:
         observed_ids = {
@@ -16963,7 +17236,8 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
                     slice_sweep_values: Sequence[float] | None = None,
                     title_note: str | None = None,
                     draw_full_cube_edges: bool = False,
-                    show_2d_contours: bool = False):
+                    show_2d_contours: bool = False,
+                    surrogate_2d_style: str = "Continuous GP heatmap"):
     parameter_context = _surrogate_parameter_context(session, iteration)
     title = (
         f"{view} | {value} | artifact iteration {iteration}<br>"
@@ -17378,39 +17652,129 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
             )
         return fig
     elif view == "2D map":
-        fig, ax = plt.subplots(figsize=(6.4, 4.0))
-        mesh = _plot_surrogate_2d_control_style(
-            ax,
-            session,
-            display_frame,
-            iteration,
-            value,
-            x_name,
-            y_name,
-            selected_next_frame,
-            dot_size=dot_size,
-            log_frequency=log_frequency,
-            show_iteration_path=show_iteration_path,
-            show_observed_points=show_observed_points,
-            show_contours=show_2d_contours,
-            axis_ranges=axis_ranges,
-            observed_slice_axis=observed_slice_axis,
-            observed_slice_value=observed_slice_value,
-        )
-        if mesh is not None:
-            colorbar = fig.colorbar(
-                mesh,
-                ax=ax,
-                label=SURROGATE_VALUE_LABELS.get(value, value),
+        automation_style = surrogate_2d_style == "Automation smooth heatmap"
+        if automation_style:
+            fig, ax = plt.subplots(figsize=(6.4, 4.0))
+            base_params = _surrogate_slice_base_params(session, iteration)
+            grid = _surrogate_regular_2d_grid(
+                session,
+                frame,
+                iteration,
+                value,
+                x_name,
+                y_name,
+                base_params,
+                grid_size=75,
+                axis_ranges=axis_ranges,
             )
-            colorbar.ax.tick_params(labelsize=8)
-            colorbar.set_label(
-                SURROGATE_VALUE_LABELS.get(value, value),
-                fontsize=8,
-            )
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
+            if grid is not None:
+                x_values, y_values, z_values = grid
+                mesh = ax.pcolormesh(
+                    x_values,
+                    y_values,
+                    np.ma.masked_invalid(z_values),
+                    cmap="viridis",
+                    shading="auto",
+                )
+            else:
+                fallback = frame[[x_name, y_name, value]].apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                ).dropna()
+                if fallback.empty:
+                    ax.text(
+                        .5,
+                        .5,
+                        "No plottable surrogate rows",
+                        ha="center",
+                        va="center",
+                    )
+                    ax.set_axis_off()
+                    mesh = None
+                else:
+                    mesh = ax.scatter(
+                        fallback[x_name],
+                        fallback[y_name],
+                        c=fallback[value],
+                        cmap="viridis",
+                        s=14,
+                        alpha=0.8,
+                    )
+            if mesh is not None:
+                colorbar = fig.colorbar(mesh, ax=ax, label=value)
+                colorbar.ax.tick_params(labelsize=8)
+                colorbar.set_label(value, fontsize=8)
+            observed = _observed_points(session, iteration, [x_name, y_name])
+            if observed:
+                observed_x = [float(obs["params"][x_name]) for obs in observed]
+                observed_y = [float(obs["params"][y_name]) for obs in observed]
+                ax.plot(
+                    observed_x,
+                    observed_y,
+                    color="#d67b32",
+                    linewidth=1.4,
+                    alpha=0.95,
+                    label="observed path",
+                )
+                mesh = ax.scatter(
+                    observed_x,
+                    observed_y,
+                    color="#d67b32",
+                    s=18,
+                    zorder=4,
+                )
+                selected = observed[-1]
+                ax.scatter(
+                    [float(selected["params"][x_name])],
+                    [float(selected["params"][y_name])],
+                    color="#ffd166",
+                    edgecolors="black",
+                    linewidths=1.0,
+                    s=85,
+                    zorder=5,
+                    label="selected iteration",
+                )
                 ax.legend(loc="best", fontsize=8)
+        else:
+            fig, ax = plt.subplots(figsize=(6.4, 4.0))
+            mesh = _plot_surrogate_2d_control_style(
+                ax,
+                session,
+                display_frame,
+                iteration,
+                value,
+                x_name,
+                y_name,
+                selected_next_frame,
+                dot_size=dot_size,
+                log_frequency=log_frequency,
+                show_iteration_path=show_iteration_path,
+                show_observed_points=show_observed_points,
+                show_contours=show_2d_contours,
+                axis_ranges=axis_ranges,
+                observed_slice_axis=observed_slice_axis,
+                observed_slice_value=observed_slice_value,
+            )
+            if mesh is not None:
+                colorbar = fig.colorbar(
+                    mesh,
+                    ax=ax,
+                    label=SURROGATE_VALUE_LABELS.get(value, value),
+                )
+                colorbar.ax.tick_params(labelsize=8)
+                colorbar.set_label(
+                    SURROGATE_VALUE_LABELS.get(value, value),
+                    fontsize=8,
+                )
+                handles, labels = ax.get_legend_handles_labels()
+                if handles:
+                    ax.legend(loc="best", fontsize=8)
+        ax.set_xlabel(x_name)
+        ax.set_ylabel(y_name)
+        if log_frequency and x_name == "frequency":
+            ax.set_xscale("log")
+        if log_frequency and y_name == "frequency":
+            ax.set_yscale("log")
         if axis_ranges:
             if x_name in axis_ranges:
                 ax.set_xlim(*map(float, axis_ranges[x_name]))
@@ -17460,12 +17824,23 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         if axis_ranges and x_name in axis_ranges:
             ax.set_xlim(*map(float, axis_ranges[x_name]))
         ax.legend()
-    title_lines = [
-        f"{view} | {value} | artifact iteration {iteration}",
-        parameter_context,
-    ]
-    if title_note:
-        title_lines.append(title_note)
+    if (
+        view == "2D map"
+        and surrogate_2d_style == "Automation smooth heatmap"
+    ):
+        surface_title = (
+            "Predicted Q surface"
+            if value == "predicted_mean_Q"
+            else "Acquisition surface"
+        )
+        title_lines = [f"Iteration {iteration:03d} {surface_title}"]
+    else:
+        title_lines = [
+            f"{view} | {value} | artifact iteration {iteration}",
+            parameter_context,
+        ]
+        if title_note:
+            title_lines.append(title_note)
     ax.set_title("\n".join(title_lines))
     ax.grid(alpha=.2)
     fig.tight_layout()
@@ -17644,6 +18019,20 @@ def _plot_width_px() -> int:
 
 def _plot_perimeter_width() -> float:
     return max(0.0, min(10.0, float(st.session_state.get("bo_plot_perimeter_width", 0.8) or 0.0)))
+
+
+def _plot_perimeter_color() -> str:
+    value = str(
+        st.session_state.get("bo_plot_perimeter_color", "#222222")
+        or "#222222"
+    ).strip()
+    if not is_color_like(value):
+        return "#222222"
+    try:
+        # Plotly axis line colors do not accept Matplotlib's #RRGGBBAA form.
+        return to_hex(value, keep_alpha=False)
+    except ValueError:
+        return "#222222"
 
 
 def _plot_margin_px() -> int:
@@ -18059,6 +18448,7 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
     line_color_override = _plot_line_color_override()
     colormap_override = _matplotlib_colormap_override()
     perimeter_width = _plot_perimeter_width()
+    perimeter_color = _plot_perimeter_color()
     show_grid = _plot_show_grid()
     title_override = _plot_text_override("bo_plot_title_override")
     x_label_override = _plot_text_override("bo_plot_x_label_override")
@@ -18102,6 +18492,7 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
         for spine in ax.spines.values():
             spine.set_visible(perimeter_width > 0)
             spine.set_linewidth(perimeter_width)
+            spine.set_edgecolor(perimeter_color)
         if colorbar_label_override and is_colorbar_axis:
             position = ax.get_position()
             if position.height >= position.width:
@@ -18384,7 +18775,7 @@ def _plotly_axis_font_update(
         "showline": show_perimeter,
         "mirror": show_perimeter,
         "linewidth": perimeter_width if show_perimeter else 0,
-        "linecolor": "#222222",
+        "linecolor": _plot_perimeter_color(),
         "showgrid": _plot_show_grid(),
     }
     if title_override:
@@ -18621,6 +19012,7 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
                 line = dict(shape_json.get("line") or {})
                 perimeter_width = _plot_perimeter_width()
                 line["width"] = perimeter_width
+                line["color"] = _plot_perimeter_color()
                 shape_json["line"] = line
                 shape_json["visible"] = perimeter_width > 0
             updated_shapes.append(shape_json)
@@ -18649,6 +19041,7 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
             if role == "highlighted_slice_outline":
                 perimeter_width = _plot_perimeter_width()
                 line["width"] = perimeter_width
+                line["color"] = _plot_perimeter_color()
                 trace.visible = True if perimeter_width > 0 else False
             else:
                 line["width"] = max(0.1, float(base_width) * line_scale)
@@ -18920,8 +19313,14 @@ def _sanitize_matplotlib_text_for_png(fig, *, max_chars: int = 180) -> None:
                 continue
 
 
-def _matplotlib_png_bytes(fig, *, dpi: int = 100) -> bytes:
-    _apply_global_plot_style(fig)
+def _matplotlib_png_bytes(
+    fig,
+    *,
+    dpi: int = 100,
+    apply_global_style: bool = True,
+) -> bytes:
+    if apply_global_style:
+        _apply_global_plot_style(fig)
     buffer = BytesIO()
     try:
         fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
@@ -18967,6 +19366,7 @@ def _render_downloadable_pyplot(
     file_stem: str,
     width_percent: int,
     dpi: int = 100,
+    enable_series_customization: bool = False,
 ) -> None:
     effective_width_px = int(max(1, float(width_percent)))
     plot_column = _sized_plot_container(container, effective_width_px)
@@ -18982,10 +19382,189 @@ def _render_downloadable_pyplot(
     except Exception:
         pass
     _apply_global_plot_style(fig)
-    png_bytes = _matplotlib_png_bytes(fig, dpi=dpi)
-    plot_column.image(png_bytes, width=effective_width_px)
+    image_slot = plot_column.empty()
+    download_container = plot_column
+    if enable_series_customization:
+        settings_column, download_container = plot_column.columns([1, 1])
+        primary_axis = next(
+            (
+                axis
+                for axis in getattr(fig, "axes", [])
+                if not _is_matplotlib_colorbar_axis(axis)
+            ),
+            None,
+        )
+        legend = primary_axis.get_legend() if primary_axis is not None else None
+        legend_handles = (
+            list(
+                getattr(
+                    legend,
+                    "legend_handles",
+                    getattr(legend, "legendHandles", []),
+                )
+            )
+            if legend is not None
+            else []
+        )
+        default_legend_labels = (
+            [text.get_text() for text in legend.get_texts()]
+            if legend is not None
+            else []
+        )
+        series_artists = (
+            [
+                line
+                for line in primary_axis.lines
+                if line.get_label() and not line.get_label().startswith("_")
+            ]
+            if primary_axis is not None
+            else []
+        )
+        color_sources = legend_handles or series_artists
+        default_series_colors = []
+        for artist in color_sources:
+            get_color = getattr(artist, "get_color", None)
+            try:
+                default_series_colors.append(
+                    to_hex(get_color(), keep_alpha=True)
+                    if callable(get_color)
+                    else ""
+                )
+            except (TypeError, ValueError):
+                default_series_colors.append("")
+
+        with settings_column.popover("Plot settings", use_container_width=True):
+            override_plot_text = st.checkbox(
+                "Override plot text",
+                key=f"{key}_override_plot_text",
+            )
+            custom_title = st.text_input(
+                "Title",
+                value=primary_axis.get_title() if primary_axis is not None else "",
+                key=f"{key}_custom_title",
+                disabled=not override_plot_text,
+            )
+            custom_xlabel = st.text_input(
+                "X-axis label",
+                value=primary_axis.get_xlabel() if primary_axis is not None else "",
+                key=f"{key}_custom_xlabel",
+                disabled=not override_plot_text,
+            )
+            custom_ylabel = st.text_input(
+                "Y-axis label",
+                value=primary_axis.get_ylabel() if primary_axis is not None else "",
+                key=f"{key}_custom_ylabel",
+                disabled=not override_plot_text,
+            )
+            custom_legend_title = st.text_input(
+                "Legend title",
+                value=(
+                    legend.get_title().get_text()
+                    if legend is not None
+                    else ""
+                ),
+                key=f"{key}_custom_legend_title",
+                disabled=not override_plot_text or legend is None,
+            )
+            custom_legend_labels_text = st.text_area(
+                "Legend entries (one per line)",
+                value="\n".join(default_legend_labels),
+                height=min(220, max(80, 28 * len(default_legend_labels))),
+                key=f"{key}_custom_legend_labels",
+                disabled=not override_plot_text or legend is None,
+                help="Entries correspond to the existing legend items in order.",
+            )
+            override_series_colors = st.checkbox(
+                "Override series colors",
+                key=f"{key}_override_series_colors",
+                disabled=not color_sources,
+            )
+            custom_series_colors_text = st.text_area(
+                "Series colors (one per line)",
+                value="\n".join(default_series_colors),
+                height=min(220, max(80, 28 * len(default_series_colors))),
+                key=f"{key}_custom_series_colors",
+                disabled=not override_series_colors or not color_sources,
+                help=(
+                    "Use Matplotlib/CSS colors such as tab:blue, crimson, "
+                    "or #4b0082. Entries follow legend order."
+                ),
+            )
+            requested_series_colors = [
+                color.strip()
+                for color in custom_series_colors_text.splitlines()
+            ]
+            invalid_series_colors = [
+                color
+                for color in requested_series_colors
+                if color and not is_color_like(color)
+            ]
+            if override_series_colors and invalid_series_colors:
+                st.caption(
+                    "Invalid color(s) ignored: "
+                    + ", ".join(invalid_series_colors)
+                )
+
+        if primary_axis is not None and override_plot_text:
+            primary_axis.set_title(custom_title)
+            primary_axis.set_xlabel(custom_xlabel)
+            primary_axis.set_ylabel(custom_ylabel)
+            if legend is not None:
+                legend.get_title().set_text(custom_legend_title)
+                requested_labels = custom_legend_labels_text.splitlines()
+                for index, legend_text in enumerate(legend.get_texts()):
+                    if index < len(requested_labels):
+                        legend_text.set_text(requested_labels[index])
+
+        if override_series_colors:
+            for index, source in enumerate(color_sources):
+                if index >= len(requested_series_colors):
+                    break
+                color = requested_series_colors[index]
+                if not color or not is_color_like(color):
+                    continue
+                get_color = getattr(source, "get_color", None)
+                try:
+                    original_rgba = (
+                        to_rgba(get_color())
+                        if callable(get_color)
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    original_rgba = None
+                for setter_name in ("set_color", "set_facecolor", "set_edgecolor"):
+                    setter = getattr(source, setter_name, None)
+                    if callable(setter):
+                        setter(color)
+                if primary_axis is not None:
+                    original_label = (
+                        default_legend_labels[index]
+                        if index < len(default_legend_labels)
+                        else source.get_label()
+                    )
+                    for line in primary_axis.lines:
+                        line_matches_label = line.get_label() == original_label
+                        try:
+                            line_matches_color = (
+                                original_rgba is not None
+                                and np.allclose(
+                                    to_rgba(line.get_color()),
+                                    original_rgba,
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            line_matches_color = False
+                        if line_matches_label or line_matches_color:
+                            line.set_color(color)
+
+    png_bytes = _matplotlib_png_bytes(
+        fig,
+        dpi=dpi,
+        apply_global_style=False,
+    )
+    image_slot.image(png_bytes, width=effective_width_px)
     _render_browser_download_link(
-        plot_column,
+        download_container,
         "Download plot",
         png_bytes,
         file_name=f"{_safe_download_stem(file_stem)}.png",
@@ -20246,6 +20825,19 @@ def render_bo_session_app() -> None:
             key="bo_plot_perimeter_width",
         ))
         st.session_state["bo_plot_perimeter_width__preferred"] = plot_perimeter_width
+        st.session_state.setdefault("bo_plot_perimeter_color", "#222222")
+        plot_perimeter_color = st.text_input(
+            "Plot perimeter color",
+            help="Use a Matplotlib/CSS color name or hex value.",
+            key="bo_plot_perimeter_color",
+        )
+        if (
+            str(plot_perimeter_color).strip()
+            and not is_color_like(plot_perimeter_color)
+        ):
+            st.caption(
+                "Perimeter color is not recognized; #222222 is being used."
+            )
         st.session_state.setdefault("bo_plot_show_legend", True)
         st.checkbox(
             "Show plot legends",
@@ -21010,7 +21602,10 @@ def render_bo_session_app() -> None:
                         channel_token.encode("utf-8")
                     ).hexdigest()[:12]
                 trend_scope_key = f"{trend_scope_key}_channels_{channel_token or 'none'}"
-                if "ground_truth_channel" in trend_history.columns:
+                if (
+                    "ground_truth_channel" in trend_history.columns
+                    and not trend_history["ground_truth_channel"].dropna().empty
+                ):
                     trend_history = trend_history.loc[
                         trend_history["ground_truth_channel"].astype(str).isin(
                             selected_history_channels
@@ -24984,6 +25579,7 @@ def render_bo_session_app() -> None:
                                             ),
                                             file_stem=trace_file_stem,
                                             width_percent=plot_width_percent,
+                                            enable_series_customization=True,
                                         )
                                         for error in errors:
                                             st.warning(error)
@@ -25084,6 +25680,7 @@ def render_bo_session_app() -> None:
                                     ),
                                     file_stem=trace_file_stem,
                                     width_percent=plot_width_percent,
+                                    enable_series_customization=True,
                                 )
                                 for error in errors:
                                     st.warning(error)
@@ -31171,7 +31768,29 @@ def render_bo_session_app() -> None:
                         surrogate_show_iteration_path
                     )
                     surrogate_show_observed_points = True
-                    if view in ("2D map", "3D tensor"):
+                    surrogate_2d_style = "Continuous GP heatmap"
+                    if view == "2D map":
+                        surrogate_2d_style = st.selectbox(
+                            "2D display style",
+                            [
+                                "Continuous GP heatmap",
+                                "Automation smooth heatmap",
+                            ],
+                            key=f"{surrogate_state_prefix}_2d_display_style",
+                            help=(
+                                "Continuous GP heatmap evaluates the surrogate on "
+                                "a regular grid with the analysis viewer overlays. "
+                                "Automation smooth heatmap matches the automation "
+                                "software's 75×75 GP grid and orange observed path."
+                            ),
+                        )
+                    if (
+                        view == "3D tensor"
+                        or (
+                            view == "2D map"
+                            and surrogate_2d_style == "Continuous GP heatmap"
+                        )
+                    ):
                         surrogate_observed_points_key = (
                             f"{surrogate_state_prefix}_show_observed_points"
                         )
@@ -31207,39 +31826,21 @@ def render_bo_session_app() -> None:
                         ] = surrogate_show_observed_points
                     surrogate_show_2d_contours = False
                     if view == "2D map":
-                        surrogate_2d_contours_key = (
-                            f"{surrogate_state_prefix}_show_2d_contours"
-                        )
-                        surrogate_2d_contours_preference_key = (
-                            f"{surrogate_state_prefix}_pref_show_2d_contours"
-                        )
-                        _initialize_preference(
-                            surrogate_2d_contours_preference_key,
-                            surrogate_2d_contours_key,
-                            default=False,
-                        )
-                        _capture_widget_preference(
-                            surrogate_2d_contours_key,
-                            surrogate_2d_contours_preference_key,
-                        )
-                        st.session_state[surrogate_2d_contours_key] = bool(
-                            st.session_state.get(
-                                surrogate_2d_contours_preference_key,
-                                False,
+                        if surrogate_2d_style == "Continuous GP heatmap":
+                            surrogate_show_2d_contours = st.checkbox(
+                                "Show contour lines",
+                                value=False,
+                                key=(
+                                    f"{surrogate_state_prefix}_"
+                                    "show_2d_contours"
+                                ),
                             )
-                        )
-                        surrogate_show_2d_contours = st.checkbox(
-                            "Show contour lines",
-                            value=False,
-                            key=surrogate_2d_contours_key,
-                            help=(
-                                "Overlays black contour lines on surrogate 2D maps "
-                                "for static publication figures."
-                            ),
-                        )
-                        st.session_state[surrogate_2d_contours_preference_key] = (
-                            surrogate_show_2d_contours
-                        )
+                        else:
+                            st.caption(
+                                "Automation heatmap uses a 75×75 Viridis GP grid "
+                                "with the observed path in orange and the selected "
+                                "iteration highlighted in yellow."
+                            )
                     surrogate_show_swv_traces = False
                     surrogate_swv_iteration_mode = "Current iteration"
                     surrogate_swv_trace_type = "Corrected"
@@ -31593,6 +32194,7 @@ def render_bo_session_app() -> None:
                         tuple(selected_artifact_iterations),
                         value,
                         view,
+                        surrogate_2d_style,
                         x_name,
                         y_name,
                         z_name,
@@ -31851,6 +32453,7 @@ def render_bo_session_app() -> None:
                                             title_note=surrogate_2d_title_note,
                                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
                                             show_2d_contours=surrogate_show_2d_contours,
+                                            surrogate_2d_style=surrogate_2d_style,
                                         )
     
                                 gif_bytes = _figures_to_gif(
@@ -31952,6 +32555,7 @@ def render_bo_session_app() -> None:
                             title_note=surrogate_2d_title_note,
                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
                             show_2d_contours=surrogate_show_2d_contours,
+                            surrogate_2d_style=surrogate_2d_style,
                         )
 
                         def render_surrogate_swv_traces() -> None:
@@ -32221,6 +32825,7 @@ def render_bo_session_app() -> None:
                                                 ),
                                                 draw_full_cube_edges=surrogate_draw_full_cube_edges,
                                                 show_2d_contours=surrogate_show_2d_contours,
+                                                surrogate_2d_style=surrogate_2d_style,
                                             )
                                             slice_color, _plotly_color = _slice_highlight_color(
                                                 slice_color_index,
@@ -32396,6 +33001,7 @@ def render_bo_session_app() -> None:
                                             ),
                                             draw_full_cube_edges=surrogate_draw_full_cube_edges,
                                             show_2d_contours=surrogate_show_2d_contours,
+                                            surrogate_2d_style=surrogate_2d_style,
                                         )
                                         _render_downloadable_pyplot(
                                             st,
@@ -36411,12 +37017,17 @@ def render_bo_session_app() -> None:
                             and not per_channel_simulation_export
                         )
                         if compact_only_simulation_export:
-                            write_scope_options = ["Compact sweep summary"]
+                            write_scope_options = [
+                                "Compact sweep summary",
+                                "Full sweep including surrogate model",
+                            ]
                             st.caption(
-                                "This simulation mode writes compact results only: "
-                                "metadata, run summary, and history CSV. Raw SWV, "
-                                "analysis records, surrogate artifacts, source points, "
-                                "and ground-truth tensor files are omitted."
+                                "Compact saves contain metadata, the run summary, and "
+                                "history CSV. Full saves also include complete observations, "
+                                "simulated SWV and analysis records, source points, the "
+                                "ground-truth tensor, candidate data, and per-iteration "
+                                "surrogate prediction artifacts. Full saves can be large "
+                                "and take substantially longer to write."
                             )
                         elif per_channel_simulation_export:
                             write_scope_options = (
@@ -36446,7 +37057,13 @@ def render_bo_session_app() -> None:
                             key=f"{run_key}_write_scope",
                         )
                         write_surrogate_artifacts = False
-                        if write_scope != "Compact sweep summary":
+                        if write_scope == "Full sweep including surrogate model":
+                            write_surrogate_artifacts = True
+                            st.caption(
+                                "Surrogate candidate artifacts will be written for every "
+                                "saved run and iteration."
+                            )
+                        elif write_scope != "Compact sweep summary":
                             write_surrogate_artifacts = st.checkbox(
                                 "Include surrogate candidate artifacts",
                                 value=False,
@@ -36498,6 +37115,20 @@ def render_bo_session_app() -> None:
                                         value_label=sim_result["value_label"],
                                         axes=(sim_x, sim_y, sim_z),
                                         simulation_settings=sim_result.get("settings"),
+                                        progress_callback=simulation_write_progress,
+                                    )]
+                                elif write_scope == "Full sweep including surrogate model":
+                                    written_paths = [_write_simulated_bo_session_bundle(
+                                        write_parent,
+                                        full_session,
+                                        nonempty_runs,
+                                        sim_ground_truth_result,
+                                        value_label=sim_result["value_label"],
+                                        axes=(sim_x, sim_y, sim_z),
+                                        source_points=sim_result.get("source_points"),
+                                        candidate_pool=sim_result.get("candidates"),
+                                        simulation_settings=sim_result.get("settings"),
+                                        write_surrogate_artifacts=True,
                                         progress_callback=simulation_write_progress,
                                     )]
                                 elif write_scope == "All full channel runs in one folder":
