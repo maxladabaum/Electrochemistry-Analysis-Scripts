@@ -4,7 +4,7 @@ Run with:  python -m streamlit run app.py
 """
 
 import bisect
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 import math
@@ -27,8 +27,12 @@ from scipy.stats import skew
 
 from core import (
     build_titration_langmuir_summary_table,
+    build_titration_measurement_accuracy_table,
     build_titration_step_table,
     compute_drift_fields,
+    filter_extreme_titration_outliers,
+    infer_titration_response_directions,
+    infer_titration_response_baselines,
     plot_cv_overlaid_cycles,
     plot_cv_trace,
     plot_drift_vs_scan,
@@ -38,7 +42,10 @@ from core import (
     plot_overlaid_traces,
     plot_single_trace,
     plot_titration_langmuir,
+    plot_titration_concentration_accuracy,
+    plot_titration_concentration_vs_measurement,
     plot_titration_plateaus,
+    plot_titration_snr,
     run_cv_batch,
     run_batch,
 )
@@ -50,7 +57,7 @@ from core.processing import (
 )
 from bo_session_viewer import render_bo_session_app
 from core.mat_conversion import convert_mat_folders_to_swv_csv
-from core.io import collect_measurement_csvs_from_folders
+from core.io import collect_measurement_csvs_from_folders, parse_measurement_time_from_filename
 
 
 def _pick_folder_windows() -> str:
@@ -93,6 +100,8 @@ def _clear_loaded_analysis_state() -> None:
     st.session_state.results_folder_key = None
     st.session_state.swv_annotation_signature = None
     st.session_state.swv_annotated_results = None
+    st.session_state.analysis_cache_key = None
+    st.session_state.analysis_cache_results = None
 
 
 ANALYSIS_CACHE_SCHEMA_VERSION = 2
@@ -269,7 +278,8 @@ def _apply_swv_plot_formatting(
                 sizes = collection.get_sizes()
                 if len(sizes):
                     collection.set_sizes(np.full_like(sizes, marker_size ** 2, dtype=float))
-            collection.set_alpha(marker_opacity)
+            if not bool(getattr(collection, "_swv_preserve_alpha", False)):
+                collection.set_alpha(marker_opacity)
 
         if (
             plot_kind == "swv_trace"
@@ -394,20 +404,95 @@ def render_downloadable_pyplot(
         if legend is not None
         else []
     )
-    series_artists = (
-        [
-            line for line in primary_axis.lines
-            if str(line.get_label()) and not str(line.get_label()).startswith("_")
+    series_artists = []
+    if primary_axis is not None:
+        legend_artists, legend_artist_labels = primary_axis.get_legend_handles_labels()
+        series_artists = [
+            artist
+            for artist, label in zip(legend_artists, legend_artist_labels)
+            if str(label) and not str(label).startswith("_")
         ]
-        if primary_axis is not None
-        else []
-    )
     default_series_colors = []
     for artist in series_artists:
+        artist_color = None
+        for getter_name in ("get_color", "get_facecolor", "get_edgecolor"):
+            getter = getattr(artist, getter_name, None)
+            if getter is None:
+                continue
+            try:
+                artist_color = getter()
+                if isinstance(artist_color, np.ndarray) and artist_color.ndim > 1:
+                    artist_color = artist_color[0] if len(artist_color) else None
+                if artist_color is not None:
+                    break
+            except (TypeError, ValueError):
+                continue
         try:
-            default_series_colors.append(to_hex(artist.get_color(), keep_alpha=True))
+            default_series_colors.append(to_hex(artist_color, keep_alpha=True))
         except (TypeError, ValueError):
-            default_series_colors.append(str(artist.get_color()))
+            default_series_colors.append(str(artist_color or ""))
+    acceptance_regions = (
+        [
+            collection for collection in primary_axis.collections
+            if bool(getattr(collection, "_swv_preserve_alpha", False))
+        ]
+        if primary_axis is not None else []
+    )
+    output_dpi = int(dpi)
+    display_width_px = int(st.session_state.get("swv_plot_width_px", 1200))
+    reconstruction_width_px = display_width_px
+    reconstruction_height_px = int(st.session_state.get("swv_plot_height_px", 600))
+    reconstruction_text_size = float(
+        st.session_state.get("swv_plot_text_size_points", 10.0)
+    )
+    reconstruction_title_size = reconstruction_text_size * 1.2
+    reconstruction_x_label_size = reconstruction_text_size
+    reconstruction_y_label_size = reconstruction_text_size
+    reconstruction_tick_size = reconstruction_text_size * 0.9
+    reconstruction_legend_size = reconstruction_text_size * 0.8
+    reconstruction_line_scale = 1.0
+    reconstruction_line_color = ""
+    reconstruction_margin_px = int(st.session_state.get("swv_plot_margin_px", 40))
+    reconstruction_perimeter_width = float(
+        st.session_state.get("swv_plot_perimeter_width", 0.8)
+    )
+    reconstruction_perimeter_color = str(
+        st.session_state.get("swv_plot_perimeter_color", "#222222")
+    )
+    reconstruction_marker_size = float(
+        st.session_state.get("swv_plot_marker_size", 6.0)
+    )
+    reconstruction_marker_opacity = float(
+        st.session_state.get("swv_plot_marker_opacity", 0.85)
+    )
+    reconstruction_show_grid = bool(
+        st.session_state.get("swv_plot_show_grid", False)
+    )
+    reconstruction_uses_doubling_levels = bool(
+        primary_axis is not None
+        and getattr(
+            primary_axis,
+            "_swv_concentration_doubling_scale",
+            False,
+        )
+    )
+    reconstruction_concentration_scale = (
+        "Doubling levels"
+        if reconstruction_uses_doubling_levels
+        else (
+            "Logarithmic"
+            if primary_axis is not None
+            and primary_axis.get_yscale() in {"log", "symlog"}
+            else "Linear"
+        )
+    )
+    manual_reconstruction_x_limits = False
+    reconstruction_x_min = None
+    reconstruction_x_max = None
+    reconstruction_x_tick_positions_text = ""
+    reconstruction_x_tick_labels_text = ""
+    reconstruction_y_tick_positions_text = ""
+    reconstruction_y_tick_labels_text = ""
 
     with settings_col.popover("Plot settings", use_container_width=True):
         override_plot_text = st.checkbox(
@@ -480,6 +565,308 @@ def render_downloadable_pyplot(
             st.caption(
                 "Invalid color(s) ignored: " + ", ".join(invalid_series_colors)
             )
+        acceptance_region_alpha = None
+        if acceptance_regions:
+            current_alpha = acceptance_regions[0].get_alpha()
+            acceptance_region_alpha = st.slider(
+                "20% acceptance-region alpha",
+                min_value=0.0,
+                max_value=1.0,
+                value=(
+                    float(current_alpha)
+                    if current_alpha is not None else 0.10
+                ),
+                step=0.05,
+                key=f"{key}_acceptance_region_alpha",
+                help=(
+                    "Controls the opacity of the shaded ±20% prediction-error region."
+                ),
+            )
+        manual_reconstruction_y_limits = False
+        reconstruction_y_min = None
+        reconstruction_y_max = None
+        if plot_kind == "concentration_reconstruction" and primary_axis is not None:
+            st.divider()
+            st.markdown("**Canvas and export**")
+            reconstruction_width_px = int(st.number_input(
+                "Plot width (px)",
+                min_value=400,
+                max_value=3000,
+                value=int(reconstruction_width_px),
+                step=20,
+                key=f"{key}_plot_width_px",
+            ))
+            reconstruction_height_px = int(st.number_input(
+                "Plot height (px)",
+                min_value=240,
+                max_value=2000,
+                value=int(reconstruction_height_px),
+                step=20,
+                key=f"{key}_plot_height_px",
+            ))
+            output_dpi = int(st.slider(
+                "Download resolution",
+                min_value=72,
+                max_value=600,
+                value=int(dpi),
+                step=1,
+                format="%d DPI",
+                key=f"{key}_plot_dpi",
+            ))
+
+            st.markdown("**Text**")
+            reconstruction_text_size = float(st.slider(
+                "Plot text size",
+                min_value=6.0,
+                max_value=72.0,
+                value=float(reconstruction_text_size),
+                step=0.5,
+                format="%.1f pt",
+                key=f"{key}_text_size",
+                help="Sets the base size used by plot text, as in the BO viewer.",
+            ))
+            use_individual_text_sizes = st.checkbox(
+                "Set individual text sizes",
+                key=f"{key}_individual_text_sizes",
+                help=(
+                    "When off, the base text-size control scales the title, axis "
+                    "labels, ticks, and legend together."
+                ),
+            )
+            reconstruction_title_size = float(st.number_input(
+                "Title size",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(reconstruction_text_size * 1.2),
+                step=0.5,
+                key=f"{key}_title_size",
+                disabled=not use_individual_text_sizes,
+            ))
+            reconstruction_tick_size = float(st.number_input(
+                "Tick size",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(reconstruction_text_size * 0.9),
+                step=0.5,
+                key=f"{key}_tick_size",
+                disabled=not use_individual_text_sizes,
+            ))
+            reconstruction_x_label_size = float(st.number_input(
+                "X label size",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(reconstruction_text_size),
+                step=0.5,
+                key=f"{key}_x_label_size",
+                disabled=not use_individual_text_sizes,
+            ))
+            reconstruction_y_label_size = float(st.number_input(
+                "Y label size",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(reconstruction_text_size),
+                step=0.5,
+                key=f"{key}_y_label_size",
+                disabled=not use_individual_text_sizes,
+            ))
+            reconstruction_legend_size = float(st.number_input(
+                "Legend text size",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(reconstruction_text_size * 0.8),
+                step=0.5,
+                key=f"{key}_legend_size",
+                disabled=not use_individual_text_sizes,
+            ))
+            if not use_individual_text_sizes:
+                reconstruction_title_size = reconstruction_text_size * 1.2
+                reconstruction_x_label_size = reconstruction_text_size
+                reconstruction_y_label_size = reconstruction_text_size
+                reconstruction_tick_size = reconstruction_text_size * 0.9
+                reconstruction_legend_size = reconstruction_text_size * 0.8
+
+            st.markdown("**Lines, markers, and frame**")
+            reconstruction_line_scale = float(st.slider(
+                "Line thickness",
+                min_value=0.25,
+                max_value=5.0,
+                value=1.0,
+                step=0.25,
+                format="%.2fx",
+                key=f"{key}_line_width_scale",
+                help="Scales the existing line widths for this plot.",
+            ))
+            reconstruction_line_color = st.text_input(
+                "Line color override",
+                key=f"{key}_line_color_override",
+                help=(
+                    "Optional Matplotlib/CSS color applied to every line. Leave "
+                    "blank to retain the plot or per-series colors."
+                ),
+            ).strip()
+            if reconstruction_line_color and not is_color_like(reconstruction_line_color):
+                st.caption("Unrecognized line color; existing colors will be retained.")
+            reconstruction_marker_size = float(st.slider(
+                "Marker size",
+                min_value=2.0,
+                max_value=30.0,
+                value=float(reconstruction_marker_size),
+                step=1.0,
+                key=f"{key}_marker_size",
+            ))
+            reconstruction_marker_opacity = float(st.slider(
+                "Marker opacity",
+                min_value=0.05,
+                max_value=1.0,
+                value=float(reconstruction_marker_opacity),
+                step=0.05,
+                key=f"{key}_marker_opacity",
+            ))
+            reconstruction_margin_px = int(st.slider(
+                "Outer plot margin",
+                min_value=0,
+                max_value=260,
+                value=int(reconstruction_margin_px),
+                step=5,
+                format="%d px",
+                key=f"{key}_plot_margin_px",
+            ))
+            reconstruction_perimeter_width = float(st.number_input(
+                "Perimeter width",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(reconstruction_perimeter_width),
+                step=0.2,
+                key=f"{key}_perimeter_width",
+            ))
+            reconstruction_perimeter_color = st.text_input(
+                "Perimeter color",
+                value=reconstruction_perimeter_color,
+                key=f"{key}_perimeter_color",
+            ).strip()
+            if (
+                reconstruction_perimeter_color
+                and not is_color_like(reconstruction_perimeter_color)
+            ):
+                st.caption("Unrecognized perimeter color; #222222 will be used.")
+            reconstruction_show_grid = st.checkbox(
+                "Show background grid",
+                value=bool(reconstruction_show_grid),
+                key=f"{key}_show_grid",
+            )
+
+            with st.expander("Axis tick label overrides", expanded=False):
+                st.caption(
+                    "Enter comma-separated positions and displayed labels. Leave "
+                    "positions blank to relabel the existing ticks in order."
+                )
+                reconstruction_x_tick_positions_text = st.text_input(
+                    "X tick positions",
+                    key=f"{key}_x_tick_positions",
+                    placeholder="0, 10, 20",
+                )
+                reconstruction_x_tick_labels_text = st.text_input(
+                    "X tick labels",
+                    key=f"{key}_x_tick_labels",
+                    placeholder="Start, 10, 20",
+                )
+                reconstruction_y_tick_positions_text = st.text_input(
+                    "Y tick positions",
+                    key=f"{key}_y_tick_positions",
+                    placeholder="-100, 0, 100",
+                )
+                reconstruction_y_tick_labels_text = st.text_input(
+                    "Y tick labels",
+                    key=f"{key}_y_tick_labels",
+                    placeholder="-100, 0, 100",
+                )
+
+            st.markdown("**Displayed axis limits**")
+            if reconstruction_uses_doubling_levels:
+                st.caption(
+                    "The concentration axis uses doubling levels: buffer is 0, "
+                    "the lowest selected dose is 1, and every doubling adds 1."
+                )
+            else:
+                reconstruction_concentration_scale = st.radio(
+                    "Concentration-axis scale",
+                    ["Linear", "Logarithmic"],
+                    index=(
+                        0 if reconstruction_concentration_scale == "Linear" else 1
+                    ),
+                    key=f"{key}_concentration_axis_scale",
+                    help=(
+                        "Logarithmic mode automatically fits a positive Y range to "
+                        "the LOD-floored data and displayed uncertainty bounds."
+                    ),
+                )
+            manual_reconstruction_x_limits = st.checkbox(
+                "Manual x-axis limits",
+                key=f"{key}_manual_x_limits",
+                help="Overrides the displayed measurement-number range for this plot only.",
+            )
+            default_x_min, default_x_max = primary_axis.get_xlim()
+            reconstruction_x_min = st.number_input(
+                "X minimum",
+                value=float(default_x_min),
+                key=f"{key}_x_min",
+                disabled=not manual_reconstruction_x_limits,
+            )
+            reconstruction_x_max = st.number_input(
+                "X maximum",
+                value=float(default_x_max),
+                key=f"{key}_x_max",
+                disabled=not manual_reconstruction_x_limits,
+            )
+            if (
+                manual_reconstruction_x_limits
+                and reconstruction_x_min >= reconstruction_x_max
+            ):
+                st.caption("X minimum must be smaller than X maximum.")
+            manual_reconstruction_y_limits = st.checkbox(
+                "Manual y-axis limits",
+                key=f"{key}_manual_y_limits",
+                help=(
+                    "Overrides the displayed doubling-level range for this plot only."
+                    if reconstruction_uses_doubling_levels
+                    else "Overrides the reconstructed concentration range for this plot only."
+                ),
+            )
+            default_y_min, default_y_max = primary_axis.get_ylim()
+            reconstruction_y_min = st.number_input(
+                (
+                    "Y minimum (doubling level)"
+                    if reconstruction_uses_doubling_levels else "Y minimum"
+                ),
+                value=float(default_y_min),
+                key=f"{key}_y_min",
+                disabled=not manual_reconstruction_y_limits,
+            )
+            reconstruction_y_max = st.number_input(
+                (
+                    "Y maximum (doubling level)"
+                    if reconstruction_uses_doubling_levels else "Y maximum"
+                ),
+                value=float(default_y_max),
+                key=f"{key}_y_max",
+                disabled=not manual_reconstruction_y_limits,
+            )
+            if (
+                manual_reconstruction_y_limits
+                and (
+                    reconstruction_y_min >= reconstruction_y_max
+                    or (
+                        reconstruction_concentration_scale == "Logarithmic"
+                        and reconstruction_y_min <= 0
+                    )
+                )
+            ):
+                st.caption(
+                    "Y minimum must be positive for logarithmic scaling and "
+                    "smaller than Y maximum."
+                    if reconstruction_concentration_scale == "Logarithmic"
+                    else "Y minimum must be smaller than Y maximum."
+                )
 
     if primary_axis is not None:
         if override_plot_text:
@@ -509,7 +896,12 @@ def render_downloadable_pyplot(
                     break
                 color = requested_series_colors[index]
                 if color and is_color_like(color):
-                    artist.set_color(color)
+                    if hasattr(artist, "set_color"):
+                        artist.set_color(color)
+                    if hasattr(artist, "set_facecolor"):
+                        artist.set_facecolor(color)
+                    if hasattr(artist, "set_edgecolor"):
+                        artist.set_edgecolor(color)
                     if index < len(legend_handles):
                         legend_handle = legend_handles[index]
                         if hasattr(legend_handle, "set_color"):
@@ -518,9 +910,179 @@ def render_downloadable_pyplot(
                             legend_handle.set_facecolor(color)
                         if hasattr(legend_handle, "set_edgecolor"):
                             legend_handle.set_edgecolor(color)
+        if acceptance_region_alpha is not None:
+            for acceptance_region in acceptance_regions:
+                acceptance_region.set_alpha(acceptance_region_alpha)
+        if plot_kind == "concentration_reconstruction":
+            fig.set_size_inches(
+                reconstruction_width_px / output_dpi,
+                reconstruction_height_px / output_dpi,
+                forward=True,
+            )
+            display_width_px = reconstruction_width_px
+            primary_axis.title.set_fontsize(reconstruction_title_size)
+            primary_axis.xaxis.label.set_fontsize(reconstruction_x_label_size)
+            primary_axis.yaxis.label.set_fontsize(reconstruction_y_label_size)
+            primary_axis.tick_params(labelsize=reconstruction_tick_size)
+            if reconstruction_concentration_scale == "Doubling levels":
+                # The plotting function has already installed concentration
+                # tick positions/labels on a linear transformed-data axis.
+                # Calling set_yscale("linear") again resets that fixed locator
+                # and exposes the internal doubling-level coordinates.
+                pass
+            elif reconstruction_concentration_scale == "Linear":
+                primary_axis.set_yscale("linear")
+            else:
+                primary_axis.set_yscale("log")
+                if not manual_reconstruction_y_limits:
+                    automatic_log_limits = getattr(
+                        primary_axis,
+                        "_swv_reconstruction_log_ylim",
+                        None,
+                    )
+                    if automatic_log_limits is not None:
+                        primary_axis.set_ylim(*automatic_log_limits)
+            for errorbar_artist in (
+                *primary_axis.lines,
+                *primary_axis.collections,
+            ):
+                if bool(
+                    getattr(
+                        errorbar_artist,
+                        "_swv_concentration_errorbar",
+                        False,
+                    )
+                ):
+                    errorbar_artist.set_transform(primary_axis.transData)
+            for annotation in primary_axis.texts:
+                if not bool(
+                    getattr(annotation, "_swv_preserve_fontsize", False)
+                ):
+                    annotation.set_fontsize(reconstruction_text_size)
+            if reconstruction_show_grid:
+                primary_axis.grid(True, alpha=0.2)
+            else:
+                primary_axis.grid(False)
+            perimeter_color = (
+                reconstruction_perimeter_color
+                if is_color_like(reconstruction_perimeter_color)
+                else "#222222"
+            )
+            for spine in primary_axis.spines.values():
+                spine.set_visible(reconstruction_perimeter_width > 0)
+                spine.set_linewidth(reconstruction_perimeter_width)
+                spine.set_edgecolor(perimeter_color)
+            valid_line_color = (
+                reconstruction_line_color
+                if is_color_like(reconstruction_line_color)
+                else None
+            )
+            for line in primary_axis.lines:
+                line.set_linewidth(max(
+                    0.1,
+                    line.get_linewidth() * reconstruction_line_scale,
+                ))
+                if valid_line_color:
+                    line.set_color(valid_line_color)
+                if line.get_marker() not in (None, "", "None", "none", " "):
+                    line.set_markersize(reconstruction_marker_size)
+            for collection in primary_axis.collections:
+                if bool(getattr(collection, "_swv_preserve_alpha", False)):
+                    continue
+                if hasattr(collection, "get_sizes") and hasattr(collection, "set_sizes"):
+                    sizes = collection.get_sizes()
+                    if len(sizes):
+                        collection.set_sizes(np.full(
+                            len(sizes),
+                            reconstruction_marker_size ** 2,
+                            dtype=float,
+                        ))
+                        collection.set_alpha(reconstruction_marker_opacity)
+            current_legend = primary_axis.get_legend()
+            if current_legend is not None:
+                for legend_text in current_legend.get_texts():
+                    legend_text.set_fontsize(reconstruction_legend_size)
+                current_legend.get_title().set_fontsize(reconstruction_legend_size)
+                current_legend_handles = list(
+                    getattr(
+                        current_legend,
+                        "legend_handles",
+                        getattr(current_legend, "legendHandles", []),
+                    )
+                )
+                for legend_handle in current_legend_handles:
+                    if hasattr(legend_handle, "set_markersize"):
+                        legend_handle.set_markersize(reconstruction_marker_size)
+                    if hasattr(legend_handle, "get_sizes") and hasattr(
+                        legend_handle, "set_sizes"
+                    ):
+                        sizes = legend_handle.get_sizes()
+                        if len(sizes):
+                            legend_handle.set_sizes(np.full(
+                                len(sizes),
+                                reconstruction_marker_size ** 2,
+                                dtype=float,
+                            ))
+
+            for axis_key, positions_text, labels_text in (
+                (
+                    "x",
+                    reconstruction_x_tick_positions_text,
+                    reconstruction_x_tick_labels_text,
+                ),
+                (
+                    "y",
+                    reconstruction_y_tick_positions_text,
+                    reconstruction_y_tick_labels_text,
+                ),
+            ):
+                labels = _parse_text_list(labels_text)
+                if not labels:
+                    continue
+                matplotlib_axis = (
+                    primary_axis.xaxis if axis_key == "x" else primary_axis.yaxis
+                )
+                positions = _parse_numeric_list(positions_text)
+                if not positions:
+                    positions = list(matplotlib_axis.get_ticklocs())
+                count = min(len(positions), len(labels))
+                if count:
+                    matplotlib_axis.set_ticks(
+                        positions[:count],
+                        labels=labels[:count],
+                    )
+
+        if (
+            manual_reconstruction_x_limits
+            and reconstruction_x_min is not None
+            and reconstruction_x_max is not None
+            and reconstruction_x_min < reconstruction_x_max
+        ):
+            primary_axis.set_xlim(
+                float(reconstruction_x_min),
+                float(reconstruction_x_max),
+            )
+        if (
+            manual_reconstruction_y_limits
+            and reconstruction_y_min is not None
+            and reconstruction_y_max is not None
+            and reconstruction_y_min < reconstruction_y_max
+            and (
+                reconstruction_concentration_scale != "Logarithmic"
+                or reconstruction_y_min > 0
+            )
+        ):
+            primary_axis.set_ylim(
+                float(reconstruction_y_min),
+                float(reconstruction_y_max),
+            )
         if not bool(getattr(fig, "_swv_manual_layout", False)):
             try:
-                margin_px = int(st.session_state.get("swv_plot_margin_px", 40))
+                margin_px = (
+                    reconstruction_margin_px
+                    if plot_kind == "concentration_reconstruction"
+                    else int(st.session_state.get("swv_plot_margin_px", 40))
+                )
                 fig.tight_layout(pad=max(0.5, margin_px / 30.0))
             except (RuntimeError, ValueError):
                 pass
@@ -528,11 +1090,18 @@ def render_downloadable_pyplot(
             _position_swv_colorbars(fig)
 
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=output_dpi,
+        bbox_inches=(
+            None if plot_kind == "concentration_reconstruction" else "tight"
+        ),
+    )
     if globals().get("analysis_mode") == "SWV":
         plot_slot.image(
             buffer.getvalue(),
-            width=int(st.session_state.get("swv_plot_width_px", 1200)),
+            width=display_width_px,
         )
     else:
         plot_slot.pyplot(fig)
@@ -566,10 +1135,10 @@ st.markdown("""
 
 
 # 
-# Cached analysis  only re-runs when params change
+# Analysis runner. Result reuse is managed explicitly in session state so
+# progress widgets are never called from inside Streamlit's cache replay.
 # 
-@st.cache_data(show_spinner=False)
-def cached_run_batch(
+def run_batch_dispatch(
     analysis_mode,
     folders,          # tuple so it's hashable
     crop_range,
@@ -582,15 +1151,18 @@ def cached_run_batch(
     min_start_voltage,
     scan_windows,
     scan_range,
+    time_range,
     compute_skew,
     compute_wavelet_energy,
     compute_wavelet_denoised_trace,
     use_wavelet_for_correction,
+    _parallel_workers,
     edge_trim_fraction,
     min_peak_prominence_uA,
     input_signature,
+    _progress_callback=None,
 ):
-    # Used by Streamlit as part of the cache key.
+    # The signature is included in the caller's explicit session cache key.
     del input_signature
     if analysis_mode == "CV":
         return run_cv_batch(
@@ -616,10 +1188,13 @@ def cached_run_batch(
         min_start_voltage=min_start_voltage,
         scan_windows=scan_windows,
         scan_range=scan_range,
+        time_range=time_range,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
         compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
         use_wavelet_for_correction=use_wavelet_for_correction,
+        parallel_workers=_parallel_workers,
+        progress_callback=_progress_callback,
     )
 
 
@@ -631,6 +1206,10 @@ def collect_titration_rows(
     scan_range,
     edge_trim_fraction,
     concentration_unit="",
+    vlines_by_channel=None,
+    baseline_mode="none",
+    included_step_labels=None,
+    remove_extreme_outliers=False,
 ):
     rows = []
     for label, (metric_key, ylabel) in metric_cfg.items():
@@ -639,9 +1218,13 @@ def collect_titration_rows(
             metric=metric_key,
             vlines=vlines,
             channels=channels,
+            vlines_by_channel=vlines_by_channel,
             scan_range=scan_range,
             edge_trim_fraction=edge_trim_fraction,
             concentration_unit=concentration_unit,
+            baseline_mode=baseline_mode,
+            included_step_labels=included_step_labels,
+            remove_extreme_outliers=remove_extreme_outliers,
         )
         for row in metric_rows:
             rows.append({
@@ -662,6 +1245,10 @@ def collect_langmuir_summary_rows(
     edge_trim_fraction,
     step_concentrations=None,
     concentration_unit="",
+    vlines_by_channel=None,
+    baseline_mode="none",
+    included_step_labels=None,
+    remove_extreme_outliers=False,
 ):
     rows = []
     for label, (metric_key, ylabel) in metric_cfg.items():
@@ -672,10 +1259,56 @@ def collect_langmuir_summary_rows(
             metric=metric_key,
             vlines=vlines,
             channels=channels,
+            vlines_by_channel=vlines_by_channel,
             scan_range=scan_range,
             edge_trim_fraction=edge_trim_fraction,
             step_concentrations=step_concentrations,
             concentration_unit=concentration_unit,
+            baseline_mode=baseline_mode,
+            included_step_labels=included_step_labels,
+            remove_extreme_outliers=remove_extreme_outliers,
+        )
+        for row in metric_rows:
+            rows.append({
+                "metric_label": label,
+                "metric_key": metric_key,
+                "metric_ylabel": ylabel,
+                **row,
+            })
+    return rows
+
+
+def collect_titration_measurement_accuracy_rows(
+    all_results,
+    metric_cfg,
+    channels,
+    vlines,
+    scan_range,
+    edge_trim_fraction,
+    concentration_unit="",
+    vlines_by_channel=None,
+    baseline_mode="none",
+    included_step_labels=None,
+    remove_extreme_outliers=False,
+    include_buffer_measurements=False,
+):
+    rows = []
+    for label, (metric_key, ylabel) in metric_cfg.items():
+        if not supports_langmuir(metric_key):
+            continue
+        metric_rows = build_titration_measurement_accuracy_table(
+            all_results,
+            metric=metric_key,
+            vlines=vlines,
+            channels=channels,
+            vlines_by_channel=vlines_by_channel,
+            scan_range=scan_range,
+            edge_trim_fraction=edge_trim_fraction,
+            concentration_unit=concentration_unit,
+            baseline_mode=baseline_mode,
+            included_step_labels=included_step_labels,
+            remove_extreme_outliers=remove_extreme_outliers,
+            include_buffer_measurements=include_buffer_measurements,
         )
         for row in metric_rows:
             rows.append({
@@ -719,6 +1352,7 @@ def build_export_metadata(
     selected_channels: Optional[List[int]] = None,
     scan_windows: Optional[List[Tuple[int, int]]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
+    time_range: Optional[Tuple[datetime, datetime]] = None,
     minima_search_window_V: Optional[float] = None,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage_V: Optional[float] = None,
@@ -730,6 +1364,11 @@ def build_export_metadata(
     compute_wavelet_denoised_trace: Optional[bool] = None,
     use_wavelet_for_correction: Optional[bool] = None,
     titration_concentration_unit: Optional[str] = None,
+    titration_baseline_mode: Optional[str] = None,
+    titration_included_step_labels: Optional[List[str]] = None,
+    remove_extreme_titration_outliers: Optional[bool] = None,
+    show_titration_uloq: Optional[bool] = None,
+    show_titration_lod: Optional[bool] = None,
 ) -> dict:
     metadata = {
         "analysis_crop_min_V": float(crop_range[0]),
@@ -743,6 +1382,12 @@ def build_export_metadata(
             float(scan_range[1]) if scan_range is not None else None
         ),
         "analysis_scan_windows": format_scan_windows(scan_windows) if scan_windows else "",
+        "analysis_filename_time_start": (
+            time_range[0].isoformat(sep=" ") if time_range is not None else None
+        ),
+        "analysis_filename_time_end": (
+            time_range[1].isoformat(sep=" ") if time_range is not None else None
+        ),
         "analysis_vline_count": int(len(active_vlines)),
         "analysis_vlines_json": _serialize_vlines(active_vlines),
         "analysis_selected_channel_count": (
@@ -771,6 +1416,18 @@ def build_export_metadata(
                 if titration_edge_trim_fraction is not None else None
             ),
             analysis_titration_concentration_unit=titration_concentration_unit or "",
+            analysis_titration_baseline_mode=titration_baseline_mode or "none",
+            analysis_titration_included_step_labels_json=json.dumps(
+                titration_included_step_labels
+                if titration_included_step_labels is not None
+                else [],
+                separators=(",", ":"),
+            ),
+            analysis_remove_extreme_titration_outliers=bool(
+                remove_extreme_titration_outliers
+            ),
+            analysis_show_titration_uloq=bool(show_titration_uloq),
+            analysis_show_titration_lod=bool(show_titration_lod),
             analysis_peak_height_source_key=peak_height_source_key or "",
             analysis_peak_height_source_label=peak_height_source_label or "",
             analysis_compute_wavelet_denoised_trace=bool(compute_wavelet_denoised_trace),
@@ -812,7 +1469,7 @@ def build_results_export_rows(analysis_mode: str, results: List[dict]) -> Tuple[
             "channel", "swv_method_group", "frequency_hz",
             "swv_sweep_start_V", "swv_sweep_end_V", "swv_step_size_V", "swv_amplitude_V",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
-            "timestamp", "file_name", "status",
+            "timestamp", "measurement_time", "file_name", "status",
             "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected",
             "peak_current_background_recentered", "peak_current", "peak_current_smoothed_corrected",
             "peak_current_raw", "bracket_width_V",
@@ -853,6 +1510,14 @@ def build_experiment_export_payload(
     titration_edge_trim_fraction: float,
     fit_titration_langmuir: bool,
     titration_concentration_unit: str,
+    titration_results: Optional[List[dict]] = None,
+    titration_channels: Optional[List[Any]] = None,
+    titration_vlines: Optional[List[Tuple[float, str]]] = None,
+    titration_vlines_by_channel: Optional[Dict[Any, List[Tuple[float, str]]]] = None,
+    titration_scan_range: Optional[Tuple[int, int]] = None,
+    titration_baseline_mode: str = "none",
+    titration_included_step_labels: Optional[List[str]] = None,
+    remove_extreme_titration_outliers: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     result_rows, _export_keys = build_results_export_rows(analysis_mode, results)
     payload = {
@@ -861,30 +1526,59 @@ def build_experiment_export_payload(
     }
 
     if enable_titration_analysis and titration_ready:
+        analysis_results = titration_results if titration_results is not None else results
+        analysis_channels = titration_channels if titration_channels is not None else channels
+        analysis_vlines = titration_vlines if titration_vlines is not None else active_vlines
+        analysis_scan_range = titration_scan_range if titration_results is not None else scan_range
         titration_rows = collect_titration_rows(
-            results,
+            analysis_results,
             metric_cfg=metric_cfg,
-            channels=channels,
-            vlines=active_vlines,
-            scan_range=scan_range,
+            channels=analysis_channels,
+            vlines=analysis_vlines,
+            vlines_by_channel=titration_vlines_by_channel,
+            scan_range=analysis_scan_range,
             edge_trim_fraction=titration_edge_trim_fraction,
             concentration_unit=titration_concentration_unit,
+            baseline_mode=titration_baseline_mode,
+            included_step_labels=titration_included_step_labels,
+            remove_extreme_outliers=remove_extreme_titration_outliers,
         )
         if titration_rows:
             payload["titration_steps"] = pd.DataFrame(titration_rows)
 
         if fit_titration_langmuir:
             langmuir_rows = collect_langmuir_summary_rows(
-                results,
+                analysis_results,
                 metric_cfg=metric_cfg,
-                channels=channels,
-                vlines=active_vlines,
-                scan_range=scan_range,
+                channels=analysis_channels,
+                vlines=analysis_vlines,
+                vlines_by_channel=titration_vlines_by_channel,
+                scan_range=analysis_scan_range,
                 edge_trim_fraction=titration_edge_trim_fraction,
                 concentration_unit=titration_concentration_unit,
+                baseline_mode=titration_baseline_mode,
+                included_step_labels=titration_included_step_labels,
+                remove_extreme_outliers=remove_extreme_titration_outliers,
             )
             if langmuir_rows:
                 payload["langmuir_fit_summary"] = pd.DataFrame(langmuir_rows)
+            accuracy_rows = collect_titration_measurement_accuracy_rows(
+                analysis_results,
+                metric_cfg=metric_cfg,
+                channels=analysis_channels,
+                vlines=analysis_vlines,
+                vlines_by_channel=titration_vlines_by_channel,
+                scan_range=analysis_scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+                concentration_unit=titration_concentration_unit,
+                baseline_mode=titration_baseline_mode,
+                included_step_labels=titration_included_step_labels,
+                remove_extreme_outliers=remove_extreme_titration_outliers,
+            )
+            if accuracy_rows:
+                payload["titration_measurement_accuracy"] = pd.DataFrame(
+                    accuracy_rows
+                )
 
     return payload
 
@@ -991,6 +1685,8 @@ def build_export_pdf(
     drift_layout: str = "Combined",
     highlight_metric_channel: Optional[Any] = None,
     highlight_drift_channel: Optional[Any] = None,
+    remove_extreme_titration_outliers: bool = False,
+    channel_colors: Optional[Dict[Any, Any]] = None,
 ) -> bytes:
     pdf_buf = io.BytesIO()
 
@@ -1059,13 +1755,24 @@ def build_export_pdf(
                 plt.close(page)
 
         metric_items = list(metric_cfg.items())
+
+        def _metric_results(metric: str) -> List[dict]:
+            if not remove_extreme_titration_outliers:
+                return results
+            return filter_extreme_titration_outliers(
+                results,
+                metric=metric,
+                vlines=active_vlines,
+                channels=channels,
+            )
+
         if metrics_layout == "Individual channels":
             for label, (metric, ylabel) in metric_items:
                 factories = [
                     (
                         f"Ch{ch}",
                         lambda metric=metric, ylabel=ylabel, label=label, ch=ch: plot_metric_vs_scan(
-                            results,
+                            _metric_results(metric),
                             metric=metric,
                             channels=[ch],
                             title=f"Ch{ch} | {label}",
@@ -1074,6 +1781,7 @@ def build_export_pdf(
                             scan_range=scan_range,
                             figsize=(5, 3),
                             xlabel=xlabel,
+                            channel_colors=channel_colors,
                         ),
                     )
                     for ch in channels
@@ -1087,7 +1795,7 @@ def build_export_pdf(
                 (
                     label,
                     lambda metric=metric, ylabel=ylabel, label=label: plot_metric_vs_scan(
-                        results,
+                        _metric_results(metric),
                         metric=metric,
                         channels=channels,
                         title=label,
@@ -1096,6 +1804,7 @@ def build_export_pdf(
                         scan_range=scan_range,
                         highlight_channel=highlight_metric_channel,
                         xlabel=xlabel,
+                        channel_colors=channel_colors,
                     ),
                 )
                 for label, (metric, ylabel) in metric_items
@@ -1121,6 +1830,7 @@ def build_export_pdf(
                             scan_range=scan_range,
                             figsize=(5, 3),
                             xlabel=xlabel,
+                            channel_colors=channel_colors,
                         ),
                     )
                     for ch in channels
@@ -1143,6 +1853,7 @@ def build_export_pdf(
                         scan_range=scan_range,
                         highlight_channel=highlight_drift_channel,
                         xlabel=xlabel,
+                        channel_colors=channel_colors,
                     ),
                 )
                 for label, (drift_key, ylabel, _caption) in drift_items
@@ -1156,7 +1867,7 @@ def build_export_pdf(
     return pdf_buf.getvalue()
 
 
-LANGMUIR_METRIC_KEY = "peak_current_selected"
+LANGMUIR_METRIC_KEYS = frozenset({"peak_current_selected", "wavelet_energy"})
 DEFAULT_SWV_VLINES_TEXT = ""
 DEFAULT_SWV_CROP_RANGE = (-0.5, -0.1)
 DEFAULT_SWV_MIN_START_VOLTAGE = -0.6
@@ -1191,7 +1902,7 @@ VLINE_ANNOTATION_PLACEHOLDER = (
 
 
 def supports_langmuir(metric_key: str) -> bool:
-    return metric_key == LANGMUIR_METRIC_KEY
+    return metric_key in LANGMUIR_METRIC_KEYS
 
 
 def parse_colormap_names(text: str) -> Tuple[List[str], List[str]]:
@@ -1584,18 +2295,42 @@ def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
     return vlines, errors
 
 
+AUTOTITRATION_VLINE_DETECTION_VERSION = 2
+
 _AUTOTITRATION_MEASUREMENT_RE = re.compile(
     r"Queue start ->\s*"
-    r"(?P<concentration>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
-    r"(?P<unit>pM|nM|[uµμ]M|mM|M)\s*\|"
+    r"(?P<label>[^|]+?)\s*\|"
     r".*?MUX ch\s*(?P<channel>\d+)"
     r".*?rep\s*(?P<replicate>\d+)\s*/\s*(?P<replicate_count>\d+)",
+    re.IGNORECASE,
+)
+_AUTOTITRATION_CONCENTRATION_RE = re.compile(
+    r"^\s*(?P<concentration>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"(?P<unit>pM|nM|[uµμ]M|mM|M)\b",
     re.IGNORECASE,
 )
 _AUTOTITRATION_TAG_RE = re.compile(
     r"\[Tag\].*?_(?P<scan>\d+)_ch(?P<channel>\d+)\s*$",
     re.IGNORECASE,
 )
+
+
+def _parse_autotitration_measurement_label(
+    label: str,
+) -> Optional[Tuple[str, str]]:
+    """Return the concentration identity encoded by a queued SWV label."""
+    if re.search(r"\bbuffer\b", label, flags=re.IGNORECASE):
+        return "buffer", ""
+
+    concentration_match = _AUTOTITRATION_CONCENTRATION_RE.search(label)
+    if concentration_match is None:
+        return None
+    unit = (
+        concentration_match.group("unit")
+        .replace("µ", "u")
+        .replace("μ", "u")
+    )
+    return concentration_match.group("concentration"), unit
 
 
 def _autotitration_session_logs(folders: List[str]) -> List[Path]:
@@ -1642,11 +2377,21 @@ def detect_autotitration_vlines(
         except OSError:
             continue
         for line in lines:
+            # A tag belongs only to the latest queue item. In particular, do
+            # not let an unrecognized queue item inherit a preceding target
+            # concentration.
+            if "queue start ->" in line.lower():
+                pending_measurement = None
             measurement_match = _AUTOTITRATION_MEASUREMENT_RE.search(line)
             if measurement_match:
-                unit = measurement_match.group("unit").replace("µ", "u").replace("μ", "u")
+                measurement_identity = _parse_autotitration_measurement_label(
+                    measurement_match.group("label")
+                )
+                if measurement_identity is None:
+                    continue
+                concentration, unit = measurement_identity
                 pending_measurement = (
-                    measurement_match.group("concentration"),
+                    concentration,
                     unit,
                     int(measurement_match.group("channel")),
                 )
@@ -1709,7 +2454,7 @@ def detect_autotitration_vlines(
         concentration, unit = segment["identity"]
         if detected_vlines and boundary <= detected_vlines[-1][0]:
             continue
-        detected_vlines.append((boundary, f"{concentration} {unit}"))
+        detected_vlines.append((boundary, f"{concentration} {unit}".strip()))
 
     if detected_vlines and segments:
         last_by_channel: Dict[int, float] = {}
@@ -1735,6 +2480,27 @@ def _vlines_input_text(vlines: List[Tuple[float, str]]) -> str:
         f"{int(scan) if float(scan).is_integer() else scan:g},{label}"
         for scan, label in vlines
     )
+
+
+def titration_step_selection_options(
+    vlines: List[Tuple[float, str]],
+) -> List[str]:
+    bases = [
+        "buffer"
+        if str(label).strip().lower().startswith("buffer")
+        else str(label).strip()
+        for _position, label in vlines[:-1]
+    ]
+    totals = {base: bases.count(base) for base in set(bases)}
+    occurrences: Dict[str, int] = {}
+    options = []
+    for base in bases:
+        occurrences[base] = occurrences.get(base, 0) + 1
+        if base == "buffer" or totals[base] > 1:
+            options.append(f"{base}_{occurrences[base]}")
+        else:
+            options.append(base)
+    return options
 
 
 def scan_in_windows(scan_number: float, scan_windows: List[Tuple[int, int]]) -> bool:
@@ -1868,6 +2634,16 @@ def filter_vlines_to_results_axis(
         for x, label in vlines
         if float(x) < min_scan
     ]
+    # Autotitration deliberately closes its final interval one scan beyond the
+    # last observed measurement. Preserve that synthetic `end` boundary so the
+    # last concentration has a right edge and can produce a plateau.
+    right_end_candidates = [
+        (float(x), str(label))
+        for x, label in vlines
+        if float(x) > max_scan and str(label).strip().lower() == "end"
+    ]
+    if right_end_candidates:
+        in_range.append(min(right_end_candidates, key=lambda item: item[0]))
     if left_candidates:
         nearest_left = max(left_candidates, key=lambda item: item[0])
         return [nearest_left] + in_range
@@ -1891,12 +2667,68 @@ def _channel_display_sort_key(channel: Any) -> tuple:
         return (1, text, 0, text)
 
 
+def _high_contrast_response_shades(count: int) -> np.ndarray:
+    """Alternate light and dark shades for neighboring channel/method options."""
+    if count <= 0:
+        return np.asarray([], dtype=float)
+    if count == 1:
+        return np.asarray([0.72], dtype=float)
+    light_count = (count + 1) // 2
+    dark_count = count // 2
+    light = np.linspace(0.42, 0.55, light_count)
+    dark = np.linspace(0.80, 0.95, dark_count)
+    return np.asarray([
+        light[index // 2] if index % 2 == 0 else dark[index // 2]
+        for index in range(count)
+    ])
+
+
 def _channel_option_value(option: str) -> Any:
     text = option.removeprefix("Ch")
     try:
         return int(text)
     except ValueError:
         return text
+
+
+def _compact_titration_channel_label(channel: Any) -> str:
+    text = str(channel).split("|", 1)[0].strip()
+    match = re.fullmatch(r"(?:Ch)?(\d+)\s+group\s+(\d+)", text, re.IGNORECASE)
+    if match:
+        return f"Ch{match.group(1)} · method {match.group(2)}"
+    return text if text.lower().startswith("ch") else f"Ch{text}"
+
+
+def _titration_diagnostic_row_groups(
+    rows: List[dict],
+    layout: str,
+) -> List[Tuple[str, str, List[dict]]]:
+    """Split diagnostic rows for all-group, original-channel, or method-group plots."""
+    if not rows:
+        return []
+    if layout == "All groups":
+        return [("all", "All groups", rows)]
+
+    grouped: Dict[Any, List[dict]] = {}
+    for row in rows:
+        if layout == "Per SWV group":
+            group_key = row.get("channel")
+        else:
+            group_key = row.get("original_channel")
+            if group_key is None:
+                channel_text = str(row.get("channel", ""))
+                match = re.match(r"(?:Ch)?(\d+)", channel_text, re.IGNORECASE)
+                group_key = int(match.group(1)) if match else row.get("channel")
+        grouped.setdefault(group_key, []).append(row)
+
+    output = []
+    for index, group_key in enumerate(
+        sorted(grouped, key=_channel_display_sort_key),
+        start=1,
+    ):
+        label = _compact_titration_channel_label(group_key)
+        output.append((f"group_{index}", label, grouped[group_key]))
+    return output
 
 
 def _swv_modulo_channel_label(channel: Any, group_index: int) -> str:
@@ -2241,6 +3073,8 @@ for k, v in dict(
     results_mode=None,
     last_results_mode=None,
     results_folder_key=None,
+    analysis_cache_key=None,
+    analysis_cache_results=None,
     folders=[],
     run_count=0,
     swv_post_method_filter_enabled=False,
@@ -2248,6 +3082,9 @@ for k, v in dict(
     swv_post_vlines_input=DEFAULT_SWV_VLINES_TEXT,
     swv_enable_titration_analysis=False,
     swv_titration_edge_trim_fraction=0.15,
+    swv_remove_extreme_titration_outliers=False,
+    swv_show_titration_uloq=True,
+    swv_show_titration_lod=True,
     swv_fit_titration_langmuir=True,
     swv_titration_concentration_unit="uM",
     mat_conversion_report=None,
@@ -2335,25 +3172,16 @@ with st.sidebar:
             st.error(f"Not found: `{fe}`")
 
     if analysis_mode == "SWV" and folders and not folder_errors:
-        mat_count = sum(
-            1
-            for folder in folders
-            for path in Path(folder).rglob("*")
-            if path.is_file()
-            and path.suffix.lower() == ".mat"
-            and "_mat_csv" not in path.parts
-        )
-        if mat_count:
-            st.caption(f"Found {mat_count} MATLAB file(s) in the selected folders.")
-            if st.button("Convert MAT files for SWV", use_container_width=True):
-                with st.spinner("Converting MATLAB files to native SWV CSVs..."):
-                    report = convert_mat_folders_to_swv_csv(folders)
-                st.session_state.mat_conversion_report = report
-                updated_folders = list(st.session_state.folders)
-                for output_folder in report["output_folders"]:
-                    updated_folders = _append_unique_folder(updated_folders, output_folder)
-                st.session_state.folders = updated_folders
-                st.rerun()
+        st.caption("MAT-file discovery runs only when conversion is requested.")
+        if st.button("Find and convert MAT files for SWV", use_container_width=True):
+            with st.spinner("Finding and converting MATLAB files to native SWV CSVs..."):
+                report = convert_mat_folders_to_swv_csv(folders)
+            st.session_state.mat_conversion_report = report
+            updated_folders = list(st.session_state.folders)
+            for output_folder in report["output_folders"]:
+                updated_folders = _append_unique_folder(updated_folders, output_folder)
+            st.session_state.folders = updated_folders
+            st.rerun()
 
     conversion_report = st.session_state.get("mat_conversion_report")
     if analysis_mode == "SWV" and conversion_report:
@@ -2369,6 +3197,8 @@ with st.sidebar:
                     use_container_width=True,
                     hide_index=True,
                 )
+        if not converted_count and not failed_count:
+            st.info("No MATLAB files were found in the selected folders.")
 
     st.divider()
 
@@ -2444,7 +3274,14 @@ with st.sidebar:
     #  Smoothing 
     st.subheader(" Smoothing")
     if analysis_mode == "SWV":
-        smooth_window = st.slider("Savitzky-Golay window", min_value=3, max_value=31, value=15, step=2, key="swv_smooth_window")
+        smooth_window = st.slider(
+            "Savitzky-Golay window",
+            min_value=3,
+            max_value=100,
+            value=15,
+            step=2,
+            key="swv_smooth_window",
+        )
         smooth_polyorder = st.slider("Polynomial order", min_value=1, max_value=5, value=2, key="swv_smooth_polyorder")
     else:
         smooth_window = st.slider("Savitzky-Golay window", min_value=3, max_value=31, value=11, step=2, key="cv_smooth_window")
@@ -2513,7 +3350,20 @@ with st.sidebar:
     st.divider()
 
     st.subheader("Performance")
+    swv_parallel_workers = 1
     if analysis_mode == "SWV":
+        available_worker_count = max(1, int(os.cpu_count() or 1))
+        swv_parallel_workers = int(st.number_input(
+            "Parallel analysis workers",
+            min_value=1,
+            max_value=available_worker_count,
+            value=min(4, available_worker_count),
+            step=1,
+            help=(
+                "Analyzes independent SWV files concurrently. Four workers is a "
+                "memory-conscious default; reduce this if the system becomes unresponsive."
+            ),
+        ))
         compute_skew = st.checkbox("Compute skew metric", value=True)
         compute_wavelet_energy = st.checkbox("Compute wavelet energy", value=True)
         with st.expander("Experimental", expanded=False):
@@ -2854,44 +3704,136 @@ with st.sidebar:
 
     st.divider()
 
-    #  Scan range 
+    #  Analysis subsection
     scan_range: Optional[Tuple[int, int]] = None
     scan_windows: List[Tuple[int, int]] = []
+    time_range: Optional[Tuple[datetime, datetime]] = None
+    time_selection_invalid = False
     use_scan_range = False
     if analysis_mode == "SWV":
-        st.subheader(" Scan Range")
+        st.subheader("Analysis Subsection")
         use_scan_range = st.checkbox(
             "Analyze subsection(s) of data",
             value=False,
             help=(
-                "Limit analysis to one or more scan windows. Enter windows using the original scan indices. "
-                "Windows use start:end slice-style bounds and are concatenated into the active dataset."
+                "Limit analysis using zero-based chronological file positions or timestamps "
+                "extracted from SWV filenames. Only matching files are opened and analyzed."
             ),
         )
         if use_scan_range:
-            scan_windows_input = st.text_area(
-                "Scan window(s)",
-                value="0:260",
-                height=80,
-                help=(
-                    "Use original scan indices in start:end format with end excluded. "
-                    "Use commas to concatenate multiple chunks, or separate with & or new lines. "
-                    "Example: 0:20, 20:40, 60:80, 80:100"
-                ),
+            subsection_basis = st.radio(
+                "Select subsection by",
+                ["File position", "Time from filename"],
+                horizontal=True,
+                key="swv_subsection_basis",
             )
-            scan_windows, scan_window_errors = parse_scan_windows(scan_windows_input)
-            for err in scan_window_errors:
-                st.warning(err)
-            if scan_windows:
-                st.caption(f"Active analysis windows: {format_scan_windows(scan_windows)}")
-                st.caption(
-                    "These subsection windows are entered on the original scan index, "
-                    "then concatenated into one continuous analysis axis."
+            if subsection_basis == "File position":
+                scan_windows_input = st.text_area(
+                    "Scan window(s)",
+                    value="0:260",
+                    height=80,
+                    help=(
+                        "Use zero-based chronological file positions in start:end format with end excluded. "
+                        "Use commas to concatenate multiple chunks, or separate with & or new lines. "
+                        "Example: 0:20, 20:40, 60:80, 80:100"
+                    ),
                 )
-                if len(scan_windows) == 1:
-                    scan_range = scan_windows[0]
-            elif scan_windows_input.strip():
-                st.error("No valid scan windows were parsed.")
+                scan_windows, scan_window_errors = parse_scan_windows(scan_windows_input)
+                for err in scan_window_errors:
+                    st.warning(err)
+                if scan_windows:
+                    st.caption(f"Active analysis windows: {format_scan_windows(scan_windows)}")
+                    st.caption(
+                        "Windows use chronological source-file order within each channel, then "
+                        "concatenate into one continuous analysis axis without opening unselected CSVs."
+                    )
+                    if len(scan_windows) == 1:
+                        scan_range = scan_windows[0]
+                elif scan_windows_input.strip():
+                    st.error("No valid scan windows were parsed.")
+            else:
+                filename_times = []
+                if folders and not folder_errors:
+                    filename_time_catalog_signature = tuple(
+                        (folder, os.stat(folder).st_mtime_ns)
+                        for folder in folders
+                    )
+                    if (
+                        st.session_state.get("_swv_filename_time_catalog_signature")
+                        != filename_time_catalog_signature
+                    ):
+                        st.session_state["_swv_filename_time_catalog"] = sorted(
+                            measurement.measurement_time
+                            for measurement in collect_measurement_csvs_from_folders(
+                                folders,
+                                mode="swv",
+                            )
+                            if measurement.measurement_time is not None
+                        )
+                        st.session_state["_swv_filename_time_catalog_signature"] = (
+                            filename_time_catalog_signature
+                        )
+                    filename_times = st.session_state.get(
+                        "_swv_filename_time_catalog",
+                        [],
+                    )
+                if not filename_times:
+                    time_selection_invalid = True
+                    st.error(
+                        "No YYYYMMDD_HHMM or YYYYMMDD_HHMMSS timestamps were found in the SWV filenames."
+                    )
+                else:
+                    filename_hours = sorted({
+                        value.replace(minute=0, second=0, microsecond=0)
+                        for value in filename_times
+                    })
+                    filename_time_signature = (
+                        2,
+                        tuple(folders),
+                        filename_hours[0],
+                        filename_hours[-1],
+                    )
+                    if (
+                        st.session_state.get("_swv_filename_time_bounds_signature")
+                        != filename_time_signature
+                    ):
+                        st.session_state["swv_filename_time_start"] = filename_hours[0]
+                        st.session_state["swv_filename_time_end"] = filename_hours[-1]
+                        st.session_state["_swv_filename_time_bounds_signature"] = (
+                            filename_time_signature
+                        )
+                    time_c1, time_c2 = st.columns(2)
+                    time_start_hour = time_c1.selectbox(
+                        "Start filename hour",
+                        filename_hours,
+                        format_func=lambda value: value.strftime("%Y-%m-%d %H:00"),
+                        key="swv_filename_time_start",
+                        help="Includes the entire selected starting hour.",
+                    )
+                    time_end_hour = time_c2.selectbox(
+                        "End filename hour",
+                        filename_hours,
+                        format_func=lambda value: value.strftime("%Y-%m-%d %H:00"),
+                        key="swv_filename_time_end",
+                        help="Includes the entire selected ending hour.",
+                    )
+                    if time_start_hour <= time_end_hour:
+                        time_end_inclusive = (
+                            time_end_hour + timedelta(hours=1) - timedelta(microseconds=1)
+                        )
+                        time_range = (time_start_hour, time_end_inclusive)
+                        selected_filename_count = sum(
+                            time_start_hour <= value <= time_end_inclusive
+                            for value in filename_times
+                        )
+                        st.caption(
+                            f"{selected_filename_count:,} source file(s) fall within the selected full-hour range."
+                        )
+                    else:
+                        time_selection_invalid = True
+                        st.error(
+                            "Start filename hour must be no later than the end hour."
+                        )
     else:
         st.subheader(" Cycle View")
         st.caption("CV metrics are tracked across detected cycle number within each EC block, so scan windows and vlines are not used here.")
@@ -2903,7 +3845,8 @@ with st.sidebar:
         max_failed = st.number_input("Max failed traces to plot", value=40, min_value=1)
 
     st.divider()
-    scan_selection_invalid = use_scan_range and not scan_windows
+    scan_selection_invalid = use_scan_range and not scan_windows and time_range is None
+    scan_selection_invalid = scan_selection_invalid or time_selection_invalid
 
     run_clicked = st.button(
         "  Run Analysis",
@@ -2920,36 +3863,109 @@ if run_clicked and folders and not folder_errors:
     st.session_state.folders = folders
     try:
         if use_cache:
-            with st.spinner("Running analysis (first run may take a moment, cached runs are instant)"):
-                results = cached_run_batch(
-                    analysis_mode=analysis_mode,
-                    folders=tuple(folders),
-                    crop_range=(crop_min, crop_max),
-                    smooth_window=smooth_window,
-                    smooth_polyorder=smooth_polyorder,
-                    minima_search_window_V=minima_search_window,
-                    use_prominent_minima=use_prominent_minima,
-                    use_double_correction=use_double_correction,
-                    min_peak_height_uA=min_peak_height,
-                    min_start_voltage=min_start_voltage,
-                    scan_windows=tuple(scan_windows),
-                    scan_range=None if scan_windows else scan_range,
-                    compute_skew=compute_skew,
-                    compute_wavelet_energy=compute_wavelet_energy,
-                    compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
-                    use_wavelet_for_correction=use_wavelet_for_correction,
-                    edge_trim_fraction=edge_trim_fraction,
-                    min_peak_prominence_uA=min_peak_prominence,
-                    input_signature=_analysis_input_signature(tuple(folders)),
-                )
+            input_signature = _analysis_input_signature(tuple(folders))
+            requested_cache_key = (
+                ANALYSIS_CACHE_SCHEMA_VERSION,
+                analysis_mode,
+                tuple(folders),
+                (float(crop_min), float(crop_max)),
+                int(smooth_window),
+                int(smooth_polyorder),
+                float(minima_search_window),
+                bool(use_prominent_minima),
+                bool(use_double_correction),
+                min_peak_height,
+                float(min_start_voltage),
+                tuple(scan_windows),
+                None if scan_windows else scan_range,
+                time_range,
+                bool(compute_skew),
+                bool(compute_wavelet_energy),
+                bool(compute_wavelet_denoised_trace),
+                bool(use_wavelet_for_correction),
+                float(edge_trim_fraction),
+                min_peak_prominence,
+                input_signature,
+            )
+            if (
+                st.session_state.get("analysis_cache_key") == requested_cache_key
+                and st.session_state.get("analysis_cache_results") is not None
+            ):
+                results = st.session_state.analysis_cache_results
+                st.caption("Reused cached analysis results.")
+            else:
+                progress_bar = None
+                progress_text = None
+
+                if analysis_mode == "SWV":
+                    progress_bar = st.progress(0)
+                    progress_text = st.empty()
+                    cached_progress_state = {"pct": -1}
+
+                    def _cached_swv_progress(done, total, name):
+                        pct = int((done / max(total, 1)) * 100)
+                        if done != 1 and done != total and pct <= cached_progress_state["pct"]:
+                            return
+                        cached_progress_state["pct"] = pct
+                        progress_bar.progress(pct)
+                        phase = "Analyzing selected traces"
+                        display_name = name.removeprefix("Analyzing ")
+                        progress_text.caption(
+                            f"{phase} {done}/{total}: {display_name}"
+                        )
+
+                with st.spinner("Running analysis (first run may take a moment, cached runs are instant)"):
+                    results = run_batch_dispatch(
+                        analysis_mode=analysis_mode,
+                        folders=tuple(folders),
+                        crop_range=(crop_min, crop_max),
+                        smooth_window=smooth_window,
+                        smooth_polyorder=smooth_polyorder,
+                        minima_search_window_V=minima_search_window,
+                        use_prominent_minima=use_prominent_minima,
+                        use_double_correction=use_double_correction,
+                        min_peak_height_uA=min_peak_height,
+                        min_start_voltage=min_start_voltage,
+                        scan_windows=tuple(scan_windows),
+                        scan_range=None if scan_windows else scan_range,
+                        time_range=time_range,
+                        compute_skew=compute_skew,
+                        compute_wavelet_energy=compute_wavelet_energy,
+                        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+                        use_wavelet_for_correction=use_wavelet_for_correction,
+                        _parallel_workers=swv_parallel_workers,
+                        edge_trim_fraction=edge_trim_fraction,
+                        min_peak_prominence_uA=min_peak_prominence,
+                        input_signature=input_signature,
+                        _progress_callback=(
+                            _cached_swv_progress if analysis_mode == "SWV" else None
+                        ),
+                    )
+                st.session_state.analysis_cache_key = requested_cache_key
+                st.session_state.analysis_cache_results = results
+                if progress_bar is not None and progress_text is not None:
+                    progress_bar.progress(100)
+                    progress_text.caption("Analysis complete.")
         else:
             progress_bar = st.progress(0)
             progress_text = st.empty()
+            progress_state = {"pct": -1}
 
             def _progress(done, total, name):
                 pct = int((done / max(total, 1)) * 100)
+                if done != 1 and done != total and pct <= progress_state["pct"]:
+                    return
+                progress_state["pct"] = pct
                 progress_bar.progress(pct)
-                progress_text.caption(f"Analyzing {done}/{total}: {name}")
+                if name.startswith("Checking "):
+                    phase = "Checking source files"
+                    display_name = name.removeprefix("Checking ")
+                else:
+                    phase = "Analyzing selected traces"
+                    display_name = name.removeprefix("Analyzing ")
+                progress_text.caption(
+                    f"{phase} {done}/{total}: {display_name}"
+                )
 
             if analysis_mode == "CV":
                 results = run_cv_batch(
@@ -2976,10 +3992,12 @@ if run_clicked and folders and not folder_errors:
                     min_start_voltage=min_start_voltage,
                     scan_windows=tuple(scan_windows),
                     scan_range=None if scan_windows else scan_range,
+                    time_range=time_range,
                     compute_skew=compute_skew,
                     compute_wavelet_energy=compute_wavelet_energy,
                     compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
                     use_wavelet_for_correction=use_wavelet_for_correction,
+                    parallel_workers=swv_parallel_workers,
                     progress_callback=_progress,
                 )
             progress_bar.progress(100)
@@ -3013,6 +4031,149 @@ elif results_mode != analysis_mode:
 if len(results) == 0:
     st.warning("No results returned for the current selection. Check folder paths and file naming pattern.")
     st.stop()
+
+# Streamlit can retain analysis rows across a code reload. Backfill the parsed
+# filename time so rows created by an earlier app version also support time plots.
+display_subsection_bounds: Optional[Tuple[int, int]] = None
+display_subsection_time_bounds: Optional[Tuple[datetime, datetime]] = None
+if analysis_mode == "SWV":
+    for row in results:
+        if row.get("measurement_time") is None:
+            row["measurement_time"] = parse_measurement_time_from_filename(
+                str(row.get("file_name") or row.get("file_path") or "")
+            )
+
+    analyzed_scan_numbers = sorted({
+        int(row["scan_number"])
+        for row in results
+        if row.get("scan_number") is not None
+    })
+    analyzed_filename_hours = sorted({
+        row["measurement_time"].replace(minute=0, second=0, microsecond=0)
+        for row in results
+        if row.get("measurement_time") is not None
+    })
+    if analyzed_scan_numbers:
+        analyzed_scan_min = analyzed_scan_numbers[0]
+        analyzed_scan_max = analyzed_scan_numbers[-1]
+        display_subsection_signature = (
+            current_selection_key,
+            st.session_state.get("run_count", 0),
+            analyzed_scan_min,
+            analyzed_scan_max,
+            analyzed_filename_hours[0] if analyzed_filename_hours else None,
+            analyzed_filename_hours[-1] if analyzed_filename_hours else None,
+        )
+        if (
+            st.session_state.get("_swv_display_subsection_signature")
+            != display_subsection_signature
+        ):
+            st.session_state["swv_display_subsection_enabled"] = False
+            st.session_state["swv_display_subsection_basis"] = "Scan number"
+            st.session_state["swv_display_scan_start"] = analyzed_scan_min
+            st.session_state["swv_display_scan_end"] = analyzed_scan_max
+            if analyzed_filename_hours:
+                st.session_state["swv_display_time_start"] = analyzed_filename_hours[0]
+                st.session_state["swv_display_time_end"] = analyzed_filename_hours[-1]
+            st.session_state["_swv_display_subsection_signature"] = (
+                display_subsection_signature
+            )
+
+        with st.expander("Display subsection (no reanalysis)", expanded=False):
+            display_subsection_enabled = st.checkbox(
+                "Show only a smaller subsection of the analyzed results",
+                key="swv_display_subsection_enabled",
+            )
+            display_basis_options = ["Scan number"]
+            if analyzed_filename_hours:
+                display_basis_options.append("Time from filename")
+            if (
+                st.session_state.get("swv_display_subsection_basis")
+                not in display_basis_options
+            ):
+                st.session_state["swv_display_subsection_basis"] = "Scan number"
+            display_subsection_basis = st.radio(
+                "Select and sort display subsection by",
+                display_basis_options,
+                horizontal=True,
+                key="swv_display_subsection_basis",
+                disabled=not display_subsection_enabled,
+            )
+            display_c1, display_c2 = st.columns(2)
+            if display_subsection_basis == "Time from filename":
+                display_time_start = display_c1.selectbox(
+                    "Display start hour",
+                    analyzed_filename_hours,
+                    format_func=lambda value: value.strftime("%Y-%m-%d %H:00"),
+                    key="swv_display_time_start",
+                    disabled=not display_subsection_enabled,
+                )
+                display_time_end = display_c2.selectbox(
+                    "Display end hour",
+                    analyzed_filename_hours,
+                    format_func=lambda value: value.strftime("%Y-%m-%d %H:00"),
+                    key="swv_display_time_end",
+                    disabled=not display_subsection_enabled,
+                )
+            else:
+                display_scan_start = int(display_c1.number_input(
+                    "Analyzed scan start",
+                    min_value=analyzed_scan_min,
+                    max_value=analyzed_scan_max,
+                    step=1,
+                    key="swv_display_scan_start",
+                    disabled=not display_subsection_enabled,
+                ))
+                display_scan_end = int(display_c2.number_input(
+                    "Analyzed scan end",
+                    min_value=analyzed_scan_min,
+                    max_value=analyzed_scan_max,
+                    step=1,
+                    key="swv_display_scan_end",
+                    disabled=not display_subsection_enabled,
+                ))
+
+        if display_subsection_enabled:
+            full_result_count = len(results)
+            if display_subsection_basis == "Time from filename":
+                if display_time_start > display_time_end:
+                    st.warning("Display start hour must be no later than the end hour.")
+                else:
+                    display_time_end_inclusive = (
+                        display_time_end + timedelta(hours=1) - timedelta(microseconds=1)
+                    )
+                    display_subsection_time_bounds = (
+                        display_time_start,
+                        display_time_end_inclusive,
+                    )
+                    displayed_result_count = sum(
+                        1 for row in results
+                        if row.get("measurement_time") is not None
+                        and display_time_start
+                        <= row["measurement_time"]
+                        <= display_time_end_inclusive
+                    )
+                    st.caption(
+                        f"Displaying {displayed_result_count:,} of {full_result_count:,} analyzed rows "
+                        f"from {display_time_start:%Y-%m-%d %H:00} through "
+                        f"{display_time_end:%Y-%m-%d %H:59}. Analysis was not rerun."
+                    )
+            elif display_scan_start > display_scan_end:
+                st.warning("Display scan start must be less than or equal to the end.")
+            else:
+                displayed_result_count = sum(
+                    1 for row in results
+                    if row.get("scan_number") is not None
+                    and display_scan_start <= int(row["scan_number"]) <= display_scan_end
+                )
+                display_subsection_bounds = (
+                    display_scan_start,
+                    display_scan_end,
+                )
+                st.caption(
+                    f"Displaying {displayed_result_count:,} of {full_result_count:,} analyzed rows "
+                    f"for scans {display_scan_start}–{display_scan_end}. Analysis was not rerun."
+                )
 
 if analysis_mode == "CV":
     ec_labels = [label for label in ["EC3", "EC4"] if any(r.get("ec_label") == label for r in results)]
@@ -3102,6 +4263,27 @@ if analysis_mode == "SWV":
         "The selected SWV trace now drives the derived SWV metrics as a set: peak height, "
         "peak voltage, bracket width, peak offset, skew, wavelet energy, and the related drift fields."
     )
+    if display_subsection_bounds is not None:
+        display_scan_start, display_scan_end = display_subsection_bounds
+        results = [
+            row for row in results
+            if row.get("scan_number") is not None
+            and display_scan_start <= int(row["scan_number"]) <= display_scan_end
+        ]
+    elif display_subsection_time_bounds is not None:
+        display_time_start, display_time_end = display_subsection_time_bounds
+        results = sorted(
+            (
+                row for row in results
+                if row.get("measurement_time") is not None
+                and display_time_start <= row["measurement_time"] <= display_time_end
+            ),
+            key=lambda row: (
+                row["measurement_time"],
+                _channel_display_sort_key(row.get("channel")),
+                row.get("scan_number", math.inf),
+            ),
+        )
 
 if analysis_mode == "CV":
     metric_cfg = {
@@ -3145,6 +4327,11 @@ enable_titration_analysis = False
 titration_edge_trim_fraction = 0.15
 fit_titration_langmuir = False
 titration_concentration_unit = "uM"
+titration_baseline_mode = "none"
+titration_included_step_labels: Optional[List[str]] = None
+remove_extreme_titration_outliers = False
+show_titration_uloq = True
+show_titration_lod = True
 swv_method_filter_enabled = False
 swv_method_filter_applied = False
 selected_swv_method_groups: List[str] = []
@@ -3215,6 +4402,7 @@ if analysis_mode == "SWV":
         if path.is_file()
     )
     autotitration_detection_key = (
+        AUTOTITRATION_VLINE_DETECTION_VERSION,
         current_selection_key,
         autotitration_log_signature,
         tuple(selected_swv_method_groups),
@@ -3303,10 +4491,35 @@ if analysis_mode == "SWV":
                     key="swv_titration_edge_trim_fraction",
                     help="Uses only the middle portion of each step when estimating the plateau median.",
                 )
+                remove_extreme_titration_outliers = st.checkbox(
+                    "Remove extreme titration outliers",
+                    key="swv_remove_extreme_titration_outliers",
+                    help=(
+                        "Within each channel/method and titration interval, excludes only "
+                        "extreme values (robust modified z-score above 5) from metric plots, "
+                        "plateaus, Langmuir fits, SNR, and predicted concentrations."
+                    ),
+                )
                 fit_titration_langmuir = st.checkbox(
                     "Fit Langmuir-style curve to step plateaus",
                     key="swv_fit_titration_langmuir",
                     help="Only reports Kd when titration vline labels include concentrations.",
+                )
+                show_titration_uloq = st.checkbox(
+                    "Show ULOQ on plots",
+                    key="swv_show_titration_uloq",
+                    help=(
+                        "Shows projected ULOQ lines, labels, and curve extensions. "
+                        "ULOQ values remain available in tables and exports when hidden."
+                    ),
+                )
+                show_titration_lod = st.checkbox(
+                    "Show LOD on plots",
+                    key="swv_show_titration_lod",
+                    help=(
+                        "Shows fitted LOD lines, labels, and the SNR = 3 cutoff region. "
+                        "LOD values remain available in tables and exports when hidden."
+                    ),
                 )
                 titration_concentration_unit = st.selectbox(
                     "Kd/report concentration unit",
@@ -3316,6 +4529,77 @@ if analysis_mode == "SWV":
                         "Vline labels with units are converted into this unit for fitting/reporting. "
                         "Unitless numeric labels also use this unit."
                     ),
+                )
+                baseline_mode_label = st.selectbox(
+                    "Titration baseline mode",
+                    options=["None", "Immediately preceding buffer"],
+                    key="swv_titration_baseline_mode",
+                    help=(
+                        "For alternating buffer/target runs, removes drift using the most "
+                        "recent buffer and references every target to the buffer immediately "
+                        "before the earliest selected target. The Langmuir baseline B is "
+                        "fixed to that anchor buffer plateau."
+                    ),
+                )
+                titration_baseline_mode = (
+                    "preceding_buffer"
+                    if baseline_mode_label == "Immediately preceding buffer"
+                    else "none"
+                )
+                current_annotation_vlines, _selection_errors = parse_vlines(
+                    st.session_state.get(
+                        "swv_post_vlines_input",
+                        DEFAULT_SWV_VLINES_TEXT,
+                    )
+                )
+                concentration_options = titration_step_selection_options(
+                    current_annotation_vlines
+                )
+                option_signature = tuple(concentration_options)
+                previous_signature = tuple(
+                    st.session_state.get(
+                        "_swv_titration_concentration_option_signature",
+                        (),
+                    )
+                )
+                if option_signature != previous_signature:
+                    previous_selection = st.session_state.get(
+                        "swv_titration_included_step_labels"
+                    )
+                    if previous_selection is None or not previous_signature:
+                        next_selection = concentration_options
+                    else:
+                        next_selection = [
+                            label
+                            for label in previous_selection
+                            if label in concentration_options
+                        ]
+                        next_selection.extend(
+                            label
+                            for label in concentration_options
+                            if label not in previous_signature
+                        )
+                    st.session_state["swv_titration_included_step_labels"] = (
+                        next_selection
+                    )
+                    st.session_state[
+                        "_swv_titration_concentration_option_signature"
+                    ] = option_signature
+                titration_included_step_labels = st.multiselect(
+                    "Concentrations included in titration statistics",
+                    options=concentration_options,
+                    default=concentration_options,
+                    key="swv_titration_included_step_labels",
+                    help=(
+                        "Only selected intervals are shown in titration statistics and "
+                        "used for Langmuir, Kd, and LOD calculations. Buffers are numbered "
+                        "chronologically. Deselected buffers may still correct drift for "
+                        "their following target, but cannot define B or contribute to LOD."
+                    ),
+                )
+                st.caption(
+                    "For every Langmuir fit, B is fixed to the buffer immediately "
+                    "before the earliest selected target concentration."
                 )
                 st.caption(
                     "Kd labels must start with concentration. Examples: "
@@ -3414,6 +4698,280 @@ if use_swv_display_grouping:
     plot_active_vlines = merge_group_vlines(
         list(plot_vlines_by_channel.values())
     )
+
+# Titration analysis must use the same rows, local iteration axes, and annotation
+# remapping as the SWV display. Otherwise interleaved methods are mistaken for
+# chronological replicates of one plateau.
+titration_results = plot_results
+titration_channels = plot_channels_display
+titration_active_vlines = plot_active_vlines
+titration_vlines_by_channel = plot_vlines_by_channel or None
+titration_scan_range = plot_display_scan_range
+auto_split_titration_by_settings = False
+if analysis_mode == "SWV" and enable_titration_analysis and not use_swv_display_grouping:
+    selected_original_channels = set(channels_display)
+    signatures_by_channel: Dict[Any, set] = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel in selected_original_channels:
+            signatures_by_channel.setdefault(channel, set()).add(
+                swv_settings_signature(row)
+            )
+    auto_split_titration_by_settings = any(
+        len(signatures) > 1 for signatures in signatures_by_channel.values()
+    )
+    if auto_split_titration_by_settings:
+        titration_results = apply_swv_settings_split_for_display(results)
+        titration_channels = [
+            channel
+            for channel in sorted(
+                {row.get("channel") for row in titration_results},
+                key=_channel_display_sort_key,
+            )
+            if any(
+                row.get("channel") == channel
+                and row.get("original_channel") in selected_original_channels
+                for row in titration_results
+            )
+        ]
+        titration_vlines_by_channel = {
+            channel: remap_vlines_to_swv_display_group(
+                active_vlines,
+                [row for row in titration_results if row.get("channel") == channel],
+            )
+            for channel in titration_channels
+        }
+        titration_active_vlines = merge_group_vlines(
+            list(titration_vlines_by_channel.values())
+        )
+        titration_scan_range = None
+
+fitted_langmuir_metric_labels: List[str] = []
+langmuir_response_directions_by_metric: Dict[str, Dict[Any, str]] = {}
+response_baselines_by_metric: Dict[str, Dict[Any, float]] = {}
+if titration_ready and fit_titration_langmuir:
+    for metric_label, (metric_key, _ylabel) in metric_cfg.items():
+        if not supports_langmuir(metric_key):
+            continue
+        fit_rows = build_titration_langmuir_summary_table(
+            titration_results,
+            metric=metric_key,
+            vlines=titration_active_vlines,
+            channels=titration_channels,
+            vlines_by_channel=titration_vlines_by_channel,
+            scan_range=titration_scan_range,
+            edge_trim_fraction=titration_edge_trim_fraction,
+            concentration_unit=titration_concentration_unit,
+            baseline_mode=titration_baseline_mode,
+            included_step_labels=titration_included_step_labels,
+            remove_extreme_outliers=remove_extreme_titration_outliers,
+        )
+        if any(row.get("langmuir_fit_used") for row in fit_rows):
+            fitted_langmuir_metric_labels.append(metric_label)
+        direction_candidates: Dict[Any, set] = {}
+        for row in fit_rows:
+            if not row.get("langmuir_fit_used"):
+                continue
+            direction = str(row.get("langmuir_response_direction", "")).strip()
+            if direction not in {"signal-on", "signal-off"}:
+                continue
+            for channel_key in {
+                row.get("channel"),
+                row.get("original_channel"),
+            }:
+                if channel_key is not None:
+                    direction_candidates.setdefault(channel_key, set()).add(direction)
+        langmuir_response_directions_by_metric[metric_key] = {
+            channel: next(iter(directions))
+            for channel, directions in direction_candidates.items()
+            if len(directions) == 1
+        }
+
+# A mixed-direction metric plot should not fall back to the generic palette
+# merely because one channel's nonlinear fit failed. Supplement fitted
+# directions with robust target-minus-preceding-buffer plateau changes.
+if analysis_mode == "SWV" and (
+    len(titration_active_vlines) >= 2 or titration_vlines_by_channel
+):
+    inferred_directions = infer_titration_response_directions(
+        titration_results,
+        metric="peak_current_selected",
+        vlines=titration_active_vlines,
+        channels=titration_channels,
+        vlines_by_channel=titration_vlines_by_channel,
+        scan_range=titration_scan_range,
+        edge_trim_fraction=titration_edge_trim_fraction,
+        concentration_unit=titration_concentration_unit,
+        included_step_labels=titration_included_step_labels,
+        remove_extreme_outliers=remove_extreme_titration_outliers,
+    )
+    peak_directions = langmuir_response_directions_by_metric.setdefault(
+        "peak_current_selected",
+        {},
+    )
+    inferred_original_direction_candidates: Dict[Any, set] = {}
+    for channel, direction in inferred_directions.items():
+        peak_directions.setdefault(channel, direction)
+        original_channels = {
+            row.get("original_channel", channel)
+            for row in titration_results
+            if row.get("channel") == channel
+        }
+        for original_channel in original_channels:
+            inferred_original_direction_candidates.setdefault(
+                original_channel,
+                set(),
+            ).add(direction)
+    for original_channel, directions in (
+        inferred_original_direction_candidates.items()
+    ):
+        if len(directions) == 1:
+            peak_directions.setdefault(
+                original_channel,
+                next(iter(directions)),
+            )
+    langmuir_response_directions_by_metric["peak_current_raw"] = dict(
+        peak_directions
+    )
+    for baseline_metric in (
+        "peak_current_selected",
+        "peak_current_raw",
+        "wavelet_energy",
+    ):
+        channel_baselines = infer_titration_response_baselines(
+            titration_results,
+            metric=baseline_metric,
+            vlines=titration_active_vlines,
+            channels=titration_channels,
+            vlines_by_channel=titration_vlines_by_channel,
+            scan_range=titration_scan_range,
+            edge_trim_fraction=titration_edge_trim_fraction,
+            concentration_unit=titration_concentration_unit,
+            included_step_labels=titration_included_step_labels,
+            remove_extreme_outliers=remove_extreme_titration_outliers,
+        )
+        mapped_baselines = dict(channel_baselines)
+        original_baseline_candidates: Dict[Any, List[float]] = {}
+        for channel, baseline in channel_baselines.items():
+            for row in titration_results:
+                if row.get("channel") == channel:
+                    original_baseline_candidates.setdefault(
+                        row.get("original_channel", channel),
+                        [],
+                    ).append(float(baseline))
+                    break
+        for original_channel, baselines in original_baseline_candidates.items():
+            mapped_baselines.setdefault(
+                original_channel,
+                float(np.median(baselines)),
+            )
+        response_baselines_by_metric[baseline_metric] = mapped_baselines
+
+# Assign response colors once from the complete channel-option universe. Every
+# plot receives this same mapping, so selecting a subset or changing diagnostic
+# grouping cannot silently reassign a channel's shade.
+response_palette_channels = list(dict.fromkeys([
+    *plot_channels_display,
+    *titration_channels,
+]))
+canonical_direction_sources = [
+    langmuir_response_directions_by_metric.get("peak_current_selected", {}),
+    *langmuir_response_directions_by_metric.values(),
+]
+consistent_response_directions: Dict[Any, str] = {}
+for palette_channel in response_palette_channels:
+    primary_direction = str(
+        canonical_direction_sources[0].get(palette_channel, "")
+    ).strip().lower()
+    if primary_direction in {"signal-on", "signal-off"}:
+        consistent_response_directions[palette_channel] = primary_direction
+        continue
+    direct_candidates = {
+        str(direction_map.get(palette_channel, "")).strip().lower()
+        for direction_map in canonical_direction_sources
+        if str(direction_map.get(palette_channel, "")).strip().lower()
+        in {"signal-on", "signal-off"}
+    }
+    if len(direct_candidates) == 1:
+        consistent_response_directions[palette_channel] = next(
+            iter(direct_candidates)
+        )
+        continue
+    channel_rows = [
+        row for row in titration_results
+        if row.get("channel") == palette_channel
+    ]
+    original_channels = {
+        row.get("original_channel", palette_channel)
+        for row in channel_rows
+    }
+    primary_inherited_candidates = {
+        str(canonical_direction_sources[0].get(original_channel, "")).strip().lower()
+        for original_channel in original_channels
+        if str(canonical_direction_sources[0].get(original_channel, "")).strip().lower()
+        in {"signal-on", "signal-off"}
+    }
+    if len(primary_inherited_candidates) == 1:
+        consistent_response_directions[palette_channel] = next(
+            iter(primary_inherited_candidates)
+        )
+        continue
+    inherited_candidates = {
+        str(direction_map.get(original_channel, "")).strip().lower()
+        for direction_map in canonical_direction_sources
+        for original_channel in original_channels
+        if str(direction_map.get(original_channel, "")).strip().lower()
+        in {"signal-on", "signal-off"}
+    }
+    if len(inherited_candidates) == 1:
+        consistent_response_directions[palette_channel] = next(
+            iter(inherited_candidates)
+        )
+
+consistent_channel_colors: Dict[Any, Any] = {}
+for response_direction, colormap_name in (
+    ("signal-on", "Oranges"),
+    ("signal-off", "Blues"),
+):
+    direction_channels = [
+        channel for channel in response_palette_channels
+        if consistent_response_directions.get(channel) == response_direction
+    ]
+    shade_values = _high_contrast_response_shades(len(direction_channels))
+    consistent_channel_colors.update({
+        channel: plt.get_cmap(colormap_name)(shade_values[index])
+        for index, channel in enumerate(direction_channels)
+    })
+
+# A physical channel can be the selector option while its titration fits are
+# automatically split into SWV methods. Reuse the selector option's exact shade
+# whenever a child did not receive a direct palette assignment.
+for palette_channel in response_palette_channels:
+    if palette_channel in consistent_channel_colors:
+        continue
+    channel_rows = [
+        row for row in titration_results
+        if row.get("channel") == palette_channel
+    ]
+    parent_colors = {
+        consistent_channel_colors[original_channel]
+        for original_channel in {
+            row.get("original_channel", palette_channel)
+            for row in channel_rows
+        }
+        if original_channel in consistent_channel_colors
+    }
+    if len(parent_colors) == 1:
+        consistent_channel_colors[palette_channel] = next(iter(parent_colors))
+
+display_metric_cfg = (
+    {
+        label: metric_cfg[label]
+        for label in fitted_langmuir_metric_labels
+    }
+    if enable_titration_analysis and fit_titration_langmuir
+    else metric_cfg
+)
 
 ch_options = ["All channels"] + [f"Ch{ch}" for ch in plot_channels_display]
 
@@ -3868,40 +5426,12 @@ if view == "Overlays":
 # TAB: Metrics
 # 
 if view == "Metrics":
-    st.subheader(
-        "Metrics vs cycle number"
-        if analysis_mode == "CV"
-        else ("Metrics vs grouped iteration" if use_swv_display_grouping else "Metrics vs scan number")
-    )
+    st.subheader("Metrics")
 
-    m_c1, m_c2 = st.columns([3, 1])
-    selected_metrics = m_c1.multiselect(
-        "Metrics to display",
-        options=list(metric_cfg.keys()),
-        default=list(metric_cfg.keys()),
-    )
-    if analysis_mode == "SWV":
-        st.caption(
-            "Background RMS is computed as the RMS of the raw signal outside the selected crop window, "
-            "so the peak-analysis region is excluded by construction. Background drift uses the median "
-            "background RMS of the first 3 valid scans in each channel as the reference."
-        )
-        if apply_background_recentering:
-            st.caption(
-                "Additive background recentering is active. The app estimates a signed outside-crop background "
-                "offset from the raw trace, recenters each scan to its channel reference background, and then "
-                "reruns the usual SWV correction workflow for the recentered peak only."
-            )
-    ch_options   = ["All channels"] + [f"Ch{ch}" for ch in plot_channels_display]
-    if st.session_state.get("metric_ch_sel") not in ch_options:
-        st.session_state["metric_ch_sel"] = "All channels"
-    ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel",
-                                   help="Selecting one channel dims the others.")
-    highlight_ch = None
-    if ch_selection != "All channels":
-        highlight_ch = _channel_option_value(ch_selection)
-
+    individual_method_view = "Individual channels per method"
     metric_view_options = ["Combined", "Individual channels"]
+    if analysis_mode == "SWV":
+        metric_view_options.append(individual_method_view)
     grouped_overlay_view = None
     if use_swv_settings_grouping:
         grouped_overlay_view = "Overlay SWV settings by channel"
@@ -3917,11 +5447,220 @@ if view == "Metrics":
         horizontal=True,
         key="metric_view_mode",
     )
+    combined_plot_channels = list(plot_channels_display)
+    if view_mode == "Combined":
+        combined_channel_options_signature = tuple(
+            str(channel) for channel in plot_channels_display
+        )
+        previous_options_signature = st.session_state.get(
+            "_metric_combined_channel_options_signature"
+        )
+        stored_combined_channels = st.session_state.get(
+            "metric_combined_channels"
+        )
+        if previous_options_signature != combined_channel_options_signature:
+            valid_stored_channels = [
+                channel for channel in (stored_combined_channels or [])
+                if channel in plot_channels_display
+            ]
+            if stored_combined_channels and not valid_stored_channels:
+                valid_stored_channels = list(plot_channels_display)
+            st.session_state["metric_combined_channels"] = (
+                valid_stored_channels
+                if stored_combined_channels is not None
+                else list(plot_channels_display)
+            )
+            st.session_state[
+                "_metric_combined_channel_options_signature"
+            ] = combined_channel_options_signature
+        combined_plot_channels = st.multiselect(
+            "Channels to combine",
+            options=plot_channels_display,
+            format_func=_compact_titration_channel_label,
+            key="metric_combined_channels",
+            help="Only these channels are overlaid in Combined metric and titration plots.",
+        )
+        if not combined_plot_channels:
+            st.warning("Select at least one channel to create combined plots.")
+
+    combined_original_channels = set()
+    for channel in combined_plot_channels:
+        channel_rows = plot_results_by_channel.get(channel, [])
+        if channel_rows:
+            combined_original_channels.update(
+                row.get("original_channel", channel) for row in channel_rows
+            )
+        else:
+            combined_original_channels.add(channel)
+    combined_titration_channels = [
+        channel
+        for channel in titration_channels
+        if channel in combined_plot_channels
+        or any(
+            row.get("channel") == channel
+            and row.get("original_channel", channel) in combined_original_channels
+            for row in titration_results
+        )
+    ]
+    combined_plot_active_vlines = (
+        merge_group_vlines([
+            plot_vlines_by_channel.get(channel, [])
+            for channel in combined_plot_channels
+        ])
+        if plot_vlines_by_channel else plot_active_vlines
+    )
+    combined_titration_active_vlines = (
+        merge_group_vlines([
+            (titration_vlines_by_channel or {}).get(channel, [])
+            for channel in combined_titration_channels
+        ])
+        if titration_vlines_by_channel else titration_active_vlines
+    )
+
+    normalized_peak_label = "Peak current (min–max normalized per channel)"
+    percent_change_peak_label = "Peak current (% change from first value per channel)"
+    metric_options = list(display_metric_cfg.keys())
+    if (
+        analysis_mode == "SWV"
+        and view_mode in ("Combined", "Individual channels", individual_method_view)
+        and not (enable_titration_analysis and fit_titration_langmuir)
+    ):
+        metric_options.extend([normalized_peak_label, percent_change_peak_label])
+    stored_metric_selection = st.session_state.get("metrics_to_display")
+    if stored_metric_selection is not None:
+        st.session_state["metrics_to_display"] = [
+            label for label in stored_metric_selection if label in metric_options
+        ]
+
+    metric_columns = st.columns([3, 1, 1]) if analysis_mode == "SWV" else st.columns([3, 1])
+    m_c1, m_c2 = metric_columns[:2]
+    selected_metrics = m_c1.multiselect(
+        "Metrics to display",
+        options=metric_options,
+        default=metric_options,
+        key="metrics_to_display",
+    )
+    if enable_titration_analysis and fit_titration_langmuir:
+        if fitted_langmuir_metric_labels:
+            st.caption(
+                "Only metrics with at least one successful Langmuir fit under the "
+                "current concentration and buffer selections are displayed."
+            )
+        else:
+            st.warning(
+                "No metric produced a successful Langmuir fit with the current "
+                "concentration and buffer selections."
+            )
+    if percent_change_peak_label in selected_metrics:
+        st.caption(
+            "Percent change is calculated from each channel's first finite displayed value. "
+            "A channel whose first value is zero is omitted from that plot."
+        )
+    if analysis_mode == "SWV":
+        st.caption(
+            "Background RMS is computed as the RMS of the raw signal outside the selected crop window, "
+            "so the peak-analysis region is excluded by construction. Background drift uses the median "
+            "background RMS of the first 3 valid scans in each channel as the reference."
+        )
+        if apply_background_recentering:
+            st.caption(
+                "Additive background recentering is active. The app estimates a signed outside-crop background "
+                "offset from the raw trace, recenters each scan to its channel reference background, and then "
+                "reruns the usual SWV correction workflow for the recentered peak only."
+            )
+    highlight_channel_options = (
+        combined_plot_channels if view_mode == "Combined" else plot_channels_display
+    )
+    ch_options   = ["All channels"] + [f"Ch{ch}" for ch in highlight_channel_options]
+    if st.session_state.get("metric_ch_sel") not in ch_options:
+        st.session_state["metric_ch_sel"] = "All channels"
+    ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel",
+                                   help="Selecting one channel dims the others.")
+    highlight_ch = None
+    if ch_selection != "All channels":
+        highlight_ch = _channel_option_value(ch_selection)
+    highlight_titration_channels = None
+    if highlight_ch is not None:
+        if auto_split_titration_by_settings:
+            highlight_titration_channels = sorted(
+                {
+                    row.get("channel")
+                    for row in titration_results
+                    if row.get("original_channel") == highlight_ch
+                },
+                key=_channel_display_sort_key,
+            )
+        else:
+            highlight_titration_channels = [highlight_ch]
+
+    metric_x_key = "scan_number"
+    metric_x_label = plot_x_axis_label
+    if analysis_mode == "SWV":
+        axis_options = ["Scan number", "Time from filename"]
+        if st.session_state.get("swv_metric_x_axis") not in axis_options:
+            st.session_state["swv_metric_x_axis"] = "Scan number"
+        metric_axis = metric_columns[2].selectbox(
+            "X axis",
+            axis_options,
+            key="swv_metric_x_axis",
+            help="Time is read from the YYYYMMDD_HHMM portion of each native SWV filename.",
+        )
+        if metric_axis == "Time from filename":
+            metric_x_key = "measurement_time"
+            metric_x_label = "Measurement time"
+            missing_time_count = sum(r.get("measurement_time") is None for r in plot_results)
+            if missing_time_count == len(plot_results):
+                st.warning(
+                    "No YYYYMMDD_HHMM timestamps were found in the selected SWV filenames."
+                )
+            elif missing_time_count:
+                st.caption(
+                    f"{missing_time_count} file(s) without a native filename timestamp are omitted from time-axis plots."
+                )
+
     grouped_channels_by_original = (
         group_swv_display_channels(plot_results, plot_channels_display)
         if view_mode == grouped_overlay_view
         else {}
     )
+    method_view_results: List[dict] = []
+    method_view_channels: List[Any] = []
+    method_view_vlines_by_channel: Dict[Any, List[Tuple[float, str]]] = {}
+    if view_mode == individual_method_view:
+        if use_swv_settings_grouping:
+            method_view_results = plot_results
+            method_view_channels = list(plot_channels_display)
+            method_view_vlines_by_channel = dict(plot_vlines_by_channel)
+        else:
+            method_view_results = apply_swv_settings_split_for_display(results)
+            compute_drift_fields(method_view_results)
+            selected_original_channels = set(channels_display)
+            method_view_channels = [
+                channel
+                for channel in sorted(
+                    {row.get("channel") for row in method_view_results},
+                    key=_channel_display_sort_key,
+                )
+                if any(
+                    row.get("channel") == channel
+                    and row.get("original_channel") in selected_original_channels
+                    for row in method_view_results
+                )
+            ]
+            method_view_vlines_by_channel = {
+                channel: remap_vlines_to_swv_display_group(
+                    active_vlines,
+                    [
+                        row for row in method_view_results
+                        if row.get("channel") == channel
+                    ],
+                )
+                for channel in method_view_channels
+            }
+        st.caption(
+            "Each plot contains one physical-channel/SWV-method combination; "
+            "method iterations are kept independent."
+        )
     if grouped_overlay_view is not None and view_mode == grouped_overlay_view:
         if use_swv_settings_grouping:
             st.caption(
@@ -3945,48 +5684,216 @@ if view == "Metrics":
                 f"Titration mode is on. Each vline interval becomes one step, and plateau values are "
                 f"estimated from the median of the middle {kept_pct}% of scans in that step."
             )
+            if remove_extreme_titration_outliers:
+                st.caption(
+                    "Extreme-outlier removal is active (modified z-score > 5 within "
+                    "each channel/method and titration interval)."
+                )
+            if auto_split_titration_by_settings:
+                st.caption(
+                    "Multiple SWV methods were detected. Titration plateaus and fits are "
+                    "automatically separated by the complete SWV settings."
+                )
+            if titration_baseline_mode == "preceding_buffer":
+                st.caption(
+                    "Targets are corrected as target − preceding buffer + first buffer. "
+                    "Here, 'first buffer' means the buffer immediately before the earliest "
+                    "selected target. The Langmuir baseline B is fixed to that plateau; unpaired "
+                    "targets and buffer intervals are omitted."
+                )
+            if titration_included_step_labels is not None:
+                st.caption(
+                    f"Using {len(titration_included_step_labels)} of "
+                    f"{len(concentration_options)} concentration label(s) for "
+                    "titration statistics and fitting."
+                )
             if fit_titration_langmuir:
                 st.caption(
-                    f"Langmuir fits are only shown for {selected_peak_height_metric_label}; "
-                    "Kd requires concentrations in the vline labels."
+                    f"Langmuir fits are shown for {selected_peak_height_metric_label} and "
+                    "Wavelet energy; "
+                    "Kd requires concentrations in the vline labels. LOD uses 3σ of "
+                    "the buffer plateau divided by the fitted initial slope."
                 )
 
     for label in selected_metrics:
-        metric, ylabel = metric_cfg[label]
+        normalize_per_channel = label == normalized_peak_label
+        percent_change_per_channel = label == percent_change_peak_label
+        normalization_mode = (
+            "minmax" if normalize_per_channel
+            else "percent" if percent_change_per_channel
+            else "none"
+        )
+        if normalize_per_channel:
+            metric = "peak_current_selected"
+            ylabel = "Normalized Peak Current (0–1)"
+        elif percent_change_per_channel:
+            metric = "peak_current_selected"
+            ylabel = "Peak Current Change from First Value (%)"
+        else:
+            metric, ylabel = metric_cfg[label]
+        metric_response_directions = None
+        if not normalize_per_channel and not percent_change_per_channel:
+            metric_response_directions = (
+                langmuir_response_directions_by_metric.get(metric)
+                if metric in {"peak_current_selected", "peak_current_raw"}
+                else langmuir_response_directions_by_metric.get(
+                    "peak_current_selected"
+                )
+            )
+        buffer_offset_metric_labels = {
+            "peak_current_selected": "Peak Current Change from Buffer (uA)",
+            "peak_current_raw": "Peak Current Change from Buffer (uA)",
+            "wavelet_energy": "Wavelet Energy Change from Buffer (a.u.)",
+        }
+        metric_direction_colors_only = metric not in {
+            "peak_current_selected",
+            "peak_current_raw",
+        }
+        offset_combined_metric_to_buffer = (
+            view_mode == "Combined"
+            and len(combined_plot_channels) > 1
+            and metric in buffer_offset_metric_labels
+            and not normalize_per_channel
+            and not percent_change_per_channel
+        )
+        combined_plot_ylabel = (
+            buffer_offset_metric_labels[metric]
+            if offset_combined_metric_to_buffer else ylabel
+        )
+        combined_normalization_mode = (
+            "buffer_offset_combined"
+            if offset_combined_metric_to_buffer else normalization_mode
+        )
+        metric_plot_results = (
+            filter_extreme_titration_outliers(
+                plot_results,
+                metric=metric,
+                vlines=plot_active_vlines,
+                channels=plot_channels_display,
+                vlines_by_channel=plot_vlines_by_channel or None,
+            )
+            if remove_extreme_titration_outliers and titration_ready
+            else plot_results
+        )
+        method_metric_plot_results = method_view_results
+        if (
+            view_mode == individual_method_view
+            and remove_extreme_titration_outliers
+            and titration_ready
+        ):
+            method_metric_plot_results = filter_extreme_titration_outliers(
+                method_view_results,
+                metric=metric,
+                vlines=merge_group_vlines(
+                    list(method_view_vlines_by_channel.values())
+                ),
+                channels=method_view_channels,
+                vlines_by_channel=method_view_vlines_by_channel,
+            )
         st.markdown(f"**{label}**")
 
         if view_mode == "Combined":
-            fig = plot_metric_vs_scan(
-                plot_results, metric=metric, channels=plot_channels_display,
-                title=label, ylabel=ylabel, vlines=plot_active_vlines,
-                scan_range=plot_display_scan_range, highlight_channel=highlight_ch, xlabel=plot_x_axis_label,
+            fig = (
+                plot_metric_vs_scan(
+                    metric_plot_results,
+                    metric=metric,
+                    channels=combined_plot_channels,
+                    title=label,
+                    ylabel=combined_plot_ylabel,
+                    vlines=combined_plot_active_vlines,
+                    scan_range=plot_display_scan_range,
+                    highlight_channel=highlight_ch,
+                    xlabel=metric_x_label,
+                    x_key=metric_x_key,
+                    normalize_per_channel=normalize_per_channel,
+                    percent_change_per_channel=percent_change_per_channel,
+                    response_directions=metric_response_directions,
+                    response_baselines=response_baselines_by_metric.get(metric),
+                    offset_to_response_baseline=offset_combined_metric_to_buffer,
+                    response_direction_colors_only=(
+                        metric_direction_colors_only
+                        and not offset_combined_metric_to_buffer
+                    ),
+                    channel_colors=consistent_channel_colors,
+                )
+                if combined_plot_channels else None
             )
             if fig:
                 render_downloadable_pyplot(
                     st,
                     fig,
-                    key=f"metric_combined_{metric}_{highlight_ch or 'all'}",
+                    key=(
+                        f"metric_combined_{metric}_{highlight_ch or 'all'}_"
+                        f"normalization_{combined_normalization_mode}"
+                    ),
                     file_stem=f"metric_{label}_combined",
                 )
+        elif view_mode == individual_method_view:
+            method_column_count = max(1, min(len(method_view_channels), 3))
+            cols = st.columns(method_column_count)
+            for i, ch in enumerate(method_view_channels):
+                fig = plot_metric_vs_scan(
+                    method_metric_plot_results,
+                    metric=metric,
+                    channels=[ch],
+                    title=_compact_titration_channel_label(ch),
+                    ylabel=ylabel,
+                    vlines=method_view_vlines_by_channel.get(ch, []),
+                    scan_range=None,
+                    figsize=(5, 3),
+                    xlabel=(
+                        metric_x_label
+                        if metric_x_key == "measurement_time"
+                        else "SWV setting iteration"
+                    ),
+                    x_key=metric_x_key,
+                    normalize_per_channel=normalize_per_channel,
+                    percent_change_per_channel=percent_change_per_channel,
+                    response_directions=metric_response_directions,
+                    response_direction_colors_only=metric_direction_colors_only,
+                    channel_colors=consistent_channel_colors,
+                )
+                if fig:
+                    with cols[i % method_column_count]:
+                        render_downloadable_pyplot(
+                            st,
+                            fig,
+                            key=(
+                                f"metric_channel_method_{i}_{metric}_"
+                                f"normalization_{normalization_mode}"
+                            ),
+                            file_stem=(
+                                f"metric_{label}_{_compact_titration_channel_label(ch)}"
+                            ),
+                        )
         elif view_mode == "Individual channels":
             cols = st.columns(min(len(plot_channels_display), 3))
             for i, ch in enumerate(plot_channels_display):
                 fig = plot_metric_vs_scan(
-                    plot_results, metric=metric, channels=[ch],
+                    metric_plot_results, metric=metric, channels=[ch],
                     title=f"Ch{ch}", ylabel=ylabel,
                     vlines=(
                         plot_vlines_by_channel.get(ch, plot_active_vlines)
                         if use_swv_display_grouping
                         else plot_active_vlines
                     ),
-                    scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
+                    scan_range=plot_display_scan_range, figsize=(5, 3),
+                    xlabel=metric_x_label, x_key=metric_x_key,
+                    normalize_per_channel=normalize_per_channel,
+                    percent_change_per_channel=percent_change_per_channel,
+                    response_directions=metric_response_directions,
+                    response_direction_colors_only=metric_direction_colors_only,
+                    channel_colors=consistent_channel_colors,
                 )
                 if fig:
                     with cols[i % min(len(plot_channels_display), 3)]:
                         render_downloadable_pyplot(
                             st,
                             fig,
-                            key=f"metric_ch{ch}_{metric}",
+                            key=(
+                                f"metric_ch{ch}_{metric}_"
+                                f"normalization_{normalization_mode}"
+                            ),
                             file_stem=f"metric_{label}_ch{ch}",
                         )
         else:
@@ -3994,22 +5901,40 @@ if view == "Metrics":
             cols = st.columns(min(len(original_channels), 3))
             for i, (original_ch, display_groups) in enumerate(grouped_channels_by_original.items()):
                 original_channel_results = [
-                    row for row in plot_results
+                    row for row in metric_plot_results
                     if row.get("channel") in display_groups
                 ]
+                offset_group_metric_to_buffer = (
+                    len(display_groups) > 1
+                    and metric in buffer_offset_metric_labels
+                    and not normalize_per_channel
+                    and not percent_change_per_channel
+                )
                 fig = plot_metric_vs_scan(
                     original_channel_results,
                     metric=metric,
                     channels=display_groups,
                     title=f"Ch{original_ch}",
-                    ylabel=ylabel,
+                    ylabel=(
+                        buffer_offset_metric_labels[metric]
+                        if offset_group_metric_to_buffer else ylabel
+                    ),
                     vlines=merge_group_vlines([
                         plot_vlines_by_channel.get(display_group, [])
                         for display_group in display_groups
                     ]),
                     scan_range=plot_display_scan_range,
                     figsize=(5, 3),
-                    xlabel=plot_x_axis_label,
+                    xlabel=metric_x_label,
+                    x_key=metric_x_key,
+                    response_directions=metric_response_directions,
+                    response_baselines=response_baselines_by_metric.get(metric),
+                    offset_to_response_baseline=offset_group_metric_to_buffer,
+                    response_direction_colors_only=(
+                        metric_direction_colors_only
+                        and not offset_group_metric_to_buffer
+                    ),
+                    channel_colors=consistent_channel_colors,
                 )
                 if fig:
                     with cols[i % min(len(original_channels), 3)]:
@@ -4020,20 +5945,44 @@ if view == "Metrics":
                             file_stem=f"metric_{label}_ch{original_ch}_group_overlay",
                         )
 
-        if titration_ready:
+        if titration_ready and not normalize_per_channel and not percent_change_per_channel:
             st.caption("Titration plateaus")
             if view_mode == "Combined":
-                fig = plot_titration_plateaus(
-                    results,
-                    metric=metric,
-                    channels=channels_display,
-                    title=f"{label} | plateau fit",
-                    ylabel=ylabel,
-                    vlines=active_vlines,
-                    scan_windows=None,
-                    scan_range=plot_scan_range,
-                    edge_trim_fraction=titration_edge_trim_fraction,
-                    highlight_channel=highlight_ch if not use_swv_display_grouping else None,
+                offset_combined_plateaus_to_buffer = (
+                    len(combined_titration_channels) > 1
+                    and metric in buffer_offset_metric_labels
+                )
+                fig = (
+                    plot_titration_plateaus(
+                        titration_results,
+                        metric=metric,
+                        channels=combined_titration_channels,
+                        title=f"{label} | plateau fit",
+                        ylabel=(
+                            buffer_offset_metric_labels[metric]
+                            if offset_combined_plateaus_to_buffer else ylabel
+                        ),
+                        vlines=combined_titration_active_vlines,
+                        vlines_by_channel=titration_vlines_by_channel,
+                        scan_windows=None,
+                        scan_range=titration_scan_range,
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                        baseline_mode=titration_baseline_mode,
+                        included_step_labels=titration_included_step_labels,
+                        remove_extreme_outliers=remove_extreme_titration_outliers,
+                        response_directions=metric_response_directions,
+                        response_baselines=response_baselines_by_metric.get(metric),
+                        offset_to_response_baseline=(
+                            offset_combined_plateaus_to_buffer
+                        ),
+                        highlight_channel=(
+                            highlight_ch
+                            if not use_swv_display_grouping and not auto_split_titration_by_settings
+                            else None
+                        ),
+                        channel_colors=consistent_channel_colors,
+                    )
+                    if combined_titration_channels else None
                 )
                 if fig:
                     render_downloadable_pyplot(
@@ -4043,22 +5992,28 @@ if view == "Metrics":
                         file_stem=f"titration_plateau_{label}_combined",
                     )
             else:
-                cols = st.columns(min(len(channels_display), 3))
-                for i, ch in enumerate(channels_display):
+                cols = st.columns(min(len(titration_channels), 3))
+                for i, ch in enumerate(titration_channels):
                     fig = plot_titration_plateaus(
-                        results,
+                        titration_results,
                         metric=metric,
                         channels=[ch],
                         title=f"Ch{ch} | plateau fit",
                         ylabel=ylabel,
-                        vlines=active_vlines,
+                        vlines=titration_active_vlines,
+                        vlines_by_channel=titration_vlines_by_channel,
                         scan_windows=None,
-                        scan_range=plot_scan_range,
+                        scan_range=titration_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
+                        baseline_mode=titration_baseline_mode,
+                        included_step_labels=titration_included_step_labels,
+                        remove_extreme_outliers=remove_extreme_titration_outliers,
                         figsize=(5, 3),
+                        response_directions=metric_response_directions,
+                        channel_colors=consistent_channel_colors,
                     )
                     if fig:
-                        with cols[i % min(len(channels_display), 3)]:
+                        with cols[i % min(len(titration_channels), 3)]:
                             render_downloadable_pyplot(
                                 st,
                                 fig,
@@ -4072,20 +6027,35 @@ if view == "Metrics":
                     fit_caption += f" (fitting Ch{highlight_ch} only)"
                 st.caption(fit_caption)
                 if view_mode == "Combined":
-                    fig = plot_titration_langmuir(
-                        results,
-                        metric=metric,
-                        channels=channels_display,
-                        title=f"{label} | Langmuir-style fit",
-                        ylabel=ylabel,
-                        vlines=active_vlines,
-                        scan_windows=None,
-                        scan_range=plot_scan_range,
-                        edge_trim_fraction=titration_edge_trim_fraction,
-                        highlight_channel=highlight_ch if not use_swv_display_grouping else None,
-                        fit_langmuir=True,
-                        fit_channels=[highlight_ch] if highlight_ch is not None else None,
-                        concentration_unit=titration_concentration_unit,
+                    fig = (
+                        plot_titration_langmuir(
+                            titration_results,
+                            metric=metric,
+                            channels=combined_titration_channels,
+                            title=f"{label} | Langmuir-style fit",
+                            ylabel=ylabel,
+                            vlines=combined_titration_active_vlines,
+                            vlines_by_channel=titration_vlines_by_channel,
+                            scan_windows=None,
+                            scan_range=titration_scan_range,
+                            edge_trim_fraction=titration_edge_trim_fraction,
+                            highlight_channel=(
+                                highlight_ch
+                                if not use_swv_display_grouping and not auto_split_titration_by_settings
+                                else None
+                            ),
+                            fit_langmuir=True,
+                            fit_channels=highlight_titration_channels,
+                            concentration_unit=titration_concentration_unit,
+                            baseline_mode=titration_baseline_mode,
+                            included_step_labels=titration_included_step_labels,
+                            remove_extreme_outliers=remove_extreme_titration_outliers,
+                            show_uloq=show_titration_uloq,
+                            show_lod=show_titration_lod,
+                            response_directions=metric_response_directions,
+                            channel_colors=consistent_channel_colors,
+                        )
+                        if combined_titration_channels else None
                     )
                     if fig:
                         render_downloadable_pyplot(
@@ -4095,24 +6065,34 @@ if view == "Metrics":
                             file_stem=f"titration_langmuir_{label}_combined",
                         )
                 else:
-                    cols = st.columns(min(len(channels_display), 3))
-                    for i, ch in enumerate(channels_display):
+                    langmuir_column_count = min(len(titration_channels), 2)
+                    cols = st.columns(langmuir_column_count)
+                    for i, ch in enumerate(titration_channels):
                         fig = plot_titration_langmuir(
-                            results,
+                            titration_results,
                             metric=metric,
                             channels=[ch],
-                            title=f"Ch{ch} | Langmuir-style fit",
+                            title=f"{_compact_titration_channel_label(ch)} | Langmuir fit",
                             ylabel=ylabel,
-                            vlines=active_vlines,
+                            vlines=titration_active_vlines,
+                            vlines_by_channel=titration_vlines_by_channel,
                             scan_windows=None,
-                            scan_range=plot_scan_range,
+                            scan_range=titration_scan_range,
                             edge_trim_fraction=titration_edge_trim_fraction,
-                            figsize=(5, 3),
+                            figsize=(7, 4.25),
                             fit_langmuir=True,
                             concentration_unit=titration_concentration_unit,
+                            baseline_mode=titration_baseline_mode,
+                            included_step_labels=titration_included_step_labels,
+                            remove_extreme_outliers=remove_extreme_titration_outliers,
+                            show_uloq=show_titration_uloq,
+                            show_lod=show_titration_lod,
+                            show_legend=False,
+                            response_directions=metric_response_directions,
+                            channel_colors=consistent_channel_colors,
                         )
                         if fig:
-                            with cols[i % min(len(channels_display), 3)]:
+                            with cols[i % langmuir_column_count]:
                                 render_downloadable_pyplot(
                                     st,
                                     fig,
@@ -4121,6 +6101,334 @@ if view == "Metrics":
                                 )
 
         st.divider()
+
+    if titration_ready and fit_titration_langmuir and fitted_langmuir_metric_labels:
+        st.markdown("### Titration SNR and concentration accuracy")
+        st.caption(
+            "SNR uses the median standard deviation of selected buffer plateaus. "
+            "Concentrations are back-calculated for each individual SWV by inverting "
+            "its fitted Langmuir curve."
+        )
+        titration_diagnostic_layout = st.radio(
+            "SNR and concentration-accuracy plot grouping",
+            options=["Per channel", "Per SWV group", "All groups"],
+            horizontal=True,
+            key="swv_titration_diagnostic_plot_grouping",
+            help=(
+                "Per channel overlays the fitted SWV-setting groups belonging to one "
+                "physical channel. Per SWV group creates one plot for each fitted "
+                "channel/method combination."
+            ),
+        )
+
+        metrics_snr_rows = []
+        snr_plot_rows_by_metric: Dict[str, List[dict]] = {}
+        snr_fit_rows_by_metric: Dict[str, List[dict]] = {}
+        for metric_label in fitted_langmuir_metric_labels:
+            metric_key, _ylabel = metric_cfg[metric_label]
+            metric_step_rows = build_titration_step_table(
+                titration_results,
+                metric=metric_key,
+                vlines=titration_active_vlines,
+                vlines_by_channel=titration_vlines_by_channel,
+                channels=titration_channels,
+                scan_range=titration_scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+                concentration_unit=titration_concentration_unit,
+                baseline_mode=titration_baseline_mode,
+                included_step_labels=titration_included_step_labels,
+                remove_extreme_outliers=remove_extreme_titration_outliers,
+            )
+            snr_plot_rows_by_metric[metric_label] = metric_step_rows
+            metric_fit_rows = build_titration_langmuir_summary_table(
+                titration_results,
+                metric=metric_key,
+                vlines=titration_active_vlines,
+                vlines_by_channel=titration_vlines_by_channel,
+                channels=titration_channels,
+                scan_range=titration_scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+                concentration_unit=titration_concentration_unit,
+                baseline_mode=titration_baseline_mode,
+                included_step_labels=titration_included_step_labels,
+                remove_extreme_outliers=remove_extreme_titration_outliers,
+            )
+            snr_fit_rows_by_metric[metric_label] = metric_fit_rows
+            fit_by_channel = {row["channel"]: row for row in metric_fit_rows}
+            for row in metric_step_rows:
+                fit_row = fit_by_channel.get(row["channel"], {})
+                metrics_snr_rows.append({
+                    "Metric": metric_label,
+                    "Channel / method": row["channel"],
+                    "Selection": row.get("step_selection_key"),
+                    "Concentration": row.get("step_concentration"),
+                    "Unit": row.get("step_concentration_unit"),
+                    "Plateau": row.get("plateau_value"),
+                    "Fixed B": row.get("fixed_langmuir_baseline"),
+                    "Selected-buffer noise SD": row.get("snr_noise_std"),
+                    "Plateau SNR": row.get("titration_snr"),
+                    "LOD": fit_row.get("limit_of_detection"),
+                    "Fitted SNR=3 concentration": fit_row.get(
+                        "snr_3_cutoff_concentration"
+                    ),
+                    "ULOQ": fit_row.get("upper_limit_of_quantification"),
+                    "ULOQ projected": fit_row.get(
+                        "upper_limit_of_quantification_is_extrapolated"
+                    ),
+                })
+
+        if metrics_snr_rows:
+            snr_df = pd.DataFrame(metrics_snr_rows)
+            st.markdown("#### SNR by titration concentration")
+            st.dataframe(snr_df, use_container_width=True, height=260)
+            st.download_button(
+                "Download titration SNR CSV",
+                data=snr_df.to_csv(index=False).encode(),
+                file_name=export_file_name(analysis_mode, "titration_snr"),
+                mime="text/csv",
+                use_container_width=True,
+                key="metrics_titration_snr_download",
+            )
+            for metric_label, metric_rows in snr_plot_rows_by_metric.items():
+                diagnostic_groups = _titration_diagnostic_row_groups(
+                    metric_rows,
+                    titration_diagnostic_layout,
+                )
+                plot_columns = (
+                    st.columns(min(2, len(diagnostic_groups)))
+                    if len(diagnostic_groups) > 1 else [st]
+                )
+                for group_index, (group_key, group_label, group_rows) in enumerate(
+                    diagnostic_groups
+                ):
+                    group_channels = {row.get("channel") for row in group_rows}
+                    group_fit_rows = [
+                        row for row in snr_fit_rows_by_metric.get(metric_label, [])
+                        if row.get("channel") in group_channels
+                    ]
+                    snr_figure = plot_titration_snr(
+                        group_rows,
+                        title=f"{metric_label} | {group_label} | SNR by concentration",
+                        concentration_unit=titration_concentration_unit,
+                        fit_summary_rows=group_fit_rows,
+                        show_uloq=show_titration_uloq,
+                        show_lod=show_titration_lod,
+                        response_directions=(
+                            consistent_response_directions
+                        ),
+                        channel_colors=consistent_channel_colors,
+                    )
+                    if snr_figure is not None:
+                        render_downloadable_pyplot(
+                            plot_columns[group_index % len(plot_columns)],
+                            snr_figure,
+                            key=(
+                                f"titration_snr_plot_{metric_cfg[metric_label][0]}_"
+                                f"{titration_diagnostic_layout}_{group_key}"
+                            ),
+                            file_stem=f"titration_snr_{metric_label}_{group_label}",
+                        )
+        else:
+            st.info("No concentration-level SNR rows are available.")
+
+        metrics_accuracy_rows = collect_titration_measurement_accuracy_rows(
+            titration_results,
+            metric_cfg=display_metric_cfg,
+            channels=titration_channels,
+            vlines=titration_active_vlines,
+            vlines_by_channel=titration_vlines_by_channel,
+            scan_range=titration_scan_range,
+            edge_trim_fraction=titration_edge_trim_fraction,
+            concentration_unit=titration_concentration_unit,
+            baseline_mode=titration_baseline_mode,
+            included_step_labels=titration_included_step_labels,
+            remove_extreme_outliers=remove_extreme_titration_outliers,
+        )
+        metrics_measurement_concentration_rows = (
+            collect_titration_measurement_accuracy_rows(
+                titration_results,
+                metric_cfg=display_metric_cfg,
+                channels=titration_channels,
+                vlines=titration_active_vlines,
+                vlines_by_channel=titration_vlines_by_channel,
+                scan_range=titration_scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+                concentration_unit=titration_concentration_unit,
+                baseline_mode=titration_baseline_mode,
+                included_step_labels=titration_included_step_labels,
+                remove_extreme_outliers=remove_extreme_titration_outliers,
+                include_buffer_measurements=True,
+            )
+        )
+        st.markdown("#### Concentration accuracy for each measured SWV")
+        if metrics_accuracy_rows:
+            accuracy_display_df = pd.DataFrame([
+                {
+                    "Metric": row["metric_label"],
+                    "Channel / method": row["channel"],
+                    "Scan": row["scan_number"],
+                    "Source scan": row["source_scan_number"],
+                    "Selection": row["step_selection_key"],
+                    "Known concentration": row["known_concentration"],
+                    "Predicted concentration": row["predicted_concentration"],
+                    "Raw mapped concentration": row.get(
+                        "unbounded_predicted_concentration"
+                    ),
+                    "Reported at LOD": row.get(
+                        "concentration_censored_at_lod", False
+                    ),
+                    "Predicted concentration SD": row.get(
+                        "predicted_concentration_std"
+                    ),
+                    "Predicted concentration 1σ lower": row.get(
+                        "predicted_concentration_lower_1sigma"
+                    ),
+                    "Predicted concentration 1σ upper": row.get(
+                        "predicted_concentration_upper_1sigma"
+                    ),
+                    "Mapping uncertainty method": row.get(
+                        "predicted_concentration_uncertainty_method"
+                    ),
+                    "Unit": row["concentration_unit"],
+                    "Absolute error": row["absolute_concentration_error"],
+                    "Signed error (%)": row["signed_percent_error"],
+                    "Absolute error (%)": row["absolute_percent_error"],
+                    "Log10 error": row["log10_concentration_error"],
+                    "Measurement SNR": row["measurement_snr"],
+                    "LOD": row.get("limit_of_detection"),
+                    "ULOQ": row.get("upper_limit_of_quantification"),
+                    "ULOQ projected": row.get(
+                        "upper_limit_of_quantification_is_extrapolated"
+                    ),
+                    "File": row["file_name"],
+                }
+                for row in metrics_accuracy_rows
+            ])
+            st.dataframe(accuracy_display_df, use_container_width=True, height=340)
+            valid_errors = accuracy_display_df["Absolute error (%)"].dropna()
+            if not valid_errors.empty:
+                valid_absolute_errors = accuracy_display_df["Absolute error"].dropna()
+                rmse = (
+                    float(np.sqrt(np.mean(np.square(valid_absolute_errors))))
+                    if not valid_absolute_errors.empty else None
+                )
+                summary_cols = st.columns(4)
+                summary_cols[0].metric(
+                    "SWVs predicted",
+                    f"{len(valid_errors)}",
+                )
+                summary_cols[1].metric(
+                    "Median absolute error",
+                    f"{valid_errors.median():.2f}%",
+                )
+                summary_cols[2].metric(
+                    "Within ±20%",
+                    f"{100.0 * (valid_errors <= 20.0).mean():.1f}%",
+                )
+                summary_cols[3].metric(
+                    "RMSE",
+                    (
+                        f"{rmse:.4g} {titration_concentration_unit}"
+                        if rmse is not None else "—"
+                    ),
+                    help=(
+                        "Root mean square concentration prediction error. Lower is better; "
+                        "zero is perfect agreement."
+                    ),
+                )
+            st.caption(
+                "These are back-calculated calibration residuals, not held-out "
+                "validation errors. Blank predictions fall outside the physical "
+                "Langmuir inversion domain."
+            )
+            st.download_button(
+                "Download per-SWV concentration accuracy CSV",
+                data=accuracy_display_df.to_csv(index=False).encode(),
+                file_name=export_file_name(
+                    analysis_mode,
+                    "titration_measurement_accuracy",
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="metrics_titration_accuracy_download",
+            )
+            for metric_label in fitted_langmuir_metric_labels:
+                metric_accuracy_rows = [
+                    row for row in metrics_measurement_concentration_rows
+                    if row["metric_label"] == metric_label
+                ]
+                diagnostic_groups = _titration_diagnostic_row_groups(
+                    metric_accuracy_rows,
+                    titration_diagnostic_layout,
+                )
+                plot_columns = (
+                    st.columns(min(2, len(diagnostic_groups)))
+                    if len(diagnostic_groups) > 1 else [st]
+                )
+                for group_index, (group_key, group_label, group_rows) in enumerate(
+                    diagnostic_groups
+                ):
+                    accuracy_figure = plot_titration_concentration_accuracy(
+                        group_rows,
+                        title=(
+                            f"{metric_label} | {group_label} | predicted vs known concentration"
+                        ),
+                        concentration_unit=titration_concentration_unit,
+                        show_uloq=show_titration_uloq,
+                        show_lod=show_titration_lod,
+                        channel_colors=consistent_channel_colors,
+                        response_directions=consistent_response_directions,
+                    )
+                    if accuracy_figure is not None:
+                        render_downloadable_pyplot(
+                            plot_columns[group_index % len(plot_columns)],
+                            accuracy_figure,
+                            key=(
+                                "titration_accuracy_plot_"
+                                f"{metric_cfg[metric_label][0]}_"
+                                f"{titration_diagnostic_layout}_{group_key}"
+                            ),
+                            file_stem=(
+                                f"titration_accuracy_{metric_label}_{group_label}"
+                            ),
+                        )
+                    measurement_figure = plot_titration_concentration_vs_measurement(
+                        group_rows,
+                        title=(
+                            f"{metric_label} | {group_label} | concentration by measurement"
+                        ),
+                        concentration_unit=titration_concentration_unit,
+                        channel_colors=consistent_channel_colors,
+                        response_directions=consistent_response_directions,
+                        vlines=(
+                            active_vlines
+                            if all(
+                                row.get("source_scan_number") is not None
+                                for row in group_rows
+                            )
+                            else titration_active_vlines
+                        ),
+                    )
+                    if measurement_figure is not None:
+                        render_downloadable_pyplot(
+                            plot_columns[group_index % len(plot_columns)],
+                            measurement_figure,
+                            key=(
+                                "titration_concentration_measurement_plot_"
+                                f"{metric_cfg[metric_label][0]}_"
+                                f"{titration_diagnostic_layout}_{group_key}"
+                            ),
+                            file_stem=(
+                                f"titration_concentration_measurement_"
+                                f"{metric_label}_{group_label}"
+                            ),
+                            plot_kind="concentration_reconstruction",
+                        )
+        else:
+            st.info(
+                "No individual SWV concentration predictions are available from "
+                "the current fits."
+            )
 
 
 # 
@@ -4180,6 +6488,7 @@ if view == "Drift":
                 plot_results, drift_metric=drift_key, channels=plot_channels_display,
                 title=label, ylabel=ylabel, vlines=plot_active_vlines,
                 scan_range=plot_display_scan_range, highlight_channel=drift_highlight, xlabel=plot_x_axis_label,
+                channel_colors=consistent_channel_colors,
             )
             if fig:
                 render_downloadable_pyplot(
@@ -4197,6 +6506,7 @@ if view == "Drift":
                     plot_results, drift_metric=drift_key, channels=[ch],
                     title=f"Ch{ch}", ylabel=ylabel, vlines=plot_active_vlines,
                     scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
+                    channel_colors=consistent_channel_colors,
                 )
                 if fig:
                     with cols[i % min(len(plot_channels_display), 3)]:
@@ -4342,7 +6652,8 @@ if view == "Failures":
             chosen_label = st.selectbox("Pick a failed trace", list(fail_options_map.keys()))
             if chosen_label:
                 chosen = fail_options_map[chosen_label]
-                st.caption(f"Error: {chosen.get('error', '')}")
+                if chosen.get("error"):
+                    st.caption(f"Error: {chosen['error']}")
                 if chosen.get("voltage") is not None:
                     fig = plot_single_trace(chosen)
                     render_downloadable_pyplot(
@@ -4381,7 +6692,7 @@ if view == "Data Table":
         scalar_keys = [
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
-            "file_name", "status",
+            "measurement_time", "file_name", "status",
             "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected", "peak_current_background_recentered", "peak_current", "peak_current_smoothed_corrected",
             "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
@@ -4401,6 +6712,17 @@ if view == "Data Table":
         r for r in results
         if r.get("status") in status_filter and r.get("channel") in ch_filter
     ]
+    filtered_titration_results = [
+        r for r in titration_results
+        if r.get("status") in status_filter
+        and (
+            r.get("original_channel", r.get("channel")) in ch_filter
+        )
+    ]
+    filtered_titration_channels = sorted(
+        {r.get("channel") for r in filtered_titration_results},
+        key=_channel_display_sort_key,
+    )
 
     st.dataframe(filtered_df, use_container_width=True, height=400)
     st.caption(f"{mask.sum()} rows shown")
@@ -4411,33 +6733,52 @@ if view == "Data Table":
         if not titration_ready:
             st.info("Add at least two vertical lines inside the active scan range to build titration steps.")
         else:
+            titration_table_metric_cfg = (
+                display_metric_cfg
+                if fit_titration_langmuir
+                else metric_cfg
+            )
             default_titration_metrics = (
                 [selected_peak_height_metric_label]
-                if selected_peak_height_metric_label in metric_cfg
-                else list(metric_cfg.keys())[:1]
+                if selected_peak_height_metric_label in titration_table_metric_cfg
+                else list(titration_table_metric_cfg.keys())[:1]
             )
+            stored_titration_metrics = st.session_state.get(
+                "table_titration_metrics"
+            )
+            if stored_titration_metrics is not None:
+                st.session_state["table_titration_metrics"] = [
+                    label
+                    for label in stored_titration_metrics
+                    if label in titration_table_metric_cfg
+                ]
             titration_metric_labels = st.multiselect(
                 "Titration metrics to tabulate",
-                options=list(metric_cfg.keys()),
+                options=list(titration_table_metric_cfg.keys()),
                 default=default_titration_metrics,
                 key="table_titration_metrics",
             )
             titration_rows = []
             for label in titration_metric_labels:
-                metric_key, ylabel = metric_cfg[label]
+                metric_key, ylabel = titration_table_metric_cfg[label]
                 for row in build_titration_step_table(
-                    filtered_results,
+                    filtered_titration_results,
                     metric=metric_key,
-                    vlines=active_vlines,
-                    channels=ch_filter,
-                    scan_range=plot_scan_range,
+                    vlines=titration_active_vlines,
+                    vlines_by_channel=titration_vlines_by_channel,
+                    channels=filtered_titration_channels,
+                    scan_range=titration_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
                     concentration_unit=titration_concentration_unit,
+                    baseline_mode=titration_baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
                 ):
                     titration_rows.append({
                         "Metric": label,
                         "Channel": row["channel"],
                         "Step #": row["step_index"],
+                        "Selection key": row.get("step_selection_key"),
                         "Step label": row["step_display_label"],
                         "Concentration": row["step_concentration"],
                         "Unit": row["step_concentration_unit"],
@@ -4448,6 +6789,13 @@ if view == "Data Table":
                         "Step end": row["step_end_scan"],
                         "Midpoint": row["midpoint_scan"],
                         "Plateau value": row["plateau_value"],
+                        "Raw plateau value": row["raw_plateau_value"],
+                        "Baseline step": row["baseline_step_index"],
+                        "Baseline value": row["baseline_value"],
+                        "Anchor buffer step": row.get("anchor_buffer_step_index"),
+                        "Fixed Langmuir B": row.get("fixed_langmuir_baseline"),
+                        "Plateau SNR": row.get("titration_snr"),
+                        "SNR noise SD": row.get("snr_noise_std"),
                         "Plateau MAD": row["plateau_mad"],
                         "Step scans": row["step_scan_count"],
                         "Plateau scans": row["plateau_scan_count"],
@@ -4466,13 +6814,17 @@ if view == "Data Table":
                 st.info("Add at least two vertical lines inside the active scan range to build Langmuir fits.")
             else:
                 langmuir_rows = collect_langmuir_summary_rows(
-                    filtered_results,
+                    filtered_titration_results,
                     metric_cfg=metric_cfg,
-                    channels=ch_filter,
-                    vlines=active_vlines,
-                    scan_range=plot_scan_range,
+                    channels=filtered_titration_channels,
+                    vlines=titration_active_vlines,
+                    vlines_by_channel=titration_vlines_by_channel,
+                    scan_range=titration_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
                     concentration_unit=titration_concentration_unit,
+                    baseline_mode=titration_baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
                 )
                 if langmuir_rows:
                     langmuir_df = pd.DataFrame([
@@ -4480,8 +6832,20 @@ if view == "Data Table":
                             "Metric": row["metric_label"],
                             "Channel": row["channel"],
                             "Fit status": row["langmuir_fit_status"],
+                            "Response direction": row.get(
+                                "langmuir_response_direction"
+                            ),
                             f"Kd ({row.get('langmuir_kd_unit') or titration_concentration_unit})": row["langmuir_kd"],
+                            f"LOD ({row.get('limit_of_detection_unit') or titration_concentration_unit})": row["limit_of_detection"],
+                            "LOD method": row["limit_of_detection_method"],
+                            f"ULOQ ({row.get('upper_limit_of_quantification_unit') or titration_concentration_unit})": row.get("upper_limit_of_quantification"),
+                            "ULOQ method": row.get("upper_limit_of_quantification_method"),
+                            "ULOQ noise SD": row.get("upper_limit_of_quantification_noise_sigma"),
+                            "ULOQ noise source": row.get("upper_limit_of_quantification_noise_source"),
+                            "ULOQ projected beyond data": row.get("upper_limit_of_quantification_is_extrapolated"),
                             "Baseline": row["langmuir_baseline"],
+                            "Baseline fixed": row.get("langmuir_baseline_fixed", False),
+                            "Anchor buffer step": row.get("anchor_buffer_step_index"),
                             "Amplitude": row["langmuir_amplitude"],
                             "Saturation step": row["saturation_step_index"],
                             "Saturation concentration": row["saturation_concentration"],
@@ -4499,10 +6863,49 @@ if view == "Data Table":
                     st.dataframe(langmuir_df, use_container_width=True, height=220)
                     st.caption(
                         "Kd is reported only when the fitted titration steps have numeric concentrations "
-                        "from their left vline labels."
+                        "from their left vline labels. LOD is reported only when buffer "
+                        "plateaus provide a nonzero noise estimate."
                     )
                 else:
                     st.info("No Langmuir fit summaries are available for the current filters.")
+
+                accuracy_rows = collect_titration_measurement_accuracy_rows(
+                    filtered_titration_results,
+                    metric_cfg=metric_cfg,
+                    channels=filtered_titration_channels,
+                    vlines=titration_active_vlines,
+                    vlines_by_channel=titration_vlines_by_channel,
+                    scan_range=titration_scan_range,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit,
+                    baseline_mode=titration_baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
+                )
+                st.markdown("#### Per-SWV concentration accuracy")
+                if accuracy_rows:
+                    accuracy_df = pd.DataFrame(accuracy_rows)
+                    st.dataframe(accuracy_df, use_container_width=True, height=300)
+                    valid_accuracy = accuracy_df["absolute_percent_error"].dropna()
+                    if not valid_accuracy.empty:
+                        valid_absolute_errors = accuracy_df[
+                            "absolute_concentration_error"
+                        ].dropna()
+                        rmse = (
+                            float(np.sqrt(np.mean(np.square(valid_absolute_errors))))
+                            if not valid_absolute_errors.empty else None
+                        )
+                        st.caption(
+                            f"{len(valid_accuracy)} SWVs inverted successfully; median absolute "
+                            f"back-calculated concentration error = {valid_accuracy.median():.2f}%; "
+                            f"RMSE = {rmse:.4g} {titration_concentration_unit}. "
+                            "These are calibration-fit residuals, not held-out validation errors."
+                        )
+                else:
+                    st.info(
+                        "No per-SWV concentration predictions are available from the "
+                        "current selected concentrations and Langmuir fits."
+                    )
 
     if analysis_mode == "SWV":
         st.divider()
@@ -4588,6 +6991,7 @@ if view == "Export":
         selected_channels=channels_display,
         scan_windows=scan_windows,
         scan_range=plot_scan_range,
+        time_range=time_range,
         minima_search_window_V=minima_search_window if analysis_mode == "SWV" else None,
         min_peak_height_uA=min_peak_height if analysis_mode == "SWV" else None,
         min_start_voltage_V=min_start_voltage if analysis_mode == "SWV" else None,
@@ -4599,6 +7003,19 @@ if view == "Export":
         compute_wavelet_denoised_trace=compute_wavelet_denoised_trace if analysis_mode == "SWV" else None,
         use_wavelet_for_correction=use_wavelet_for_correction if analysis_mode == "SWV" else None,
         titration_concentration_unit=titration_concentration_unit if analysis_mode == "SWV" else None,
+        titration_baseline_mode=titration_baseline_mode if analysis_mode == "SWV" else None,
+        titration_included_step_labels=(
+            titration_included_step_labels if analysis_mode == "SWV" else None
+        ),
+        remove_extreme_titration_outliers=(
+            remove_extreme_titration_outliers if analysis_mode == "SWV" else None
+        ),
+        show_titration_uloq=(
+            show_titration_uloq if analysis_mode == "SWV" else None
+        ),
+        show_titration_lod=(
+            show_titration_lod if analysis_mode == "SWV" else None
+        ),
     )
     export_payload = build_experiment_export_payload(
         analysis_mode=analysis_mode,
@@ -4613,6 +7030,14 @@ if view == "Export":
         titration_edge_trim_fraction=titration_edge_trim_fraction,
         fit_titration_langmuir=fit_titration_langmuir,
         titration_concentration_unit=titration_concentration_unit,
+        titration_results=titration_results,
+        titration_channels=titration_channels,
+        titration_vlines=titration_active_vlines,
+        titration_vlines_by_channel=titration_vlines_by_channel,
+        titration_scan_range=titration_scan_range,
+        titration_baseline_mode=titration_baseline_mode,
+        titration_included_step_labels=titration_included_step_labels,
+        remove_extreme_titration_outliers=remove_extreme_titration_outliers,
     )
 
     st.markdown("#### Save experiment output folder")
@@ -4719,6 +7144,24 @@ if view == "Export":
         else:
             st.info("No Langmuir fit summary rows are available for export with the current settings.")
 
+        st.markdown("#### Per-SWV concentration accuracy CSV")
+        if "titration_measurement_accuracy" in export_payload:
+            accuracy_csv = export_payload["titration_measurement_accuracy"].to_csv(
+                index=False
+            ).encode()
+            st.download_button(
+                "Download titration_measurement_accuracy.csv",
+                data=accuracy_csv,
+                file_name=export_file_name(
+                    analysis_mode,
+                    "titration_measurement_accuracy",
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("No per-SWV concentration accuracy rows are available for export.")
+
     st.divider()
 
     drift_export_cfg = build_drift_options(
@@ -4749,13 +7192,15 @@ if view == "Export":
             results=plot_results,
             ok_results_by_channel=plot_ok_results_by_channel,
             channels=plot_channels_display,
-            metric_cfg=metric_cfg,
+            metric_cfg=display_metric_cfg,
             drift_cfg=drift_export_cfg,
             active_vlines=plot_active_vlines,
             scan_range=plot_display_scan_range,
             xlabel=plot_x_axis_label,
             metrics_layout=pdf_metric_layout,
             drift_layout=pdf_drift_layout,
+            remove_extreme_titration_outliers=remove_extreme_titration_outliers,
+            channel_colors=consistent_channel_colors,
         )
         st.download_button(
             "  Download all_plots.pdf",
@@ -4782,42 +7227,136 @@ if view == "Export":
                 zf.writestr(path, buf.getvalue())
                 plt.close(fig)
 
-            for title, (metric, ylabel) in metric_cfg.items():
-                fig = plot_metric_vs_scan(plot_results, metric=metric, channels=plot_channels_display,
-                                          title=title, ylabel=ylabel,
-                                          vlines=plot_active_vlines, scan_range=plot_display_scan_range, xlabel=plot_x_axis_label)
+            for title, (metric, ylabel) in display_metric_cfg.items():
+                offset_export_metric_to_buffer = (
+                    len(combined_plot_channels) > 1
+                    and metric in {"peak_current_selected", "peak_current_raw"}
+                )
+                export_response_directions = (
+                    langmuir_response_directions_by_metric.get(metric)
+                    if metric in {"peak_current_selected", "peak_current_raw"}
+                    else langmuir_response_directions_by_metric.get(
+                        "peak_current_selected"
+                    )
+                )
+                export_metric_results = (
+                    filter_extreme_titration_outliers(
+                        plot_results,
+                        metric=metric,
+                        vlines=combined_plot_active_vlines,
+                        channels=combined_plot_channels,
+                        vlines_by_channel=plot_vlines_by_channel or None,
+                    )
+                    if remove_extreme_titration_outliers and titration_ready
+                    else plot_results
+                )
+                fig = (
+                    plot_metric_vs_scan(
+                        export_metric_results,
+                        metric=metric,
+                        channels=combined_plot_channels,
+                        title=title,
+                        ylabel=(
+                            "Peak Current Change from Buffer (uA)"
+                            if offset_export_metric_to_buffer else ylabel
+                        ),
+                        vlines=combined_plot_active_vlines,
+                        scan_range=plot_display_scan_range,
+                        xlabel=plot_x_axis_label,
+                        response_directions=export_response_directions,
+                        response_baselines=response_baselines_by_metric.get(metric),
+                        offset_to_response_baseline=offset_export_metric_to_buffer,
+                        response_direction_colors_only=(
+                            metric not in {
+                                "peak_current_selected",
+                                "peak_current_raw",
+                            }
+                        ),
+                        channel_colors=consistent_channel_colors,
+                    )
+                    if combined_plot_channels else None
+                )
                 if fig:
                     _save(fig, f"metrics/{metric}.{fig_format}")
 
             if titration_ready:
-                for title, (metric, ylabel) in metric_cfg.items():
-                    fig = plot_titration_plateaus(
-                        results,
-                        metric=metric,
-                        channels=channels_display,
-                        title=f"{title} | plateau fit",
-                        ylabel=ylabel,
-                        vlines=active_vlines,
-                        scan_windows=None,
-                        scan_range=plot_scan_range,
-                        edge_trim_fraction=titration_edge_trim_fraction,
+                for title, (metric, ylabel) in display_metric_cfg.items():
+                    offset_export_plateaus_to_buffer = (
+                        len(combined_titration_channels) > 1
+                        and metric in {
+                            "peak_current_selected",
+                            "peak_current_raw",
+                            "wavelet_energy",
+                        }
+                    )
+                    export_plateau_directions = (
+                        langmuir_response_directions_by_metric.get(metric)
+                        if metric in {"peak_current_selected", "peak_current_raw"}
+                        else langmuir_response_directions_by_metric.get(
+                            "peak_current_selected"
+                        )
+                    )
+                    export_plateau_ylabel = {
+                        "peak_current_selected": "Peak Current Change from Buffer (uA)",
+                        "peak_current_raw": "Peak Current Change from Buffer (uA)",
+                        "wavelet_energy": "Wavelet Energy Change from Buffer (a.u.)",
+                    }.get(metric, ylabel)
+                    fig = (
+                        plot_titration_plateaus(
+                            titration_results,
+                            metric=metric,
+                            channels=combined_titration_channels,
+                            title=f"{title} | plateau fit",
+                            ylabel=(
+                                export_plateau_ylabel
+                                if offset_export_plateaus_to_buffer else ylabel
+                            ),
+                            vlines=combined_titration_active_vlines,
+                            vlines_by_channel=titration_vlines_by_channel,
+                            scan_windows=None,
+                            scan_range=titration_scan_range,
+                            edge_trim_fraction=titration_edge_trim_fraction,
+                            baseline_mode=titration_baseline_mode,
+                            included_step_labels=titration_included_step_labels,
+                            remove_extreme_outliers=remove_extreme_titration_outliers,
+                            response_directions=export_plateau_directions,
+                            response_baselines=response_baselines_by_metric.get(metric),
+                            offset_to_response_baseline=(
+                                offset_export_plateaus_to_buffer
+                            ),
+                            channel_colors=consistent_channel_colors,
+                        )
+                        if combined_titration_channels else None
                     )
                     if fig:
                         _save(fig, f"titration/plateaus/{metric}.{fig_format}")
 
                     if fit_titration_langmuir and supports_langmuir(metric):
-                        fig = plot_titration_langmuir(
-                            results,
-                            metric=metric,
-                            channels=channels_display,
-                            title=f"{title} | Langmuir-style fit",
-                            ylabel=ylabel,
-                            vlines=active_vlines,
-                            scan_windows=None,
-                            scan_range=plot_scan_range,
-                            edge_trim_fraction=titration_edge_trim_fraction,
-                            fit_langmuir=True,
-                            concentration_unit=titration_concentration_unit,
+                        fig = (
+                            plot_titration_langmuir(
+                                titration_results,
+                                metric=metric,
+                                channels=combined_titration_channels,
+                                title=f"{title} | Langmuir-style fit",
+                                ylabel=ylabel,
+                                vlines=combined_titration_active_vlines,
+                                vlines_by_channel=titration_vlines_by_channel,
+                                scan_windows=None,
+                                scan_range=titration_scan_range,
+                                edge_trim_fraction=titration_edge_trim_fraction,
+                                fit_langmuir=True,
+                                concentration_unit=titration_concentration_unit,
+                                baseline_mode=titration_baseline_mode,
+                                included_step_labels=titration_included_step_labels,
+                                remove_extreme_outliers=remove_extreme_titration_outliers,
+                                show_uloq=show_titration_uloq,
+                                show_lod=show_titration_lod,
+                                response_directions=(
+                                    consistent_response_directions
+                                ),
+                                channel_colors=consistent_channel_colors,
+                            )
+                            if combined_titration_channels else None
                         )
                         if fig:
                             _save(fig, f"titration/langmuir/{metric}.{fig_format}")
@@ -4825,7 +7364,8 @@ if view == "Export":
             for title, (dk, ylabel, _caption) in drift_export_cfg.items():
                 fig = plot_drift_vs_scan(plot_results, drift_metric=dk, channels=plot_channels_display,
                                          title=title, ylabel=ylabel,
-                                         vlines=plot_active_vlines, scan_range=plot_display_scan_range, xlabel=plot_x_axis_label)
+                                         vlines=plot_active_vlines, scan_range=plot_display_scan_range, xlabel=plot_x_axis_label,
+                                         channel_colors=consistent_channel_colors)
                 if fig:
                     _save(fig, f"drift/{dk}.{fig_format}")
 

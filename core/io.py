@@ -1,6 +1,7 @@
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,6 +14,24 @@ FILENAME_RE = re.compile(
 )
 CHANNEL_RE = re.compile(r"(?:^|[_\-\s])ch(?:annel)?\s*0*(\d+)(?:\D|$)", re.IGNORECASE)
 SCAN_RE = re.compile(r"(?:^|[_\-\s])meas[_\-\s].*?(\d+)(?:\D|$)", re.IGNORECASE)
+FILENAME_TIME_RE = re.compile(
+    r"(?:^|_)(?P<date>\d{8})_(?P<time>\d{4}(?:\d{2})?)(?:_|\.|$)",
+    re.IGNORECASE,
+)
+
+
+def parse_measurement_time_from_filename(filename: str) -> Optional[datetime]:
+    """Extract a YYYYMMDD_HHMM[SS] measurement time from a filename."""
+    match = FILENAME_TIME_RE.search(os.path.basename(filename))
+    if match is None:
+        return None
+    try:
+        time_format = "%Y%m%d%H%M%S" if len(match.group("time")) == 6 else "%Y%m%d%H%M"
+        return datetime.strptime(
+            f"{match.group('date')}{match.group('time')}", time_format
+        )
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -23,6 +42,7 @@ class MeasurementFile:
     ts: int
     path: str
     folder_index: int
+    measurement_time: Optional[datetime] = None
 
 
 # Backward-compatible alias used across the existing SWV pipeline.
@@ -63,6 +83,7 @@ def collect_measurement_csvs_from_folders(
                 ch = int(channel_match.group(1)) if channel_match else 1
                 scan = int(scan_match.group(1)) if scan_match else 1
                 ts = int(os.stat(os.path.join(root, fn)).st_mtime_ns)
+            measurement_time = parse_measurement_time_from_filename(fn)
             out.append(
                 MeasurementFile(
                     mode=file_mode,
@@ -71,6 +92,7 @@ def collect_measurement_csvs_from_folders(
                     ts=ts,
                     path=os.path.join(root, fn),
                     folder_index=folder_index,
+                    measurement_time=measurement_time,
                 )
             )
     return out

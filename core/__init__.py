@@ -13,13 +13,20 @@ from .analysis import analyze_swv_file, run_batch, compute_drift_fields
 from .cv_analysis import analyze_cv_file, compute_cv_drift_fields, run_cv_batch
 from .plotting import (
     build_titration_langmuir_summary_table,
+    build_titration_measurement_accuracy_table,
     build_titration_step_table,
+    filter_extreme_titration_outliers,
+    infer_titration_response_directions,
+    infer_titration_response_baselines,
     plot_grouped_overlaid_traces,
     plot_overlaid_traces,
     plot_failed_traces,
     plot_metric_vs_scan,
     plot_titration_langmuir,
+    plot_titration_concentration_accuracy,
+    plot_titration_concentration_vs_measurement,
     plot_titration_plateaus,
+    plot_titration_snr,
     plot_drift_vs_scan,
     plot_single_trace,
 )

@@ -1,5 +1,7 @@
 import os
 import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +23,12 @@ from .processing import (
     rotate_offset_using_bracketing_minima,
 )
 
+
+def is_peak_height_below_cutoff_error(error: object) -> bool:
+    """Return whether an error represents an expected minimum-peak rejection."""
+    message = str(error or "").strip().lower()
+    return "peak height" in message and "below cutoff" in message
+
 _NUMBER_TOKEN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 SWV_SETTINGS_RE = re.compile(
     rf"(?P<start>{_NUMBER_TOKEN}m?)[\s,]+"
@@ -37,17 +45,55 @@ def _file_signature(filepath: str) -> Tuple[int, int]:
     return int(stat.st_mtime_ns), int(stat.st_size)
 
 
-def _infer_method_path(csv_path: str) -> str:
+def _method_search_roots(csv_path: str) -> List[str]:
     folder = os.path.dirname(csv_path)
-    stem, _ = os.path.splitext(os.path.basename(csv_path))
-    search_roots = [
+    return [
         os.path.join(folder, "methods_used"),
         os.path.join(folder, "Methods Used"),
         os.path.join(os.path.dirname(folder), "methods_used"),
         os.path.join(os.path.dirname(folder), "Methods Used"),
     ]
+
+
+def _build_method_file_index(files: List[SWVFile]) -> Dict[str, Dict[str, str]]:
+    """Index each possible method directory once for fast batch lookups."""
+    search_roots = {
+        search_root
+        for measurement in files
+        for search_root in _method_search_roots(measurement.path)
+    }
+    indexes: Dict[str, Dict[str, str]] = {}
+    for search_root in search_roots:
+        names: Dict[str, str] = {}
+        try:
+            with os.scandir(search_root) as entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.lower().endswith(".ms"):
+                        names.setdefault(entry.name.lower(), entry.path)
+        except OSError:
+            pass
+        indexes[search_root] = names
+    return indexes
+
+
+def _infer_method_path(
+    csv_path: str,
+    method_file_index: Optional[Dict[str, Dict[str, str]]] = None,
+) -> str:
+    folder = os.path.dirname(csv_path)
+    stem, _ = os.path.splitext(os.path.basename(csv_path))
+    search_roots = _method_search_roots(csv_path)
     wanted_names = {f"{stem}.ms".lower(), f"{stem}.csv.ms".lower()}
     for search_root in search_roots:
+        if method_file_index is not None:
+            indexed_names = method_file_index.get(search_root, {})
+            matching_path = next(
+                (indexed_names[name] for name in wanted_names if name in indexed_names),
+                None,
+            )
+            if matching_path is not None:
+                return matching_path
+            continue
         if not os.path.isdir(search_root):
             continue
         try:
@@ -60,6 +106,19 @@ def _infer_method_path(csv_path: str) -> str:
         )
         if matching_name is not None:
             return os.path.join(search_root, matching_name)
+    return os.path.join(folder, "methods_used", f"{stem}.ms")
+
+
+def _infer_method_path_direct(csv_path: str) -> str:
+    """Resolve one method path without listing a potentially large directory."""
+    folder = os.path.dirname(csv_path)
+    stem, _ = os.path.splitext(os.path.basename(csv_path))
+    candidate_names = (f"{stem}.ms", f"{stem}.csv.ms")
+    for search_root in _method_search_roots(csv_path):
+        for candidate_name in candidate_names:
+            candidate_path = os.path.join(search_root, candidate_name)
+            if os.path.isfile(candidate_path):
+                return candidate_path
     return os.path.join(folder, "methods_used", f"{stem}.ms")
 
 
@@ -202,7 +261,16 @@ def _process_file_cached(
             compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
             use_wavelet_for_correction=use_wavelet_for_correction,
         )
-        return {"status": "FAILED", "result": None, "partial": partial, "error": str(exc)}
+        return {
+            "status": "FAILED",
+            "result": None,
+            "partial": partial,
+            "error": (
+                None
+                if is_peak_height_below_cutoff_error(exc)
+                else str(exc)
+            ),
+        }
 
 
 def _run_correction_pass(
@@ -705,6 +773,87 @@ def _remap_scan_number(
     return scan_number
 
 
+def _validate_swv_work_item(
+    measurement: SWVFile,
+    crop_range: Tuple[float, float],
+    voltage_col: str,
+    current_col: Optional[str],
+    min_start_voltage: float,
+) -> Optional[Tuple[int, int]]:
+    """Return the file signature when a source file is eligible for SWV analysis."""
+    try:
+        file_mtime_ns, file_size = _file_signature(measurement.path)
+        v_check, _ = _load_filtered_arrays_cached(
+            filepath=measurement.path,
+            voltage_col=voltage_col,
+            current_col=current_col,
+            file_mtime_ns=file_mtime_ns,
+            file_size=file_size,
+        )
+    except Exception:
+        return None
+
+    if len(v_check) == 0 or float(v_check[0]) < float(min_start_voltage):
+        return None
+    in_crop = (v_check >= crop_range[0]) & (v_check <= crop_range[1])
+    if in_crop.sum() < 5:
+        return None
+    return file_mtime_ns, file_size
+
+
+def _process_swv_work_item(
+    measurement: SWVFile,
+    method_path: str,
+    crop_range: Tuple[float, float],
+    voltage_col: str,
+    current_col: Optional[str],
+    smooth_window: int,
+    smooth_polyorder: int,
+    minima_search_window_V: float,
+    use_prominent_minima: bool,
+    use_double_correction: bool,
+    min_peak_height_uA: Optional[float],
+    min_start_voltage: float,
+    compute_skew: bool,
+    compute_wavelet_energy: bool,
+    compute_wavelet_denoised_trace: bool,
+    use_wavelet_for_correction: bool,
+    validated_signature: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[dict, dict]]:
+    """Validate and analyze one SWV without assigning its display scan number."""
+    signature = validated_signature or _validate_swv_work_item(
+        measurement=measurement,
+        crop_range=crop_range,
+        voltage_col=voltage_col,
+        current_col=current_col,
+        min_start_voltage=min_start_voltage,
+    )
+    if signature is None:
+        return None
+    file_mtime_ns, file_size = signature
+
+    method_meta = load_swv_method_metadata(method_path)
+    processed = _process_file_cached(
+        filepath=measurement.path,
+        voltage_col=voltage_col,
+        current_col=current_col,
+        file_mtime_ns=file_mtime_ns,
+        file_size=file_size,
+        crop_range=crop_range,
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        minima_search_window_V=minima_search_window_V,
+        use_prominent_minima=use_prominent_minima,
+        use_double_correction=use_double_correction,
+        min_peak_height_uA=min_peak_height_uA,
+        compute_skew=compute_skew,
+        compute_wavelet_energy=compute_wavelet_energy,
+        compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+        use_wavelet_for_correction=use_wavelet_for_correction,
+    )
+    return method_meta, processed
+
+
 def run_batch(
     folders: List[str],
     crop_range: Tuple[float, float] = (-0.5, -0.1),
@@ -719,10 +868,12 @@ def run_batch(
     min_start_voltage: float = -0.6,
     scan_windows: Optional[Tuple[Tuple[int, int], ...]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
+    time_range: Optional[Tuple[datetime, datetime]] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
     compute_wavelet_denoised_trace: bool = False,
     use_wavelet_for_correction: bool = False,
+    parallel_workers: int = 1,
     progress_callback=None,
 ) -> List[dict]:
     files = collect_swv_csvs_from_folders(folders)
@@ -740,59 +891,92 @@ def run_batch(
 
     total = len(ordered)
     scan_counters: Dict[int, int] = {}
+    worker_count = min(total, max(1, int(parallel_workers or 1)))
+    if time_range is not None and (scan_windows or scan_range is not None):
+        raise ValueError("Choose either scan-position windows or a filename-time range, not both.")
+    filter_during_analysis = bool(
+        scan_windows or scan_range is not None or time_range is not None
+    )
+    assigned_scans: Dict[int, Tuple[int, int]] = {}
 
-    for idx, (ch, f) in enumerate(ordered):
-        if progress_callback:
-            progress_callback(idx + 1, total, os.path.basename(f.path))
-
-        try:
-            file_mtime_ns, file_size = _file_signature(f.path)
-            v_check, i_check = _load_filtered_arrays_cached(
-                filepath=f.path,
-                voltage_col=voltage_col,
-                current_col=current_col,
-                file_mtime_ns=file_mtime_ns,
-                file_size=file_size,
+    if filter_during_analysis:
+        source_file_counters: Dict[int, int] = {}
+        selected_time_counters: Dict[int, int] = {}
+        for index, (channel, measurement) in enumerate(ordered):
+            source_scan_number = source_file_counters.get(channel, 0)
+            source_file_counters[channel] = source_scan_number + 1
+            if time_range is not None:
+                measurement_time = measurement.measurement_time
+                if (
+                    measurement_time is None
+                    or measurement_time < time_range[0]
+                    or measurement_time > time_range[1]
+                ):
+                    continue
+                analysis_scan_number = selected_time_counters.get(channel, 0)
+                selected_time_counters[channel] = analysis_scan_number + 1
+                assigned_scans[index] = (
+                    source_scan_number,
+                    analysis_scan_number,
+                )
+                continue
+            if not _scan_in_windows(
+                source_scan_number,
+                scan_windows=scan_windows,
+                scan_range=scan_range,
+            ):
+                continue
+            assigned_scans[index] = (
+                source_scan_number,
+                _remap_scan_number(
+                    source_scan_number,
+                    scan_windows=scan_windows,
+                    scan_range=scan_range,
+                ),
             )
-        except Exception:
-            continue
 
-        if len(v_check) == 0 or float(v_check[0]) < float(min_start_voltage):
-            continue
+    if filter_during_analysis:
+        method_paths = {
+            index: _infer_method_path_direct(ordered[index][1].path)
+            for index in assigned_scans
+        }
+    else:
+        method_file_index = _build_method_file_index(files)
+        method_paths = {
+            index: _infer_method_path(measurement.path, method_file_index)
+            for index, (_, measurement) in enumerate(ordered)
+        }
 
-        # Skip files that have no data points within the crop range (e.g. LSV sweeps
-        # that cover a completely different voltage window than the SWV crop range).
-        in_crop = (v_check >= crop_range[0]) & (v_check <= crop_range[1])
-        if in_crop.sum() < 5:
-            continue
-
-        scan_counters[ch] = scan_counters.get(ch, 0) + 1
-        scan_number = scan_counters[ch]
-
-        # If scan filtering is active, skip analysis+storage for out-of-range scans
-        # only after the counter has been incremented so numbering stays consistent
-        # with the full dataset.
-        if not _scan_in_windows(scan_number, scan_windows=scan_windows, scan_range=scan_range):
-            continue
-
-        analysis_scan_number = _remap_scan_number(
-            scan_number,
-            scan_windows=scan_windows,
-            scan_range=scan_range,
-        )
-
+    def append_processed_result(
+        index: int,
+        channel: int,
+        measurement: SWVFile,
+        outcome: Optional[Tuple[dict, dict]],
+    ) -> None:
+        if outcome is None:
+            return
+        method_meta, processed = outcome
+        if filter_during_analysis:
+            assigned_scan = assigned_scans.get(index)
+            if assigned_scan is None:
+                return
+            scan_number, analysis_scan_number = assigned_scan
+        else:
+            scan_counters[channel] = scan_counters.get(channel, 0) + 1
+            scan_number = scan_counters[channel]
+            analysis_scan_number = scan_number
         common = dict(
-            channel=ch,
-            channel_label=f"Ch{ch}",
-            timestamp=f.ts,
-            scan_id_from_name=f.scan,
+            channel=channel,
+            channel_label=f"Ch{channel}",
+            timestamp=measurement.ts,
+            measurement_time=measurement.measurement_time,
+            scan_id_from_name=measurement.scan,
             original_scan_number=scan_number,
             scan_number=analysis_scan_number,
-            folder_index=f.folder_index,
-            file_path=f.path,
-            file_name=os.path.basename(f.path),
+            folder_index=measurement.folder_index,
+            file_path=measurement.path,
+            file_name=os.path.basename(measurement.path),
         )
-        method_meta = load_swv_method_metadata(_infer_method_path(f.path))
         common.update(
             method_path=method_meta.get("method_path"),
             method_exists=method_meta.get("method_exists"),
@@ -803,26 +987,6 @@ def run_batch(
             swv_step_size_V=method_meta.get("swv_step_size_V"),
             swv_amplitude_V=method_meta.get("swv_amplitude_V"),
         )
-
-        processed = _process_file_cached(
-            filepath=f.path,
-            voltage_col=voltage_col,
-            current_col=current_col,
-            file_mtime_ns=file_mtime_ns,
-            file_size=file_size,
-            crop_range=crop_range,
-            smooth_window=smooth_window,
-            smooth_polyorder=smooth_polyorder,
-            minima_search_window_V=minima_search_window_V,
-            use_prominent_minima=use_prominent_minima,
-            use_double_correction=use_double_correction,
-            min_peak_height_uA=min_peak_height_uA,
-            compute_skew=compute_skew,
-            compute_wavelet_energy=compute_wavelet_energy,
-            compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
-            use_wavelet_for_correction=use_wavelet_for_correction,
-        )
-
         if processed["status"] == "OK":
             r = dict(processed["result"])
             r.update(common)
@@ -864,6 +1028,118 @@ def run_batch(
                     "correction_passes",
                 )},
             })
+
+    def process_index(index: int) -> Optional[Tuple[dict, dict]]:
+        _, measurement = ordered[index]
+        return _process_swv_work_item(
+            measurement=measurement,
+            method_path=method_paths[index],
+            crop_range=crop_range,
+            voltage_col=voltage_col,
+            current_col=current_col,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            minima_search_window_V=minima_search_window_V,
+            use_prominent_minima=use_prominent_minima,
+            use_double_correction=use_double_correction,
+            min_peak_height_uA=min_peak_height_uA,
+            min_start_voltage=min_start_voltage,
+            compute_skew=compute_skew,
+            compute_wavelet_energy=compute_wavelet_energy,
+            compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
+            use_wavelet_for_correction=use_wavelet_for_correction,
+        )
+
+    analysis_indexes = (
+        sorted(assigned_scans)
+        if filter_during_analysis
+        else list(range(total))
+    )
+    analysis_total = len(analysis_indexes)
+
+    if worker_count == 1:
+        for completed, index in enumerate(analysis_indexes, start=1):
+            channel, measurement = ordered[index]
+            append_processed_result(index, channel, measurement, process_index(index))
+            if progress_callback:
+                progress_callback(
+                    completed,
+                    analysis_total,
+                    f"Analyzing {os.path.basename(measurement.path)}",
+                )
+    elif analysis_total:
+        # Limit in-flight tasks so very large batches do not allocate one Future
+        # per file. Completed work is emitted in source order to preserve the
+        # existing per-channel scan numbering exactly.
+        max_pending = max(worker_count, worker_count * 4)
+        pending = {}
+        ready: Dict[int, Optional[Tuple[dict, dict]]] = {}
+        next_submit_position = 0
+        next_emit_position = 0
+        completed = 0
+
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="swv-analysis",
+        ) as executor:
+            while (
+                next_submit_position < analysis_total
+                and len(pending) < max_pending
+            ):
+                index = analysis_indexes[next_submit_position]
+                future = executor.submit(process_index, index)
+                pending[future] = index
+                next_submit_position += 1
+
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    index = pending.pop(future)
+                    ready[index] = future.result()
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(
+                            completed,
+                            analysis_total,
+                            f"Analyzing {os.path.basename(ordered[index][1].path)}",
+                        )
+
+                while (
+                    next_emit_position < analysis_total
+                    and analysis_indexes[next_emit_position] in ready
+                ):
+                    index = analysis_indexes[next_emit_position]
+                    channel, measurement = ordered[index]
+                    append_processed_result(
+                        index,
+                        channel,
+                        measurement,
+                        ready.pop(index),
+                    )
+                    next_emit_position += 1
+
+                while (
+                    next_submit_position < analysis_total
+                    and len(pending) + len(ready) < max_pending
+                ):
+                    index = analysis_indexes[next_submit_position]
+                    future = executor.submit(process_index, index)
+                    pending[future] = index
+                    next_submit_position += 1
+
+        while (
+            next_emit_position < analysis_total
+            and analysis_indexes[next_emit_position] in ready
+        ):
+            index = analysis_indexes[next_emit_position]
+            channel, measurement = ordered[index]
+            append_processed_result(
+                index,
+                channel,
+                measurement,
+                ready.pop(index),
+            )
+            next_emit_position += 1
 
     # Compute drift relative to each channel's first valid scan
     compute_drift_fields(all_results)

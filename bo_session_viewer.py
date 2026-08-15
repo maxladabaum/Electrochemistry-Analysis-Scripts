@@ -6,6 +6,7 @@ import json
 import itertools
 import ast
 import base64
+import copy
 import hashlib
 import html
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -17,6 +18,7 @@ from pathlib import Path, PureWindowsPath
 import queue
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -61,8 +63,9 @@ _plotly_camera_capture = components.declare_component(
 _SHARED_3D_CAMERA_STORAGE_KEY = "bo_viewer_camera:latest_3d_perspective"
 SURROGATE_2D_FIGURE_ASPECT = 6.4 / 4.0
 INTERPOLATION_CACHE_VERSION = "gp_smooth_fixed_length_scales_v2"
+RESCORE_CACHE_VERSION = 7
 
-from core.analysis import analyze_swv_arrays
+from core.analysis import analyze_swv_arrays, is_peak_height_below_cutoff_error
 from core.io import load_swv_csv
 
 
@@ -105,25 +108,48 @@ GROUP_CATEGORICAL_COLORS = (
 NO_HIGHLIGHTED_SLICE_LABEL = "Do not display highlighted slice"
 PAIRED_TREND_METRICS = {
     "Peak height (µA)": ("channel", "mean_peak_current_uA", "median_peak_current_uA"),
-    "Raw SNR": ("channel", "snr_unadjusted", "snr"),
+    "Peak prominence": ("channel", "peak_prominence", "snr_unadjusted"),
+    "Repeat-scan SNR": ("channel", "repeat_scan_snr", None),
+    "Repeat relative STD": ("channel", "repeat_relative_std", None),
     "Peak shape score": ("channel", "peak_shape_score", None),
     "Baseline stability score": ("channel", "baseline_stability_score", None),
     "Replicate consistency score": ("channel", "replicate_consistency_score", None),
     "Success score": ("channel", "success_score", None),
     "Classic Q": ("component", "classic_Q", None),
-    "SNR score": ("component", "snr_score", None),
+    "Prominence score": ("component", "peak_prominence_score", "snr_score"),
 }
 REAL_DATA_METRICS = {
     "Peak height (µA)": ("channel", "mean_peak_current_uA", "median_peak_current_uA"),
-    "Raw SNR": ("channel", "snr_unadjusted", "snr"),
+    "Median peak height (µA)": ("channel", "median_peak_current_uA", "mean_peak_current_uA"),
+    "Peak-height STD (µA)": ("channel", "std_peak_current_uA", None),
+    "Mean background RMS (µA)": ("channel", "mean_background_rms_uA", "background_current_rms"),
+    "Median background RMS (µA)": ("channel", "median_background_rms_uA", "mean_background_rms_uA"),
+    "Background RMS STD (µA)": ("channel", "std_background_rms_uA", None),
+    "Peak prominence": ("channel", "peak_prominence", "snr_unadjusted"),
+    "Repeat-scan SNR": ("channel", "repeat_scan_snr", None),
+    "Repeat relative STD": ("channel", "repeat_relative_std", None),
     "Peak shape score": ("channel", "peak_shape_score", None),
     "Baseline stability score": ("channel", "baseline_stability_score", None),
     "Replicate consistency score": ("channel", "replicate_consistency_score", None),
     "Success score": ("channel", "success_score", None),
+    "Successful scan count": ("channel", "ok_scan_count", None),
+    "Total scan count": ("channel", "total_scan_count", None),
     "Paired Q": ("observation", "Q_run", None),
+    "Target − buffer peak height (µA)": ("paired", "delta_peak_current_uA", None),
+    "Combined buffer + target RMS (µA)": ("paired", "combined_background_rms_uA", None),
+    "Paired peak prominence": ("paired", "peak_prominence_raw", None),
+    "Combined buffer + target peak STD (µA)": (
+        "paired", "combined_peak_std_uA", None,
+    ),
+    "Paired repeat-scan SNR": ("paired", "repeat_scan_snr_raw", None),
     "Classic Q": ("component", "classic_Q", None),
-    "SNR score": ("component", "snr_score", None),
+    "Prominence score": ("component", "normalized_peak_prominence", "snr_score"),
 }
+
+
+def _real_metric_phase_independent(metric_label: str) -> bool:
+    spec = REAL_DATA_METRICS.get(metric_label)
+    return bool(spec and spec[0] in {"observation", "paired"})
 
 
 def _slice_highlight_color(
@@ -725,6 +751,9 @@ def _normalize_simulated_channel_identities(
                 source_component.setdefault("classic_Q", q_run)
                 source_component.setdefault("snr_score", q_run)
                 source_component.setdefault("normalized_SNR", q_run)
+                source_component.setdefault("normalized_peak_prominence", q_run)
+                source_component.setdefault("peak_prominence_raw", q_run)
+                source_component.setdefault("repeat_scan_snr_raw", 0.0)
                 paired_observation = (
                     str(normalized.get("objective") or "").lower()
                     == "paired_response"
@@ -762,6 +791,9 @@ def _normalize_simulated_channel_identities(
                 source_metrics.setdefault("classic_Q", q_run)
                 source_metrics.setdefault("snr", max(0.0, q_run))
                 source_metrics.setdefault("snr_unadjusted", max(0.0, q_run))
+                source_metrics.setdefault("peak_prominence", max(0.0, q_run))
+                source_metrics.setdefault("repeat_scan_snr", 0.0)
+                source_metrics.setdefault("repeat_relative_std", 0.0)
                 source_metrics.setdefault("success_score", q_run)
                 source_metrics.setdefault("mean_peak_current_uA", q_run)
             normalized["channel_metrics"] = {channel_text: source_metrics}
@@ -1359,6 +1391,38 @@ def _real_simulation_run_plot_series(
     return series
 
 
+def _q_summary_observations(
+    observations: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Use paired-response records for run-Q summaries when they are present."""
+    completed = [
+        observation
+        for observation in observations
+        if isinstance(observation, Mapping)
+    ]
+    paired = [
+        observation
+        for observation in completed
+        if str(observation.get("objective") or "").lower() == "paired_response"
+    ]
+    return paired or completed
+
+
+def _best_run_q_observation(
+    observations: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Return the record with the best canonical run-level Q value."""
+    candidates = _q_summary_observations(observations)
+    valid = [
+        observation
+        for observation in candidates
+        if _finite_float(observation.get("Q_run")) is not None
+    ]
+    if not valid:
+        return candidates[0] if candidates else {}
+    return max(valid, key=lambda observation: float(observation["Q_run"]))
+
+
 def _observation_table(session: dict) -> pd.DataFrame:
     def add_best_q_column(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty or "Q_run" not in frame.columns:
@@ -1388,6 +1452,12 @@ def _observation_table(session: dict) -> pd.DataFrame:
                 ["iteration", "_source_order"],
                 kind="mergesort",
             )
+            if "objective" in result.columns:
+                paired_rows = result.loc[ordered.index, "objective"].map(
+                    lambda value: str(value).lower() == "paired_response"
+                )
+                if paired_rows.any():
+                    ordered = ordered.loc[paired_rows]
             best_q.loc[ordered.index] = ordered["q_value"].cummax()
         result["best_Q"] = best_q
         return result
@@ -1395,18 +1465,23 @@ def _observation_table(session: dict) -> pd.DataFrame:
     history = session["history"].copy()
     rows = []
     for obs in session["observations"]:
+        quality = obs.get("quality") or {}
         row = {
             "iteration": obs.get("iteration"),
             "group_id": obs.get("group_id", 1),
             "group_name": obs.get("group_name", "Group 1"),
             "channels": ",".join(str(channel) for channel in obs.get("channels", [])),
-            "Q_run": obs.get("Q_run"),
+            # This top-level value is the canonical BO objective. Some older
+            # paired sessions stored a Classic Q value in quality.Q_run.
+            "Q_run": obs.get("Q_run", quality.get("Q_run")),
             "objective": obs.get("objective"),
             "completed_at": obs.get("completed_at"),
         }
         row.update(obs.get("params") or {})
-        for key, value in (obs.get("quality") or {}).items():
+        for key, value in quality.items():
             if np.isscalar(value) and not isinstance(value, (str, bytes)):
+                if key == "Q_run" and row.get("Q_run") is not None:
+                    continue
                 row[key] = value
         for source_name, prefix in (
             ("channel_metrics", ""),
@@ -1421,7 +1496,9 @@ def _observation_table(session: dict) -> pd.DataFrame:
         for channel, metrics in components.items():
             for key, value in (metrics or {}).items():
                 if np.isscalar(value) and not isinstance(value, (str, bytes)):
-                    row.setdefault(f"ch{channel}_{key}", value)
+                    # Rescored quality components are authoritative for score
+                    # fields; channel_metrics may still contain recorded scores.
+                    row[f"ch{channel}_{key}"] = value
         rows.append(row)
     observation_frame = pd.DataFrame(rows)
     if history.empty:
@@ -1518,7 +1595,18 @@ def _best_q_parameters_by_channel_frame(
         else None
     )
     channel_q_columns: dict[str, str] = {}
-    for preferred_metric in ("Q_channel", "paired_Q_channel", "classic_Q"):
+    paired_history = bool(
+        "objective" in history.columns
+        and history["objective"].map(
+            lambda value: str(value).lower() == "paired_response"
+        ).any()
+    )
+    preferred_metrics = (
+        ("paired_Q_channel", "Q_channel", "classic_Q")
+        if paired_history
+        else ("Q_channel", "classic_Q", "paired_Q_channel")
+    )
+    for preferred_metric in preferred_metrics:
         for column in history.columns:
             q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
             component_match = re.fullmatch(
@@ -1618,7 +1706,12 @@ def _metric_label(metric: str) -> str:
         "step_potential_distance_from_ideal": "Distance from ideal step size",
         "mean_peak_current_uA": "Peak height (µA)",
         "median_peak_current_uA": "Peak height (µA)",
-        "snr_unadjusted": "Raw SNR",
+        "snr_unadjusted": "Peak prominence",
+        "peak_prominence": "Peak prominence",
+        "normalized_peak_prominence": "Prominence score",
+        "repeat_scan_snr": "Repeat-scan SNR",
+        "repeat_scan_snr_raw": "Repeat-scan SNR",
+        "repeat_relative_std": "Repeat relative STD",
         "uA": "µA",
     }
     if metric in replacements:
@@ -2321,6 +2414,66 @@ def _stabilize_dense_plotly_legend(
     return fig
 
 
+def _add_moving_average_traces(
+    fig: go.Figure,
+    window: int | None,
+) -> go.Figure:
+    """Overlay a trailing moving average for each plotted measurement trace."""
+    if window is None or int(window) < 2:
+        return fig
+    window = int(window)
+    source_traces = list(fig.data)
+    fallback_colors = (
+        "#636efa",
+        "#ef553b",
+        "#00cc96",
+        "#ab63fa",
+        "#ffa15a",
+        "#19d3f3",
+        "#ff6692",
+        "#b6e880",
+        "#ff97ff",
+        "#fecb52",
+    )
+    measurement_index = 0
+    for trace in source_traces:
+        if not isinstance(trace, go.Scatter) or "markers" not in str(trace.mode or ""):
+            continue
+        x_values = list(trace.x) if trace.x is not None else []
+        y_values = pd.to_numeric(
+            pd.Series(list(trace.y) if trace.y is not None else []),
+            errors="coerce",
+        )
+        if not x_values or len(x_values) != len(y_values) or y_values.notna().sum() < 2:
+            continue
+        moving_values = y_values.rolling(window=window, min_periods=1).mean()
+        line_color = getattr(trace.line, "color", None)
+        marker_color = getattr(trace.marker, "color", None)
+        if not isinstance(line_color, str):
+            line_color = marker_color if isinstance(marker_color, str) else None
+        if not line_color:
+            line_color = fallback_colors[measurement_index % len(fallback_colors)]
+        measurement_index += 1
+        trace_name = str(trace.name or "Trend")
+        fig.add_trace(go.Scatter(
+            x=x_values,
+            y=moving_values,
+            mode="lines",
+            name=f"{trace_name} — {window}-point moving average",
+            legendgroup=trace.legendgroup,
+            showlegend=trace.showlegend,
+            line={"color": line_color, "dash": "dash", "width": 3},
+            opacity=1.0,
+            xaxis=trace.xaxis,
+            yaxis=trace.yaxis,
+            hovertemplate=(
+                f"{trace_name}<br>Iteration %{{x}}<br>"
+                f"{window}-point moving average: %{{y:.4g}}<extra></extra>"
+            ),
+        ))
+    return fig
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_trend(
     frame: pd.DataFrame,
@@ -2334,6 +2487,7 @@ def _plot_trend(
     reference_label: str | None = None,
     reference_values_by_group: dict[int, float] | None = None,
     trace_opacity: float = 1.0,
+    moving_average_window: int | None = None,
 ):
     if metric not in frame.columns:
         fig = go.Figure()
@@ -2462,6 +2616,7 @@ def _plot_trend(
                     reference_value,
                     reference_label or "Ground-truth optimum",
                 )
+            _add_moving_average_traces(fig, moving_average_window)
             return fig
     if grouped and group_layout == "Average groups together":
         averaged = pd.DataFrame({
@@ -2505,6 +2660,7 @@ def _plot_trend(
                 reference_value,
                 reference_label or "Ground-truth optimum",
             )
+        _add_moving_average_traces(fig, moving_average_window)
         return fig
     if grouped and group_layout == "Plot groups separately":
         grouped_rows = list(frame.loc[valid].groupby("group_id", sort=True))
@@ -2619,6 +2775,7 @@ def _plot_trend(
             None if reference_values_by_group else reference_value,
             reference_label or "Ground-truth optimum",
         )
+        _add_moving_average_traces(fig, moving_average_window)
         return fig
     group_series = (
         frame.loc[valid].groupby("group_id", sort=True)
@@ -2711,6 +2868,7 @@ def _plot_trend(
             reference_value,
             reference_label or "Ground-truth optimum",
         )
+    _add_moving_average_traces(fig, moving_average_window)
     _stabilize_dense_plotly_legend(fig)
     return _apply_plotly_colorbar_height(fig)
 
@@ -3960,6 +4118,7 @@ def _plot_channel_trend(
     reference_values_by_group: dict[int, float] | None = None,
     reference_label: str | None = None,
     trace_opacity: float = 1.0,
+    moving_average_window: int | None = None,
 ):
     iterations = pd.to_numeric(
         frame.get("iteration", pd.Series(range(1, len(frame) + 1))),
@@ -4325,6 +4484,7 @@ def _plot_channel_trend(
     )
     if multiple_groups and not group_color_values:
         fig.update_traces(marker_showscale=False)
+    _add_moving_average_traces(fig, moving_average_window)
     _stabilize_dense_plotly_legend(fig)
     return _apply_plotly_colorbar_height(fig)
 
@@ -4344,6 +4504,23 @@ def _figure_y_bounds(fig: go.Figure) -> tuple[float, float] | None:
 
 def _apply_y_axis_range(fig: go.Figure, y_min: float, y_max: float) -> None:
     fig.update_yaxes(range=[y_min, y_max], autorange=False)
+
+
+def _fit_y_axis_to_figure(fig: go.Figure, padding_fraction: float = 0.05) -> None:
+    """Fit a Plotly figure's y-axis to only the values drawn in that figure."""
+    bounds = _figure_y_bounds(fig)
+    if bounds is None:
+        return
+    y_min, y_max = bounds
+    if np.isclose(y_min, y_max):
+        padding = max(abs(y_min) * padding_fraction, 0.5)
+    else:
+        padding = max((y_max - y_min) * padding_fraction, 1e-12)
+    fig.update_yaxes(
+        matches=None,
+        range=[y_min - padding, y_max + padding],
+        autorange=False,
+    )
 
 
 def _manual_y_axis_range_control(
@@ -4430,12 +4607,31 @@ def _paired_trend_values(observations: list[dict], metric_label: str) -> dict[st
     return result
 
 
+def _paired_trend_differences(series: dict[str, list]) -> tuple[list[int], list[float]]:
+    """Return aligned target-minus-buffer values for one channel's paired series."""
+    iterations: list[int] = []
+    differences: list[float] = []
+    for iteration, buffer_value, target_value in zip(
+        series.get("iteration", []),
+        series.get("buffer", []),
+        series.get("target", []),
+    ):
+        buffer_numeric = pd.to_numeric(buffer_value, errors="coerce")
+        target_numeric = pd.to_numeric(target_value, errors="coerce")
+        if pd.isna(buffer_numeric) or pd.isna(target_numeric):
+            continue
+        iterations.append(int(iteration))
+        differences.append(float(target_numeric) - float(buffer_numeric))
+    return iterations, differences
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_paired_phase_trend(
     series_by_channel: dict[str, dict[str, list]],
     metric_label: str,
     selected_channels: list[str],
     layout: str,
+    plot_difference: bool = False,
 ):
     phase_colors = {"buffer": "#1f77b4", "target": "#ff7f0e"}
     if layout == "Separate plots":
@@ -4471,6 +4667,26 @@ def _plot_paired_phase_trend(
                     row=row + 1,
                     col=column + 1,
                 )
+            if plot_difference:
+                iterations, differences = _paired_trend_differences(series)
+                fig.add_trace(
+                    go.Scatter(
+                        x=iterations,
+                        y=differences,
+                        mode="lines+markers",
+                        name="Target − buffer",
+                        legendgroup="difference",
+                        showlegend=index == 0,
+                        line={"color": "#9467bd", "dash": "dash"},
+                        customdata=iterations,
+                        hovertemplate=(
+                            f"Iteration %{{x}}<br>Target − buffer {metric_label}: "
+                            "%{y:.4g}<extra></extra>"
+                        ),
+                    ),
+                    row=row + 1,
+                    col=column + 1,
+                )
             fig.update_xaxes(title_text="BO iteration", row=row + 1, col=column + 1)
             fig.update_yaxes(
                 title_text=metric_label,
@@ -4492,25 +4708,45 @@ def _plot_paired_phase_trend(
             for channel in selected_channels
             for iteration in series_by_channel[channel]["iteration"]
         })
-        for phase in ("buffer", "target"):
+        value_series = (
+            ("buffer", "target", "difference")
+            if plot_difference else ("buffer", "target")
+        )
+        for phase in value_series:
             values = []
             for iteration in all_iterations:
                 iteration_values = []
                 for channel in selected_channels:
                     series = series_by_channel[channel]
-                    for idx, recorded_iteration in enumerate(series["iteration"]):
-                        if recorded_iteration == iteration and pd.notna(series[phase][idx]):
-                            iteration_values.append(float(series[phase][idx]))
+                    if phase == "difference":
+                        paired_iterations, paired_differences = (
+                            _paired_trend_differences(series)
+                        )
+                        iteration_values.extend(
+                            difference
+                            for recorded_iteration, difference in zip(
+                                paired_iterations, paired_differences
+                            )
+                            if recorded_iteration == iteration
+                        )
+                    else:
+                        for idx, recorded_iteration in enumerate(series["iteration"]):
+                            if recorded_iteration == iteration and pd.notna(series[phase][idx]):
+                                iteration_values.append(float(series[phase][idx]))
                 values.append(float(np.mean(iteration_values)) if iteration_values else None)
+            phase_name = "Target − buffer" if phase == "difference" else phase.title()
             fig.add_trace(go.Scatter(
                 x=all_iterations,
                 y=values,
                 mode="lines+markers",
-                name=phase.title(),
-                line={"color": phase_colors[phase]},
+                name=phase_name,
+                line=(
+                    {"color": "#9467bd", "dash": "dash"}
+                    if phase == "difference" else {"color": phase_colors[phase]}
+                ),
                 customdata=all_iterations,
                 hovertemplate=(
-                    f"Iteration %{{x}}<br>Average {phase} {metric_label}: "
+                    f"Iteration %{{x}}<br>Average {phase_name} {metric_label}: "
                     "%{y:.4g}<extra></extra>"
                 ),
             ))
@@ -4519,21 +4755,46 @@ def _plot_paired_phase_trend(
         use_generic_phase_legend = len(selected_channels) > 4
         for channel_index, channel in enumerate(selected_channels):
             series = series_by_channel[channel]
-            for phase in ("buffer", "target"):
-                values = pd.to_numeric(pd.Series(series[phase]), errors="coerce")
-                iterations = pd.Series(series["iteration"])
+            value_series = (
+                ("buffer", "target", "difference")
+                if plot_difference else ("buffer", "target")
+            )
+            for phase in value_series:
+                if phase == "difference":
+                    difference_iterations, difference_values = (
+                        _paired_trend_differences(series)
+                    )
+                    iterations = pd.Series(difference_iterations)
+                    values = pd.Series(difference_values)
+                else:
+                    values = pd.to_numeric(pd.Series(series[phase]), errors="coerce")
+                    iterations = pd.Series(series["iteration"])
                 valid = values.notna()
+                phase_name = "Target − buffer" if phase == "difference" else phase
                 fig.add_trace(go.Scatter(
                     x=iterations[valid],
                     y=values[valid],
                     mode="lines+markers",
-                    name=phase.title() if use_generic_phase_legend else f"Ch {channel} {phase}",
-                    legendgroup=phase,
-                    showlegend=not use_generic_phase_legend or channel_index == 0,
-                    line={"color": phase_colors[phase]},
+                    name=(
+                        f"Ch {channel} target − buffer"
+                        if phase == "difference"
+                        else phase.title() if use_generic_phase_legend else f"Ch {channel} {phase}"
+                    ),
+                    legendgroup=(
+                        f"difference_{channel}" if phase == "difference" else phase
+                    ),
+                    showlegend=(
+                        True
+                        if phase == "difference"
+                        else not use_generic_phase_legend or channel_index == 0
+                    ),
+                    line=(
+                        {"dash": "dash"}
+                        if phase == "difference" else {"color": phase_colors[phase]}
+                    ),
                     customdata=iterations[valid],
                     hovertemplate=(
-                        f"Iteration %{{x}}<br>Ch {channel} {phase} {metric_label}: "
+                        f"Iteration %{{x}}<br>Ch {channel} {phase_name} {metric_label}: "
                         "%{y:.4g}<extra></extra>"
                     ),
                 ))
@@ -4887,6 +5148,103 @@ def _real_data_channels(observations: list[dict]) -> list[str]:
     return sorted(channels, key=_channel_sort_key)
 
 
+def _paired_pairwise_repeat_snr(
+    buffer_metrics: Mapping[str, Any],
+    target_metrics: Mapping[str, Any],
+) -> tuple[float, float] | None:
+    """Calculate target-minus-buffer SNR from every replicate pairing."""
+    buffer_raw = buffer_metrics.get("peak_currents_uA")
+    target_raw = target_metrics.get("peak_currents_uA")
+    has_raw_replicates = isinstance(
+        buffer_raw, (list, tuple, np.ndarray)
+    ) and isinstance(target_raw, (list, tuple, np.ndarray))
+    if has_raw_replicates:
+        buffer_values = [
+            value
+            for raw_value in buffer_raw
+            if (value := _finite_float(raw_value)) is not None
+        ]
+        target_values = [
+            value
+            for raw_value in target_raw
+            if (value := _finite_float(raw_value)) is not None
+        ]
+        if not buffer_values or not target_values:
+            return None
+        pairwise_differences = np.asarray(
+            [
+                target_value - buffer_value
+                for buffer_value in buffer_values
+                for target_value in target_values
+            ],
+            dtype=float,
+        )
+        if pairwise_differences.size < 2:
+            return 0.0, 0.0
+        pairwise_std = float(np.std(pairwise_differences, ddof=1))
+        mean_difference = float(np.mean(target_values) - np.mean(buffer_values))
+    else:
+        buffer_count = _finite_float(buffer_metrics.get("ok_scan_count"))
+        target_count = _finite_float(target_metrics.get("ok_scan_count"))
+        buffer_std = _finite_float(buffer_metrics.get("std_peak_current_uA"))
+        target_std = _finite_float(target_metrics.get("std_peak_current_uA"))
+        buffer_mean = _finite_float(buffer_metrics.get("mean_peak_current_uA"))
+        target_mean = _finite_float(target_metrics.get("mean_peak_current_uA"))
+        if None in (
+            buffer_count,
+            target_count,
+            buffer_std,
+            target_std,
+            buffer_mean,
+            target_mean,
+        ):
+            return None
+        buffer_count = int(buffer_count)
+        target_count = int(target_count)
+        pair_count = buffer_count * target_count
+        if buffer_count < 1 or target_count < 1 or pair_count < 2:
+            return 0.0, 0.0
+        pairwise_sum_squares = (
+            target_count * max(0, buffer_count - 1) * buffer_std ** 2
+            + buffer_count * max(0, target_count - 1) * target_std ** 2
+        )
+        pairwise_std = float(
+            np.sqrt(pairwise_sum_squares / (pair_count - 1))
+        )
+        mean_difference = float(target_mean - buffer_mean)
+    if not np.isfinite(pairwise_std) or pairwise_std <= 1e-12:
+        return 0.0, 0.0
+    return mean_difference / pairwise_std, pairwise_std
+
+
+def _saved_pairwise_peak_differences(
+    buffer_metrics: Mapping[str, Any],
+    target_metrics: Mapping[str, Any],
+) -> list[float]:
+    """Return every saved target-minus-buffer replicate pairing."""
+    buffer_raw = buffer_metrics.get("peak_currents_uA")
+    target_raw = target_metrics.get("peak_currents_uA")
+    if not isinstance(buffer_raw, (list, tuple, np.ndarray, pd.Series)) or not isinstance(
+        target_raw, (list, tuple, np.ndarray, pd.Series)
+    ):
+        return []
+    buffer_values = [
+        value
+        for raw_value in buffer_raw
+        if (value := _finite_float(raw_value)) is not None
+    ]
+    target_values = [
+        value
+        for raw_value in target_raw
+        if (value := _finite_float(raw_value)) is not None
+    ]
+    return [
+        float(target_value - buffer_value)
+        for buffer_value in buffer_values
+        for target_value in target_values
+    ]
+
+
 def _real_metric_points(
     observations: list[dict],
     metric_label: str,
@@ -4896,6 +5254,17 @@ def _real_metric_points(
 ) -> pd.DataFrame:
     source, primary_key, fallback_key = REAL_DATA_METRICS[metric_label]
     rows = []
+
+    def mapping_for_channel(mapping: dict, channel: Any) -> dict:
+        return mapping.get(str(channel), {}) or mapping.get(channel, {}) or {}
+
+    def finite_metric(mapping: dict, *keys: str) -> float | None:
+        for key in keys:
+            value = _finite_float(mapping.get(key))
+            if value is not None:
+                return value
+        return None
+
     for observation in observations:
         params = observation.get("params") or {}
         observation_metadata = {
@@ -4913,29 +5282,111 @@ def _real_metric_points(
             observation_metadata["exploration"] = observation.get("simulation_exploration")
         if "run_label" not in observation_metadata and observation.get("simulation_run_label") is not None:
             observation_metadata["run_label"] = observation.get("simulation_run_label")
-        if source == "observation":
+        if source in {"observation", "paired"}:
             per_iteration = []
             quality = observation.get("quality") or {}
             q_channels = quality.get("Q_channels") or {}
             components = quality.get("channel_components") or {}
             for channel in selected_channels:
-                component = components.get(str(channel), {}) or components.get(channel, {}) or {}
-                value = (
-                    q_channels.get(str(channel))
-                    if isinstance(q_channels, dict)
-                    else None
-                )
-                if value is None and isinstance(q_channels, dict):
-                    value = q_channels.get(channel)
-                if value is None:
-                    value = component.get("Q_channel")
-                if value is None:
-                    value = component.get("paired_Q_channel")
-                if value is None:
-                    value = component.get("paired_Q")
-                try:
-                    numeric_value = float(value)
-                except (TypeError, ValueError):
+                component = mapping_for_channel(components, channel)
+                if source == "observation":
+                    value = (
+                        q_channels.get(str(channel))
+                        if isinstance(q_channels, dict)
+                        else None
+                    )
+                    if value is None and isinstance(q_channels, dict):
+                        value = q_channels.get(channel)
+                    if value is None:
+                        value = component.get("Q_channel")
+                    if value is None:
+                        value = component.get("paired_Q_channel")
+                    if value is None:
+                        value = component.get("paired_Q")
+                    numeric_value = _finite_float(value)
+                else:
+                    buffer_metrics = mapping_for_channel(
+                        observation.get("buffer_channel_metrics") or {},
+                        channel,
+                    )
+                    target_metrics = mapping_for_channel(
+                        observation.get("target_channel_metrics") or {},
+                        channel,
+                    )
+                    buffer_peak = finite_metric(
+                        buffer_metrics,
+                        "mean_peak_current_uA",
+                        "median_peak_current_uA",
+                    )
+                    target_peak = finite_metric(
+                        target_metrics,
+                        "mean_peak_current_uA",
+                        "median_peak_current_uA",
+                    )
+                    buffer_rms = finite_metric(
+                        buffer_metrics,
+                        "mean_background_rms_uA",
+                        "median_background_rms_uA",
+                        "background_current_rms",
+                    )
+                    target_rms = finite_metric(
+                        target_metrics,
+                        "mean_background_rms_uA",
+                        "median_background_rms_uA",
+                        "background_current_rms",
+                    )
+                    buffer_std = finite_metric(buffer_metrics, "std_peak_current_uA")
+                    target_std = finite_metric(target_metrics, "std_peak_current_uA")
+                    delta_peak = (
+                        target_peak - buffer_peak
+                        if target_peak is not None and buffer_peak is not None
+                        else None
+                    )
+                    combined_rms = (
+                        buffer_rms + target_rms
+                        if buffer_rms is not None and target_rms is not None
+                        else None
+                    )
+                    combined_std = (
+                        buffer_std + target_std
+                        if buffer_std is not None and target_std is not None
+                        else None
+                    )
+                    derived_values = {
+                        "delta_peak_current_uA": delta_peak,
+                        "combined_background_rms_uA": combined_rms,
+                        "peak_prominence_raw": finite_metric(
+                            component,
+                            "peak_prominence_raw",
+                            "paired_peak_prominence",
+                        ),
+                        "combined_peak_std_uA": combined_std,
+                        "repeat_scan_snr_raw": finite_metric(
+                            component,
+                            "repeat_scan_snr_raw",
+                            "paired_repeat_scan_snr",
+                        ),
+                    }
+                    if (
+                        derived_values["peak_prominence_raw"] is None
+                        and delta_peak is not None
+                        and combined_rms is not None
+                    ):
+                        derived_values["peak_prominence_raw"] = (
+                            delta_peak / max(combined_rms, 1e-12)
+                        )
+                    if (
+                        derived_values["repeat_scan_snr_raw"] is None
+                        and delta_peak is not None
+                        and combined_std is not None
+                    ):
+                        derived_values["repeat_scan_snr_raw"] = (
+                            delta_peak / combined_std
+                            if combined_std > 1e-12
+                            else 0.0
+                        )
+                    numeric_value = _finite_float(derived_values.get(primary_key))
+                if numeric_value is None:
                     continue
                 row = {
                     "iteration": int(observation.get("iteration", 0)),
@@ -4945,7 +5396,7 @@ def _real_metric_points(
                         observation.get("group_name")
                         or f"Group {observation.get('group_id', 1)}"
                     ),
-                    "value": numeric_value,
+                    "value": float(numeric_value),
                 }
                 row.update({
                     name: float(params[name])
@@ -4963,7 +5414,7 @@ def _real_metric_points(
                 rows.append(averaged)
             elif per_iteration:
                 rows.extend(per_iteration)
-            else:
+            elif source == "observation":
                 try:
                     numeric_value = float(observation.get(primary_key))
                 except (TypeError, ValueError):
@@ -4995,18 +5446,24 @@ def _real_metric_points(
         components = (observation.get("quality") or {}).get("channel_components") or {}
         for channel in selected_channels:
             if source == "channel":
-                metrics = phase_metrics.get(channel, {}) or {}
+                metrics = mapping_for_channel(phase_metrics, channel)
                 value = metrics.get(primary_key)
                 if value is None and fallback_key:
                     value = metrics.get(fallback_key)
             else:
-                component = components.get(channel, {}) or {}
+                component = mapping_for_channel(components, channel)
                 if phase == "measurement" and primary_key == "classic_Q":
                     value = component.get("Q_channel")
-                elif phase == "measurement" and primary_key == "snr_score":
-                    value = component.get("normalized_SNR")
+                elif phase == "measurement":
+                    value = component.get(primary_key)
+                    if value is None and primary_key == "normalized_peak_prominence":
+                        value = component.get("normalized_SNR")
+                    if value is None and fallback_key:
+                        value = component.get(fallback_key)
                 else:
                     value = component.get(f"{phase}_{primary_key}")
+                    if value is None and fallback_key:
+                        value = component.get(f"{phase}_{fallback_key}")
             try:
                 numeric_value = float(value)
             except (TypeError, ValueError):
@@ -10709,7 +11166,8 @@ def _plot_interpolated_simulated_trace(
                     "iteration": int(observation.get("iteration", 0)),
                 })
             except Exception as exc:
-                errors.append(f"{item['path'].name}: {exc}")
+                if not is_peak_height_below_cutoff_error(exc):
+                    errors.append(f"{item['path'].name}: {exc}")
     fig, ax = plt.subplots(figsize=(8, 4))
     if not trace_rows:
         ax.text(.5, .5, "No nearby real SWV traces matched the selected channels.", ha="center", va="center")
@@ -10843,7 +11301,8 @@ def _trace_realistic_channel_measurements(
                     "source_iteration": int(observation.get("iteration", 0)),
                 })
             except Exception as exc:
-                errors.append(f"{item['path'].name}: {exc}")
+                if not is_peak_height_below_cutoff_error(exc):
+                    errors.append(f"{item['path'].name}: {exc}")
     channel_measurements: dict[str, dict] = {}
     for channel, group in itertools.groupby(
         sorted(trace_rows, key=lambda row: _channel_sort_key(row["channel"])),
@@ -10912,6 +11371,9 @@ def _trace_realistic_channel_measurements(
                 "Q_channel": classic_q,
                 "snr": float(snr) if np.isfinite(snr) else np.nan,
                 "snr_unadjusted": float(snr) if np.isfinite(snr) else np.nan,
+                "peak_prominence": float(snr) if np.isfinite(snr) else np.nan,
+                "repeat_scan_snr": 0.0,
+                "repeat_relative_std": 0.0,
                 "mean_peak_current_uA": peak,
                 "background_current_rms": noise,
                 "peak_shape_score": max(0.0, 1.0 - abs(float(analyzed.get("peak_offset_norm", 0.0) or 0.0))),
@@ -10921,7 +11383,8 @@ def _trace_realistic_channel_measurements(
                 "source_iterations": sorted(set(source_iterations)),
             }
         except Exception as exc:
-            errors.append(f"Ch {channel}: {exc}")
+            if not is_peak_height_below_cutoff_error(exc):
+                errors.append(f"Ch {channel}: {exc}")
     return channel_measurements, errors
 
 
@@ -11028,6 +11491,15 @@ def _write_simulated_trace_record(
         "snr": trace_snr,
         "snr_unadjusted": float(
             trace_measurement.get("snr_unadjusted", trace_snr)
+        ),
+        "peak_prominence": float(
+            trace_measurement.get("peak_prominence", trace_snr)
+        ),
+        "repeat_scan_snr": float(
+            trace_measurement.get("repeat_scan_snr", 0.0)
+        ),
+        "repeat_relative_std": float(
+            trace_measurement.get("repeat_relative_std", 0.0)
         ),
         "mean_peak_current_uA": float(
             trace_measurement.get(
@@ -11369,12 +11841,20 @@ def _simulation_channel_quality_fields(
         "classic_Q": classic_q,
         "snr_score": classic_q,
         "normalized_SNR": classic_q,
+        "normalized_peak_prominence": classic_q,
+        "peak_prominence_raw": snr_value,
+        "repeat_scan_snr_raw": _finite_float(
+            trace_measurement.get("repeat_scan_snr")
+        ) or 0.0,
     }
     channel_metrics = {
         "Q_channel": q_run,
         "classic_Q": classic_q,
         "snr": snr_value,
         "snr_unadjusted": snr_value,
+        "peak_prominence": trace_measurement.get("peak_prominence", snr_value),
+        "repeat_scan_snr": trace_measurement.get("repeat_scan_snr", 0.0),
+        "repeat_relative_std": trace_measurement.get("repeat_relative_std", 0.0),
         "success_score": trace_measurement.get("success_score", q_run),
         "mean_peak_current_uA": trace_measurement.get("mean_peak_current_uA", classic_q),
         "peak_shape_score": trace_measurement.get("peak_shape_score", q_run),
@@ -11397,12 +11877,17 @@ def _simulation_channel_quality_fields(
         "target_classic_Q": classic_q,
         "buffer_snr_score": classic_q,
         "target_snr_score": classic_q,
+        "buffer_peak_prominence_score": classic_q,
+        "target_peak_prominence_score": classic_q,
     })
     paired_phase_metrics = {
         "Q_channel": classic_q,
         "classic_Q": classic_q,
         "snr": snr_value,
         "snr_unadjusted": snr_value,
+        "peak_prominence": channel_metrics["peak_prominence"],
+        "repeat_scan_snr": channel_metrics["repeat_scan_snr"],
+        "repeat_relative_std": channel_metrics["repeat_relative_std"],
         "success_score": channel_metrics["success_score"],
         "mean_peak_current_uA": channel_metrics["mean_peak_current_uA"],
         "peak_shape_score": channel_metrics["peak_shape_score"],
@@ -13909,9 +14394,15 @@ def _pdf_real_data_3d_tensors(
     status_callback=None,
 ) -> None:
     del config
-    phases = ("buffer", "target") if paired else ("measurement",)
-    for phase in phases:
-        for metric in REAL_DATA_METRICS:
+    for metric in REAL_DATA_METRICS:
+        phases = (
+            ("measurement",)
+            if _real_metric_phase_independent(metric)
+            else ("buffer", "target")
+            if paired
+            else ("measurement",)
+        )
+        for phase in phases:
             points = _real_metric_points(
                 observations,
                 metric,
@@ -14184,8 +14675,7 @@ def build_bo_session_pdf(
     classic_equation = _classic_q_equation(config)
     objective_equation = _paired_q_equation(config) if paired else classic_equation
     objective_equation_label = "Paired Q equation" if paired else "Classic Q equation"
-    q_values = [float(obs.get("Q_run", np.nan)) for obs in observations]
-    best = observations[int(np.nanargmax(q_values))]
+    best = _best_run_q_observation(observations)
     if progress_callback is not None:
         progress_callback(0.025, "Indexing real-data channels...")
     channels = _real_data_channels(observations)
@@ -14380,8 +14870,17 @@ def _channel_table(observation: dict) -> pd.DataFrame:
             "Channel": channel,
             "Q": (quality.get("Q_channels") or {}).get(channel, component.get("Q_channel")),
             "Peak uA": metric.get("mean_peak_current_uA", metric.get("median_peak_current_uA")),
-            "Raw SNR": metric.get("snr_unadjusted", metric.get("snr")),
-            "SNR Score": component.get("snr_score", component.get("target_snr_score")),
+            "Peak Prominence": metric.get(
+                "peak_prominence", metric.get("snr_unadjusted", metric.get("snr"))
+            ),
+            "Repeat-scan SNR": metric.get("repeat_scan_snr"),
+            "Repeat Relative STD": metric.get("repeat_relative_std"),
+            "Prominence Score": component.get(
+                "normalized_peak_prominence",
+                component.get(
+                    "snr_score", component.get("target_peak_prominence_score")
+                ),
+            ),
             "Shape": metric.get("peak_shape_score"),
             "Baseline": metric.get("baseline_stability_score"),
             "Replicate": metric.get("replicate_consistency_score"),
@@ -14545,32 +15044,64 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
             source_rank=10,
         )
 
-    deduped: dict[tuple[str, str], dict] = {}
-    for item in paths:
-        key = (str(item["phase"]).lower(), str(item["channel"]))
-        existing = deduped.get(key)
-        if existing is None:
-            deduped[key] = item
-            continue
-        item_rank = int(item.get("source_rank", 0))
-        existing_rank = int(existing.get("source_rank", 0))
-        if item_rank > existing_rank:
-            deduped[key] = item
-            continue
-        if item_rank == existing_rank:
-            try:
-                if item["path"].stat().st_mtime_ns > existing["path"].stat().st_mtime_ns:
-                    deduped[key] = item
-            except OSError:
-                pass
+    # ``add`` already merges repeated references to the same physical file.
+    # Do not additionally deduplicate by phase/channel: one analysis record can
+    # legitimately contain several replicate SWVs for a channel, and collapsing
+    # that key silently discarded every replicate except one.
     cleaned = []
-    for item in deduped.values():
+    for item in paths:
         cleaned.append({
             "phase": item["phase"],
             "path": item["path"],
             "channel": item["channel"],
         })
     return cleaned
+
+
+def _pair_buffer_target_traces(traces: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Pair same-channel buffer/target replicates without dropping extras."""
+    grouped: dict[str, dict[str, list[dict]]] = {}
+    for trace in traces:
+        phase = str(trace.get("phase", "")).lower()
+        if phase not in {"buffer", "target"}:
+            continue
+        channel = _trace_channel_key(trace)
+        grouped.setdefault(channel, {"buffer": [], "target": []})[phase].append(trace)
+
+    paired: list[tuple[str, list[dict]]] = []
+    for channel in sorted(grouped, key=_channel_sort_key):
+        phases = grouped[channel]
+        for buffer_trace, target_trace in itertools.zip_longest(
+            phases["buffer"],
+            phases["target"],
+        ):
+            pair = [
+                trace
+                for trace in (buffer_trace, target_trace)
+                if trace is not None
+            ]
+            if pair:
+                paired.append((channel, pair))
+    return paired
+
+
+def _trace_entries_by_iteration(
+    trace_entries: list[tuple[dict, dict]],
+) -> list[tuple[int, int, dict, list[dict]]]:
+    """Group trace entries by channel-group and BO iteration in display order."""
+    grouped: dict[tuple[int, int], tuple[dict, list[dict]]] = {}
+    for observation, trace in trace_entries:
+        key = (
+            int(observation.get("group_id", 1)),
+            int(observation.get("iteration", 0)),
+        )
+        if key not in grouped:
+            grouped[key] = (observation, [])
+        grouped[key][1].append(trace)
+    return [
+        (group_id, iteration, observation, traces)
+        for (group_id, iteration), (observation, traces) in sorted(grouped.items())
+    ]
 
 
 def _channel_sort_key(channel: str):
@@ -14899,6 +15430,681 @@ def _compact_trace_stem(path: Path, *, max_chars: int = 42) -> str:
     return stem[: max_chars - 3].rstrip("_-. ") + "..."
 
 
+def _format_q_score(value: Any) -> str:
+    numeric = _finite_float(value)
+    return f"{numeric:.4g}" if numeric is not None else "unknown"
+
+
+def _format_saved_numeric_values(values: Any) -> str:
+    if not isinstance(values, (list, tuple, np.ndarray, pd.Series)):
+        return "not saved"
+    numeric_values = [
+        numeric
+        for value in values
+        if (numeric := _finite_float(value)) is not None
+    ]
+    if not numeric_values:
+        return "not saved"
+    return "[" + ", ".join(f"{value:.4g}" for value in numeric_values) + "]"
+
+
+def _mapping_channel_value(mapping: Mapping[str, Any], channel: str) -> dict:
+    value = mapping.get(channel)
+    if value is None and str(channel).isdigit():
+        value = mapping.get(int(channel))
+    return dict(value or {})
+
+
+def _metric_value(metrics: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if metrics.get(key) is not None:
+            return metrics.get(key)
+    return None
+
+
+def _phase_q_input_lines(
+    phase_label: str,
+    metrics: Mapping[str, Any],
+    classic_components: Mapping[str, Any],
+    classic_q: Any,
+) -> list[str]:
+    peak_values = metrics.get("peak_currents_uA")
+    return [
+        (
+            f"  {phase_label} peaks µA used for STD: "
+            f"{_format_saved_numeric_values(peak_values)}"
+        ),
+        (
+            f"  {phase_label} peak mean={_format_q_score(_metric_value(metrics, 'mean_peak_current_uA', 'median_peak_current_uA'))}"
+            f"  STD={_format_q_score(metrics.get('std_peak_current_uA'))}"
+            f"  RMS={_format_q_score(_metric_value(metrics, 'mean_background_rms_uA', 'median_background_rms_uA', 'background_current_rms'))}"
+        ),
+        (
+            f"  {phase_label} prominence={_format_q_score(_metric_value(metrics, 'peak_prominence', 'snr_unadjusted', 'snr'))}"
+            f"  repeat SNR={_format_q_score(metrics.get('repeat_scan_snr'))}"
+            f"  repeat rel STD={_format_q_score(metrics.get('repeat_relative_std'))}"
+        ),
+        (
+            f"  {phase_label} shape={_format_q_score(metrics.get('peak_shape_score'))}"
+            f"  baseline={_format_q_score(metrics.get('baseline_stability_score'))}"
+            f"  replicate={_format_q_score(metrics.get('replicate_consistency_score'))}"
+            f"  success={_format_q_score(metrics.get('success_score'))}"
+            f"  Classic Q={_format_q_score(classic_q)}"
+        ),
+        (
+            f"  {phase_label} Classic contributions: prominence="
+            f"{_format_q_score(classic_components.get('peak_prominence_contribution'))}"
+            f"  repeat SNR={_format_q_score(classic_components.get('repeat_scan_snr_contribution'))}"
+            f"  peak={_format_q_score(classic_components.get('peak_height_contribution'))}"
+            f"  shape={_format_q_score(classic_components.get('peak_shape_contribution'))}"
+            f"  baseline={_format_q_score(classic_components.get('baseline_contribution'))}"
+            f"  replicate={_format_q_score(classic_components.get('replicate_consistency_contribution'))}"
+            f"  success={_format_q_score(classic_components.get('success_contribution'))}"
+            f"  noise penalty={_format_q_score(classic_components.get('noise_penalty_magnitude'))}"
+        ),
+    ]
+
+
+def _nonzero_scoring_weight(value: Any) -> bool:
+    numeric = _finite_float(value)
+    return numeric is not None and not np.isclose(numeric, 0.0)
+
+
+def _classic_active_input_lines(
+    phase_label: str,
+    metrics: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    derived: Mapping[str, Any],
+) -> list[str]:
+    mode = str(scoring.get("mode", "classic") or "classic").strip().lower()
+    weights = dict(scoring.get("channel_weights") or {})
+    defaults = (
+        {
+            "peak_prominence": .45,
+            "repeat_scan_snr": 0.0,
+            "peak_height": .35,
+            "peak_shape": .05,
+            "baseline": .12,
+            "replicate_consistency": .03,
+            "success": 0.0,
+        }
+        if mode == "signal_priority_unbounded"
+        else {
+            "peak_prominence": .35,
+            "repeat_scan_snr": 0.0,
+            "peak_height": 0.0,
+            "peak_shape": .20,
+            "baseline": .20,
+            "replicate_consistency": .15,
+            "success": .10,
+        }
+    )
+    if "peak_prominence" not in weights and "snr" in weights:
+        weights["peak_prominence"] = weights["snr"]
+    values = {
+        "peak_prominence": derived.get("peak_prominence_raw"),
+        "repeat_scan_snr": derived.get("repeat_scan_snr_raw"),
+        "peak_height": derived.get("peak_height_raw"),
+        "peak_shape": derived.get("peak_shape_score"),
+        "baseline": derived.get("baseline_stability_score"),
+        "replicate_consistency": derived.get("replicate_consistency_score"),
+        "success": derived.get("success_score"),
+    }
+    labels = {
+        "peak_prominence": "peak prominence",
+        "repeat_scan_snr": "repeat-scan SNR",
+        "peak_height": "peak height µA",
+        "peak_shape": "peak shape",
+        "baseline": "baseline stability",
+        "replicate_consistency": "replicate consistency",
+        "success": "scan success",
+    }
+    lines = []
+    for name, default in defaults.items():
+        weight = _finite_float(weights.get(name, default))
+        if weight is None or np.isclose(weight, 0.0):
+            continue
+        if name == "repeat_scan_snr":
+            lines.append(
+                f"    {phase_label} peak replicates µA="
+                f"{_format_saved_numeric_values(metrics.get('peak_currents_uA'))}; "
+                f"mean={_format_q_score(derived.get('peak_height_raw'))}; "
+                f"sample STD={_format_q_score(metrics.get('std_peak_current_uA'))}"
+            )
+        if name == "peak_prominence":
+            lines.append(
+                f"    {phase_label} prominence inputs: peak mean="
+                f"{_format_q_score(derived.get('peak_height_raw'))} µA; RMS noise="
+                f"{_format_q_score(derived.get('noise_raw'))} µA"
+            )
+        lines.append(
+            f"    {phase_label} {labels[name]}={_format_q_score(values[name])}; "
+            f"weight={weight:g}; Classic-Q contribution="
+            f"{_format_q_score(derived.get(f'{name}_contribution'))}"
+        )
+    if mode != "signal_priority_unbounded":
+        noise_weight = _finite_float(weights.get("noise_penalty", 0.0))
+        if noise_weight is not None and not np.isclose(noise_weight, 0.0):
+            lines.append(
+                f"    {phase_label} RMS noise={_format_q_score(derived.get('noise_raw'))} µA; "
+                f"noise weight={noise_weight:g}; penalty="
+                f"{_format_q_score(derived.get('noise_penalty_magnitude'))}"
+            )
+    lines.append(
+        f"    Derived {phase_label} Classic Q={_format_q_score(derived.get('Q_channel'))}"
+    )
+    return lines
+
+
+def _paired_iteration_q_score_lines(
+    observation: Mapping[str, Any],
+    channels: Sequence[str],
+    config: Mapping[str, Any],
+) -> list[str]:
+    scoring = dict((config or {}).get("scoring") or {})
+    paired_weights = dict(scoring.get("paired_response_weights") or {})
+    if (
+        "standard_quality" in paired_weights
+        and "buffer_classic_Q" not in paired_weights
+        and "target_classic_Q" not in paired_weights
+    ):
+        legacy = max(0.0, float(paired_weights.get("standard_quality", 0.0) or 0.0))
+        paired_weights["buffer_classic_Q"] = legacy / 2
+        paired_weights["target_classic_Q"] = legacy / 2
+    resolved_weights = {
+        "buffer_classic_Q": float(paired_weights.get("buffer_classic_Q", .25) or 0.0),
+        "target_classic_Q": float(paired_weights.get("target_classic_Q", .25) or 0.0),
+        "peak_prominence": float(
+            paired_weights.get(
+                "peak_prominence",
+                paired_weights.get("delta_peak", 1.0),
+            ) or 0.0
+        ),
+        "repeat_scan_snr": float(paired_weights.get("repeat_scan_snr", 0.0) or 0.0),
+    }
+    snr_definition = str(
+        paired_weights.get("repeat_scan_snr_definition", "original") or "original"
+    ).strip().lower()
+    direction = _rescore_group_direction(
+        config,
+        int(observation.get("group_id", 1) or 1),
+    )
+    allowed_channels = _rescore_observation_channels(observation, config)
+    buffer_all = _scoped_rescore_metrics(
+        observation.get("buffer_channel_metrics") or {},
+        allowed_channels,
+    )
+    target_all = _scoped_rescore_metrics(
+        observation.get("target_channel_metrics") or {},
+        allowed_channels,
+    )
+    derived_quality = _rescore_paired_quality(
+        buffer_all,
+        target_all,
+        scoring,
+        direction,
+    )
+    derived_components = derived_quality.get("channel_components") or {}
+    saved_components = (
+        (observation.get("quality") or {}).get("channel_components") or {}
+    )
+    for saved_channel, saved_component in saved_components.items():
+        saved_differences = (saved_component or {}).get(
+            "pairwise_peak_differences_uA"
+        )
+        if not isinstance(
+            saved_differences,
+            (list, tuple, np.ndarray, pd.Series),
+        ):
+            continue
+        saved_differences = [
+            numeric
+            for value in saved_differences
+            if (numeric := _finite_float(value)) is not None
+        ]
+        if not saved_differences:
+            continue
+        channel_component = _mapping_channel_value(
+            derived_components,
+            str(saved_channel),
+        )
+        channel_component["pairwise_peak_differences_uA"] = saved_differences
+        derived_components[str(saved_channel)] = channel_component
+    lines = ["Only nonzero-weight terms in the active Paired Q profile are shown."]
+    selected_channels = sorted(
+        {str(channel) for channel in channels},
+        key=_channel_sort_key,
+    )
+    for channel in selected_channels:
+        buffer_metrics = _mapping_channel_value(buffer_all, channel)
+        target_metrics = _mapping_channel_value(target_all, channel)
+        component = _mapping_channel_value(derived_components, channel)
+        lines.append(f"{_trace_channel_label(channel)}")
+        delta_peak = _finite_float(component.get("delta_peak_height_uA")) or 0.0
+        buffer_success = (component.get("buffer_classic_components") or {}).get(
+            "success_score"
+        )
+        target_success = (component.get("target_classic_components") or {}).get(
+            "success_score"
+        )
+        lines.append(
+            "  Source-measurement validity: buffer success="
+            f"{_format_q_score(buffer_success)}, target success="
+            f"{_format_q_score(target_success)} → "
+            f"{'pass' if component.get('valid_source_pair', component.get('valid_classic_pair', False)) else 'fail'}"
+        )
+        if _nonzero_scoring_weight(resolved_weights["buffer_classic_Q"]):
+            weight = resolved_weights["buffer_classic_Q"]
+            lines.append(
+                "  Buffer Classic-Q paired term: sign(Δpeak) × "
+                f"{weight:g} × {_format_q_score(component.get('buffer_classic_Q'))} = "
+                f"{_format_q_score(component.get('buffer_classic_Q_contribution'))}"
+            )
+            lines.extend(_classic_active_input_lines(
+                "buffer",
+                buffer_metrics,
+                scoring,
+                component.get("buffer_classic_components") or {},
+            ))
+        if _nonzero_scoring_weight(resolved_weights["target_classic_Q"]):
+            weight = resolved_weights["target_classic_Q"]
+            lines.append(
+                "  Target Classic-Q paired term: sign(Δpeak) × "
+                f"{weight:g} × {_format_q_score(component.get('target_classic_Q'))} = "
+                f"{_format_q_score(component.get('target_classic_Q_contribution'))}"
+            )
+            lines.extend(_classic_active_input_lines(
+                "target",
+                target_metrics,
+                scoring,
+                component.get("target_classic_components") or {},
+            ))
+        if _nonzero_scoring_weight(resolved_weights["peak_prominence"]):
+            weight = resolved_weights["peak_prominence"]
+            buffer_peak = _metric_value(
+                buffer_metrics,
+                "mean_peak_current_uA",
+                "median_peak_current_uA",
+            )
+            target_peak = _metric_value(
+                target_metrics,
+                "mean_peak_current_uA",
+                "median_peak_current_uA",
+            )
+            buffer_rms = _metric_value(
+                buffer_metrics,
+                "mean_background_rms_uA",
+                "median_background_rms_uA",
+                "background_current_rms",
+            )
+            target_rms = _metric_value(
+                target_metrics,
+                "mean_background_rms_uA",
+                "median_background_rms_uA",
+                "background_current_rms",
+            )
+            lines.append(
+                "  Paired prominence: (target peak "
+                f"{_format_q_score(target_peak)} − buffer peak {_format_q_score(buffer_peak)}) "
+                f"/ (target RMS {_format_q_score(target_rms)} + buffer RMS {_format_q_score(buffer_rms)}) "
+                f"= {_format_q_score(component.get('peak_prominence'))}; weight={weight:g}; "
+                f"contribution={_format_q_score(component.get('peak_prominence_contribution'))}"
+            )
+        if _nonzero_scoring_weight(resolved_weights["repeat_scan_snr"]):
+            weight = resolved_weights["repeat_scan_snr"]
+            if snr_definition == "pairwise":
+                buffer_peaks = buffer_metrics.get("peak_currents_uA")
+                target_peaks = target_metrics.get("peak_currents_uA")
+                buffer_values = [
+                    numeric for value in buffer_peaks
+                    if (numeric := _finite_float(value)) is not None
+                ] if isinstance(buffer_peaks, (list, tuple, np.ndarray, pd.Series)) else []
+                target_values = [
+                    numeric for value in target_peaks
+                    if (numeric := _finite_float(value)) is not None
+                ] if isinstance(target_peaks, (list, tuple, np.ndarray, pd.Series)) else []
+                saved_pairwise_differences = component.get(
+                    "pairwise_peak_differences_uA"
+                )
+                pairwise_differences = [
+                    numeric
+                    for value in (
+                        saved_pairwise_differences
+                        if isinstance(
+                            saved_pairwise_differences,
+                            (list, tuple, np.ndarray, pd.Series),
+                        )
+                        else _saved_pairwise_peak_differences(
+                            buffer_metrics,
+                            target_metrics,
+                        )
+                    )
+                    if (numeric := _finite_float(value)) is not None
+                ]
+                pairwise_mean = (
+                    float(np.mean(pairwise_differences))
+                    if pairwise_differences else None
+                )
+                pairwise_std = (
+                    float(np.std(pairwise_differences, ddof=1))
+                    if len(pairwise_differences) > 1 else None
+                )
+                if not pairwise_differences:
+                    reconstructed = _paired_pairwise_repeat_snr(
+                        buffer_metrics,
+                        target_metrics,
+                    )
+                    if reconstructed is not None:
+                        pairwise_std = reconstructed[1]
+                        buffer_mean = _metric_value(
+                            buffer_metrics,
+                            "mean_peak_current_uA",
+                            "median_peak_current_uA",
+                        )
+                        target_mean = _metric_value(
+                            target_metrics,
+                            "mean_peak_current_uA",
+                            "median_peak_current_uA",
+                        )
+                        if _finite_float(buffer_mean) is not None and _finite_float(target_mean) is not None:
+                            pairwise_mean = float(target_mean) - float(buffer_mean)
+                derived_snr = (
+                    _finite_float(component.get("repeat_scan_snr")) or 0.0
+                )
+                std_floor = _finite_float(
+                    component.get("pairwise_std_floor_uA")
+                ) or 0.0
+                regularized_std = _finite_float(
+                    component.get("pairwise_regularized_std_uA")
+                )
+                if regularized_std is None and pairwise_std is not None:
+                    regularized_std = math.hypot(pairwise_std, std_floor)
+                lines.extend([
+                    "  Buffer peak replicates µA: "
+                    f"{_format_saved_numeric_values(buffer_values)}",
+                    "  Target peak replicates µA: "
+                    f"{_format_saved_numeric_values(target_values)}",
+                    "  All pairwise target−buffer peak differences µA: "
+                    f"{_format_saved_numeric_values(pairwise_differences)}",
+                    f"  Mean pairwise peak difference={_format_q_score(pairwise_mean)} µA; "
+                    f"sample pairwise STD={_format_q_score(pairwise_std)} µA",
+                    "  Regularized pairwise STD = sqrt(sample STD² + floor²) = "
+                    f"sqrt({_format_q_score(pairwise_std)}² + {_format_q_score(std_floor)}²) "
+                    f"= {_format_q_score(regularized_std)} µA",
+                    "  Pairwise repeat SNR = mean pairwise difference / regularized STD = "
+                    f"{_format_q_score(pairwise_mean)} / {_format_q_score(regularized_std)} = "
+                    f"{_format_q_score(derived_snr)}; weight={weight:g}; contribution="
+                    f"{_format_q_score(component.get('repeat_scan_snr_contribution'))}",
+                ])
+            else:
+                buffer_std = buffer_metrics.get("std_peak_current_uA")
+                target_std = target_metrics.get("std_peak_current_uA")
+                denominator = (
+                    abs(float(buffer_std or 0.0)) + abs(float(target_std or 0.0))
+                )
+                derived_snr = delta_peak / denominator if denominator > 1e-12 else 0.0
+                lines.extend([
+                    "  Buffer peak replicates µA used for STD: "
+                    f"{_format_saved_numeric_values(buffer_metrics.get('peak_currents_uA'))}",
+                    "  Target peak replicates µA used for STD: "
+                    f"{_format_saved_numeric_values(target_metrics.get('peak_currents_uA'))}",
+                    "  Original repeat SNR = Δpeak / (buffer peak STD + target peak STD) = "
+                    f"{_format_q_score(delta_peak)} / ({_format_q_score(buffer_std)} + "
+                    f"{_format_q_score(target_std)}) = {_format_q_score(derived_snr)}; "
+                    f"weight={weight:g}; contribution="
+                    f"{_format_q_score(component.get('repeat_scan_snr_contribution'))}",
+                ])
+        if not component.get(
+            "valid_source_pair", component.get("valid_classic_pair", True)
+        ):
+            lines.append("  Source-measurement validity failed; this channel contributed 0.")
+        lines.append(
+            f"  Derived Paired Q channel={_format_q_score(component.get('Q_channel'))}"
+        )
+
+    run_channel_values = {
+        str(channel): _finite_float((component or {}).get("Q_channel"))
+        for channel, component in derived_components.items()
+    }
+    lines.append(
+        "Run channels included in mean: "
+        + ", ".join(
+            f"{_trace_channel_label(channel)}={_format_q_score(value)}"
+            for channel, value in sorted(
+                run_channel_values.items(),
+                key=lambda item: _channel_sort_key(item[0]),
+            )
+        )
+    )
+    lines.append(
+        "Run base: mean Paired Q channel="
+        f"{_format_q_score(derived_quality.get('mean_Q_channel'))}"
+    )
+    run_weights = dict(scoring.get("run_weights") or {})
+    run_penalties = (
+        ("lambda_variability", .20, "channel STD", "std_Q_channel"),
+        ("lambda_failed", .40, "failed-channel fraction", "failed_channel_fraction"),
+        ("lambda_low", .20, "poor-channel fraction", "poor_channel_fraction"),
+    )
+    for key, default, label, value_key in run_penalties:
+        weight = float(run_weights.get(key, default) or 0.0)
+        if np.isclose(weight, 0.0):
+            continue
+        value = derived_quality.get(value_key)
+        contribution = weight * float(value or 0.0)
+        lines.append(
+            f"Run penalty: {label} {_format_q_score(value)} × {weight:g} = "
+            f"{_format_q_score(contribution)}"
+        )
+    repeat_std_weight = float(
+        paired_weights.get(
+            "lambda_repeat_std",
+            run_weights.get("lambda_repeat_std", 0.0),
+        ) or 0.0
+    )
+    if not np.isclose(repeat_std_weight, 0.0):
+        value = derived_quality.get("mean_repeat_relative_std")
+        lines.append(
+            "Run penalty: mean repeat relative STD "
+            f"{_format_q_score(value)} × {repeat_std_weight:g} = "
+            f"{_format_q_score(repeat_std_weight * float(value or 0.0))}"
+        )
+    lines.append(
+        f"Derived Paired Q run={_format_q_score(derived_quality.get('Q_run'))}"
+    )
+    return lines
+
+
+def _iteration_trace_q_score_lines(
+    observation: Mapping[str, Any],
+    channels: Sequence[str],
+    config: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Build active-profile Q labels for one separately plotted iteration."""
+    quality = dict(observation.get("quality") or {})
+    components = dict(quality.get("channel_components") or {})
+    paired = str(observation.get("objective") or "").lower() == "paired_response"
+    if paired:
+        return _paired_iteration_q_score_lines(
+            observation,
+            channels,
+            config or {},
+        )
+    q_run = observation.get("Q_run", quality.get("Q_run"))
+    lines = [f"Classic Q run: {_format_q_score(q_run)}"]
+    selected_channels = sorted(
+        {str(channel) for channel in channels},
+        key=_channel_sort_key,
+    )
+    for channel in selected_channels:
+        component = components.get(channel)
+        if component is None and channel.isdigit():
+            component = components.get(int(channel))
+        component = dict(component or {})
+        channel_label = _trace_channel_label(channel)
+        metrics = _mapping_channel_value(
+            observation.get("channel_metrics") or {},
+            channel,
+        )
+        lines.append(
+            f"{channel_label}  Classic Q: "
+            f"{_format_q_score(component.get('Q_channel'))}"
+        )
+        lines.extend(_phase_q_input_lines(
+            "Measurement",
+            metrics,
+            component,
+            component.get("Q_channel"),
+        ))
+    lines.extend([
+        (
+            "Run inputs: channel mean="
+            f"{_format_q_score(_metric_value(quality, 'mean_paired_Q_channel', 'mean_Q_channel'))}"
+            "  channel STD="
+            f"{_format_q_score(_metric_value(quality, 'std_paired_Q_channel', 'std_Q_channel'))}"
+            "  failed fraction="
+            f"{_format_q_score(quality.get('failed_channel_fraction'))}"
+        ),
+        (
+            "Run inputs: poor fraction="
+            f"{_format_q_score(_metric_value(quality, 'poor_channel_fraction', 'low_channel_fraction'))}"
+            "  mean repeat rel STD="
+            f"{_format_q_score(quality.get('mean_repeat_relative_std'))}"
+            "  total penalty="
+            f"{_format_q_score(quality.get('run_penalty_magnitude'))}"
+        ),
+    ])
+    return lines
+
+
+def _observation_with_trace_peak_replicates(
+    observation: Mapping[str, Any],
+    trace_items: Sequence[Mapping[str, Any]],
+    analysis: Mapping[str, Any],
+) -> dict:
+    """Backfill replicate peak lists from the SWV files shown in the plot."""
+    enriched = copy.deepcopy(dict(observation))
+    peaks: dict[tuple[str, str], list[float]] = {}
+    for item in trace_items:
+        phase = str(item.get("phase") or "").strip().lower()
+        if phase not in {"buffer", "target"}:
+            continue
+        channel = str(_trace_channel_key(dict(item)))
+        path_value = item.get("path")
+        if path_value is None:
+            continue
+        try:
+            peak_analysis = dict(analysis)
+            peak_analysis["min_peak_height_uA"] = None
+            _voltage, corrected_current, peak_idx, _left_idx, _right_idx = (
+                _swv_trace_arrays(
+                    Path(path_value),
+                    True,
+                    peak_analysis,
+                    "corrected_current",
+                )
+            )
+            if peak_idx is None:
+                continue
+            peak_value = _finite_float(
+                np.asarray(corrected_current, dtype=float)[int(peak_idx)]
+            )
+            if peak_value is not None:
+                peaks.setdefault((phase, channel), []).append(abs(peak_value))
+        except Exception:
+            try:
+                voltage, current, _peak, _left, _right = _swv_trace_arrays(
+                    Path(path_value),
+                    False,
+                    dict(analysis),
+                )
+                voltage = np.asarray(voltage, dtype=float)
+                current = np.asarray(current, dtype=float)
+                finite = np.isfinite(voltage) & np.isfinite(current)
+                crop_min = _finite_float(analysis.get("crop_min_v"))
+                crop_max = _finite_float(analysis.get("crop_max_v"))
+                if crop_min is not None:
+                    finite &= voltage >= crop_min
+                if crop_max is not None:
+                    finite &= voltage <= crop_max
+                cropped = current[finite]
+                if cropped.size:
+                    peak_value = float(
+                        np.nanpercentile(cropped, 99)
+                        - np.nanpercentile(cropped, 5)
+                    )
+                    peaks.setdefault((phase, channel), []).append(abs(peak_value))
+            except Exception:
+                continue
+    for (phase, channel), peak_values in peaks.items():
+        source_name = f"{phase}_channel_metrics"
+        source = enriched.get(source_name)
+        if not isinstance(source, dict):
+            source = {}
+            enriched[source_name] = source
+        source_key: Any = channel
+        if source_key not in source and channel.isdigit() and int(channel) in source:
+            source_key = int(channel)
+        metrics = dict(source.get(source_key) or {})
+        saved_values = metrics.get("peak_currents_uA")
+        has_saved_values = isinstance(
+            saved_values,
+            (list, tuple, np.ndarray, pd.Series),
+        ) and len(saved_values) > 0
+        if not has_saved_values:
+            metrics["peak_currents_uA"] = peak_values
+        source[source_key] = metrics
+    return enriched
+
+
+def _observation_with_plotted_peak_replicates(
+    observation: Mapping[str, Any],
+    trace_items: Sequence[Mapping[str, Any]],
+    figure: Figure,
+) -> dict:
+    """Recover replicate peak ranges from traces that Matplotlib displayed."""
+    enriched = copy.deepcopy(dict(observation))
+    plotted_lines = list(figure.axes[0].lines) if figure.axes else []
+    plotted_items = [
+        item
+        for item in trace_items
+        if str(item.get("phase") or "").strip().lower() in {"buffer", "target"}
+    ]
+    for item, line in zip(plotted_items, plotted_lines):
+        values = np.asarray(line.get_ydata(), dtype=float)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            continue
+        peak_value = float(
+            np.nanpercentile(values, 99) - np.nanpercentile(values, 5)
+        )
+        phase = str(item.get("phase") or "").strip().lower()
+        channel = str(_trace_channel_key(dict(item)))
+        source_name = f"{phase}_channel_metrics"
+        source = enriched.get(source_name)
+        if not isinstance(source, dict):
+            source = {}
+            enriched[source_name] = source
+        source_key: Any = channel
+        if source_key not in source and channel.isdigit() and int(channel) in source:
+            source_key = int(channel)
+        metrics = dict(source.get(source_key) or {})
+        saved_values = metrics.get("peak_currents_uA")
+        plotted_source = "reconstructed from displayed SWV traces"
+        if (
+            isinstance(saved_values, (list, tuple, np.ndarray, pd.Series))
+            and len(saved_values) > 0
+            and metrics.get("peak_currents_source") != plotted_source
+        ):
+            continue
+        if not isinstance(saved_values, list):
+            saved_values = []
+        metrics["peak_currents_uA"] = [*saved_values, abs(peak_value)]
+        metrics["peak_currents_source"] = plotted_source
+        source[source_key] = metrics
+    return enriched
+
+
 def _plot_traces(
     session: dict,
     observation: dict,
@@ -14965,7 +16171,8 @@ def _plot_traces(
                 label=trace_label,
             )
         except Exception as exc:
-            errors.append(f"{path.name}: {exc}")
+            if not is_peak_height_below_cutoff_error(exc):
+                errors.append(f"{path.name}: {exc}")
     if not traces:
         message = (
             "No traces match the selected channels."
@@ -15141,7 +16348,8 @@ def _plot_iteration_trace_overlay(
                 ),
             )
         except Exception as exc:
-            errors.append(f"{path.name}: {exc}")
+            if not is_peak_height_below_cutoff_error(exc):
+                errors.append(f"{path.name}: {exc}")
     if not entries:
         ax.text(
             .5,
@@ -15348,7 +16556,8 @@ def _chronological_swv_stack_entries(
                 "current": current,
             })
         except Exception as exc:
-            errors.append(f"{path.name}: {exc}")
+            if not is_peak_height_below_cutoff_error(exc):
+                errors.append(f"{path.name}: {exc}")
     return loaded, errors, entries
 
 
@@ -15750,9 +16959,18 @@ def _classic_q_equation(config: dict) -> str:
     mode = str(scoring.get("mode", "classic") or "classic").strip().lower()
     weights = dict(scoring.get("channel_weights") or {})
     run = dict(scoring.get("run_weights") or {})
+    default_prominence_weight = .45 if mode == "signal_priority_unbounded" else .35
+    prominence_weight = float(
+        weights.get(
+            "peak_prominence",
+            weights.get("snr", default_prominence_weight),
+        )
+    )
+    repeat_snr_weight = float(weights.get("repeat_scan_snr", 0))
     if mode == "signal_priority_unbounded":
         terms = (
-            ("log1p(Raw SNR)", float(weights.get("snr", .45))),
+            ("log1p(Peak prominence)", prominence_weight),
+            ("log1p(Repeat-scan SNR)", repeat_snr_weight),
             ("log1p(Peak µA)", float(weights.get("peak_height", .35))),
             ("Baseline", float(weights.get("baseline", .12))),
             ("Shape", float(weights.get("peak_shape", .05))),
@@ -15766,7 +16984,8 @@ def _classic_q_equation(config: dict) -> str:
         channel_equation = f"Classic Q_channel = ({numerator}) / {total:g}"
     else:
         terms = (
-            ("Raw SNR", float(weights.get("snr", .35))),
+            ("Peak prominence", prominence_weight),
+            ("Repeat-scan SNR", repeat_snr_weight),
             ("Peak µA", float(weights.get("peak_height", 0))),
             ("Shape", float(weights.get("peak_shape", .20))),
             ("Baseline", float(weights.get("baseline", .20))),
@@ -15778,21 +16997,29 @@ def _classic_q_equation(config: dict) -> str:
         ) or "0"
         noise = float(weights.get("noise_penalty", 0))
         channel_equation = (
-            f"Classic Q_channel = max(0, {numerator} - {noise:g}·Noise µA)"
+            f"Classic Q_channel = max(0, directional_penalty({numerator}, "
+            f"{noise:g}·Noise µA))"
         )
+    repeat_penalty = float(run.get("lambda_repeat_std", 0))
     run_equation = (
-        "Classic Q_run = mean(Q_channel)"
-        f" - {float(run.get('lambda_variability', .20)):g}·std(Q_channel)"
-        f" - {float(run.get('lambda_failed', .40)):g}·failed_fraction"
-        f" - {float(run.get('lambda_low', .20)):g}·"
-        f"fraction(Q_channel < {float(run.get('low_channel_threshold', .50)):g})"
+        "Classic Q_run = directional_penalty(mean(Q_channel), "
+        f"{float(run.get('lambda_variability', .20)):g}·std(Q_channel) + "
+        f"{float(run.get('lambda_failed', .40)):g}·failed_fraction + "
+        f"{float(run.get('lambda_low', .20)):g}·poor_channel_fraction + "
+        f"{repeat_penalty:g}·mean_repeat_relative_STD)"
     )
-    return f"{channel_equation}\n{run_equation}"
+    return (
+        "Peak prominence = mean peak height / mean trace RMS noise\n"
+        "Repeat-scan SNR = mean peak height / peak-height STD (0 for one scan)\n"
+        f"{channel_equation}\n{run_equation}\n"
+        "directional_penalty subtracts for maximize, adds for minimize, and moves toward 0 for survey"
+    )
 
 
 def _paired_q_equation(config: dict) -> str:
     scoring = dict((config or {}).get("scoring") or {})
     weights = dict(scoring.get("paired_response_weights") or {})
+    run = dict(scoring.get("run_weights") or {})
     if (
         "standard_quality" in weights
         and "buffer_classic_Q" not in weights
@@ -15803,31 +17030,775 @@ def _paired_q_equation(config: dict) -> str:
         weights["target_classic_Q"] = legacy / 2
     buffer_weight = float(weights.get("buffer_classic_Q", .25))
     target_weight = float(weights.get("target_classic_Q", .25))
-    delta_weight = float(weights.get("delta_peak", 1))
-    delta_scale = max(float(weights.get("delta_scale_uA", 1)), 1e-12)
-    total = max(buffer_weight + target_weight + delta_weight, 1e-12)
-    run = dict(scoring.get("run_weights") or {})
+    prominence_weight = float(
+        weights.get("peak_prominence", weights.get("delta_peak", 1))
+    )
+    repeat_snr_weight = float(weights.get("repeat_scan_snr", 0))
+    repeat_snr_definition = str(
+        weights.get("repeat_scan_snr_definition", "original") or "original"
+    ).strip().lower()
+    pairwise_std_floor = max(
+        0.0,
+        float(weights.get("pairwise_std_floor_uA", 0.0) or 0.0),
+    )
+    repeat_penalty = float(
+        weights.get("lambda_repeat_std", run.get("lambda_repeat_std", 0))
+    )
     return (
         "Δpeak = target_peak_height_µA - buffer_peak_height_µA\n"
-        f"Δpeak_score = log1p(|Δpeak| / {delta_scale:g})\n"
-        "Paired Q_channel = "
-        f"({buffer_weight:g}·buffer_classic_Q + "
-        f"{target_weight:g}·target_classic_Q + "
-        f"{delta_weight:g}·Δpeak_score) / {total:g}\n"
-        "If buffer_classic_Q ≤ 0 or target_classic_Q ≤ 0, Paired Q_channel = 0\n"
-        "Paired Q_run = max(0, mean(Paired Q_channel)"
-        f" - {float(run.get('lambda_variability', .20)):g}·std(Paired Q_channel)"
-        f" - {float(run.get('lambda_failed', .40)):g}·failed_fraction"
-        f" - {float(run.get('lambda_low', .20)):g}·"
-        f"fraction(Paired Q_channel < {float(run.get('low_channel_threshold', .50)):g}))"
+        "Peak prominence = Δpeak / (mean buffer RMS + mean target RMS)\n"
+        + (
+            "Pairwise differences = every target peak − every buffer peak\n"
+            "Regularized pairwise STD = sqrt(STD(pairwise differences)² + "
+            f"{pairwise_std_floor:g}²) µA\n"
+            "Repeat-scan SNR = (mean target peak − mean buffer peak) / "
+            "regularized pairwise STD\n"
+            if repeat_snr_definition == "pairwise"
+            else "Repeat-scan SNR = Δpeak / (buffer peak STD + target peak STD)\n"
+        )
+        +
+        "Paired Q_channel = sign(Δpeak)·("
+        f"{buffer_weight:g}·buffer_classic_Q + "
+        f"{target_weight:g}·target_classic_Q) + "
+        f"{prominence_weight:g}·Peak prominence + "
+        f"{repeat_snr_weight:g}·Repeat-scan SNR\n"
+        "If either source measurement failed, Paired Q_channel = 0\n"
+        "Paired Q_run = directional_penalty(mean(Paired Q_channel), "
+        f"{float(run.get('lambda_variability', .20)):g}·std(Paired Q_channel) + "
+        f"{float(run.get('lambda_failed', .40)):g}·failed_fraction + "
+        f"{float(run.get('lambda_low', .20)):g}·poor_channel_fraction + "
+        f"{repeat_penalty:g}·mean_repeat_relative_STD)\n"
+        "directional_penalty subtracts for maximize, adds for minimize, and moves toward 0 for survey"
+    )
+
+
+def _rescore_direction(value: Any) -> str:
+    normalized = str(value or "maximize").strip().lower()
+    if normalized in {"minimize", "min", "more_negative", "negative"}:
+        return "minimize"
+    if normalized in {"survey", "absolute", "magnitude", "both"}:
+        return "survey"
+    return "maximize"
+
+
+def _rescore_penalized_value(
+    value: float,
+    penalty: float,
+    direction: str,
+) -> float:
+    penalty = max(0.0, float(penalty))
+    if direction == "minimize":
+        return float(value) + penalty
+    if direction == "survey":
+        if value > 0:
+            return max(0.0, float(value) - penalty)
+        if value < 0:
+            return min(0.0, float(value) + penalty)
+        return 0.0
+    return float(value) - penalty
+
+
+def _rescore_clip_run(value: float, direction: str) -> float:
+    if direction == "minimize":
+        return min(0.0, float(value))
+    if direction == "survey":
+        return float(value)
+    return max(0.0, float(value))
+
+
+def _rescore_sample_std(values: Sequence[float]) -> float:
+    return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+
+def _rescore_channel_quality(
+    metrics: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    direction: str = "maximize",
+) -> dict:
+    mode = str(scoring.get("mode", "classic") or "classic").strip().lower()
+    weights = dict(scoring.get("channel_weights") or {})
+    prominence = float(
+        metrics.get("peak_prominence", metrics.get("snr", 0.0)) or 0.0
+    )
+    peak = abs(float(
+        metrics.get(
+            "mean_peak_current_uA",
+            metrics.get("median_peak_current_uA", metrics.get("peak_current", 0.0)),
+        ) or 0.0
+    ))
+    noise = abs(float(
+        metrics.get(
+            "mean_background_rms_uA",
+            metrics.get(
+                "median_background_rms_uA",
+                metrics.get("background_current_rms", metrics.get("baseline_noise", 0.0)),
+            ),
+        ) or 0.0
+    ))
+    peak_std = abs(float(metrics.get("std_peak_current_uA", 0.0) or 0.0))
+    repeat_count = int(metrics.get("ok_scan_count", 0) or 0)
+    repeat_snr = _finite_float(metrics.get("repeat_scan_snr"))
+    if repeat_snr is None:
+        repeat_snr = (
+            peak / peak_std
+            if repeat_count > 1 and peak_std > 1e-12 else 0.0
+        )
+    saturation = max(
+        float(weights.get(
+            "peak_prominence_saturation",
+            weights.get("snr_saturation", 20.0),
+        )),
+        1e-12,
+    )
+    components = {
+        "peak_prominence_raw": prominence,
+        "snr_raw": prominence,
+        "normalized_peak_prominence": float(np.clip(prominence / saturation, 0, 1)),
+        "normalized_SNR": float(np.clip(prominence / saturation, 0, 1)),
+        "peak_height_raw": peak,
+        "noise_raw": noise,
+        "repeat_scan_snr_raw": repeat_snr,
+        "log_peak_prominence": math.log1p(max(0.0, prominence)),
+        "log_repeat_scan_snr": math.log1p(max(0.0, repeat_snr)),
+        "log_peak_height": math.log1p(max(0.0, peak)),
+        "peak_shape_score": float(np.clip(metrics.get("peak_shape_score", 0.0), 0, 1)),
+        "baseline_stability_score": float(np.clip(metrics.get("baseline_stability_score", 0.0), 0, 1)),
+        "replicate_consistency_score": float(np.clip(metrics.get("replicate_consistency_score", 0.0), 0, 1)),
+        "success_score": float(np.clip(metrics.get("success_score", 1.0), 0, 1)),
+    }
+    defaults = {
+        "peak_prominence": .45 if mode == "signal_priority_unbounded" else .35,
+        "repeat_scan_snr": 0.0,
+        "peak_height": .35 if mode == "signal_priority_unbounded" else 0.0,
+        "peak_shape": .05 if mode == "signal_priority_unbounded" else .20,
+        "baseline": .12 if mode == "signal_priority_unbounded" else .20,
+        "replicate_consistency": .03 if mode == "signal_priority_unbounded" else .15,
+        "success": 0.0 if mode == "signal_priority_unbounded" else .10,
+    }
+    resolved_weights = {
+        name: float(
+            weights.get(
+                name,
+                weights.get("snr", default) if name == "peak_prominence" else default,
+            )
+        )
+        for name, default in defaults.items()
+    }
+    sources = {
+        "peak_prominence": "log_peak_prominence" if mode == "signal_priority_unbounded" else "peak_prominence_raw",
+        "repeat_scan_snr": "log_repeat_scan_snr" if mode == "signal_priority_unbounded" else "repeat_scan_snr_raw",
+        "peak_height": "log_peak_height" if mode == "signal_priority_unbounded" else "peak_height_raw",
+        "peak_shape": "peak_shape_score",
+        "baseline": "baseline_stability_score",
+        "replicate_consistency": "replicate_consistency_score",
+        "success": "success_score",
+    }
+    weighted_terms = {
+        name: resolved_weights[name] * components[source]
+        for name, source in sources.items()
+    }
+    if mode == "signal_priority_unbounded":
+        divisor = max(sum(resolved_weights.values()), 1e-12)
+        for name, contribution in weighted_terms.items():
+            components[f"{name}_contribution"] = contribution / divisor
+        unpenalized = sum(weighted_terms.values()) / divisor
+        noise_penalty = 0.0
+        q_channel = unpenalized
+    else:
+        components.update({
+            f"{name}_contribution": contribution
+            for name, contribution in weighted_terms.items()
+        })
+        unpenalized = sum(weighted_terms.values())
+        noise_penalty = float(weights.get("noise_penalty", 0.0)) * noise
+        q_channel = max(
+            0.0,
+            _rescore_penalized_value(unpenalized, noise_penalty, direction),
+        )
+    components["unpenalized_Q_channel"] = unpenalized
+    components["noise_penalty_magnitude"] = noise_penalty
+    components["noise_penalty_adjustment"] = q_channel - unpenalized
+    components["Q_channel"] = q_channel
+    return components
+
+
+def _rescore_run_quality(
+    channel_metrics: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    direction: str,
+) -> dict:
+    per_channel = {
+        str(channel): _rescore_channel_quality(metrics or {}, scoring, direction)
+        for channel, metrics in channel_metrics.items()
+    }
+    q_values = [float(data["Q_channel"]) for data in per_channel.values()] or [0.0]
+    mean_q = float(np.mean(q_values))
+    std_q = _rescore_sample_std(q_values)
+    run_weights = dict(scoring.get("run_weights") or {})
+    threshold = float(run_weights.get("low_channel_threshold", .5))
+    failed_fraction = sum(
+        float(data.get("success_score", 1.0)) <= 0.0
+        for data in per_channel.values()
+    ) / len(q_values)
+    if direction == "minimize":
+        poor_fraction = sum(value > threshold for value in q_values) / len(q_values)
+    elif direction == "survey":
+        poor_fraction = sum(abs(value) < threshold for value in q_values) / len(q_values)
+    else:
+        poor_fraction = sum(value < threshold for value in q_values) / len(q_values)
+    repeat_relative_std = float(np.mean([
+        float((metrics or {}).get("repeat_relative_std", 0.0) or 0.0)
+        for metrics in channel_metrics.values()
+    ])) if channel_metrics else 0.0
+    repeat_penalty = float(run_weights.get("lambda_repeat_std", 0.0)) * repeat_relative_std
+    penalty = (
+        float(run_weights.get("lambda_variability", .20)) * std_q
+        + float(run_weights.get("lambda_failed", .40)) * failed_fraction
+        + float(run_weights.get("lambda_low", .20)) * poor_fraction
+        + repeat_penalty
+    )
+    penalized = _rescore_penalized_value(mean_q, penalty, direction)
+    q_run = _rescore_clip_run(penalized, direction)
+    return {
+        "Q_run": q_run,
+        "mean_Q_channel": mean_q,
+        "std_Q_channel": std_q,
+        "failed_channel_fraction": failed_fraction,
+        "low_channel_fraction": poor_fraction,
+        "poor_channel_fraction": poor_fraction,
+        "mean_repeat_relative_std": repeat_relative_std,
+        "repeat_std_penalty": repeat_penalty,
+        "optimization_direction": direction,
+        "run_penalty_magnitude": penalty,
+        "run_penalty_adjustment": penalized - mean_q,
+        "Q_channels": {channel: data["Q_channel"] for channel, data in per_channel.items()},
+        "channel_components": per_channel,
+    }
+
+
+def _rescore_paired_quality(
+    buffer_metrics: Mapping[str, Any],
+    target_metrics: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    direction: str,
+) -> dict:
+    channels = sorted(
+        set(map(str, buffer_metrics)).intersection(map(str, target_metrics)),
+        key=_channel_sort_key,
+    )
+    paired_weights = dict(scoring.get("paired_response_weights") or {})
+    if (
+        "standard_quality" in paired_weights
+        and "buffer_classic_Q" not in paired_weights
+        and "target_classic_Q" not in paired_weights
+    ):
+        legacy = max(0.0, float(paired_weights.get("standard_quality", 0.0)))
+        paired_weights["buffer_classic_Q"] = legacy / 2
+        paired_weights["target_classic_Q"] = legacy / 2
+    per_channel = {}
+    for channel in channels:
+        buffer_raw = dict(buffer_metrics.get(channel) or buffer_metrics.get(int(channel), {}) or {})
+        target_raw = dict(target_metrics.get(channel) or target_metrics.get(int(channel), {}) or {})
+        buffer_q = _rescore_channel_quality(buffer_raw, scoring, "maximize")
+        target_q = _rescore_channel_quality(target_raw, scoring, "maximize")
+        buffer_peak = float(buffer_q["peak_height_raw"])
+        target_peak = float(target_q["peak_height_raw"])
+        delta_peak = target_peak - buffer_peak
+        combined_noise = float(buffer_q["noise_raw"] + target_q["noise_raw"])
+        repeat_snr_definition = str(
+            paired_weights.get("repeat_scan_snr_definition", "original")
+            or "original"
+        ).strip().lower()
+        if repeat_snr_definition == "pairwise":
+            pairwise = _paired_pairwise_repeat_snr(buffer_raw, target_raw)
+            pairwise_differences = _saved_pairwise_peak_differences(
+                buffer_raw,
+                target_raw,
+            )
+        else:
+            pairwise = None
+            pairwise_differences = []
+        if repeat_snr_definition != "pairwise" or pairwise is None:
+            combined_std = abs(float(buffer_raw.get("std_peak_current_uA", 0.0) or 0.0)) + abs(
+                float(target_raw.get("std_peak_current_uA", 0.0) or 0.0)
+            )
+            repeat_snr = (
+                delta_peak / combined_std
+                if combined_std > 1e-12 else 0.0
+            )
+        else:
+            repeat_snr, combined_std = pairwise
+        raw_pairwise_std = combined_std
+        unregularized_repeat_snr = repeat_snr
+        pairwise_std_floor = max(
+            0.0,
+            float(paired_weights.get("pairwise_std_floor_uA", 0.0) or 0.0),
+        )
+        regularized_pairwise_std = combined_std
+        if repeat_snr_definition == "pairwise" and pairwise is not None:
+            regularized_pairwise_std = math.hypot(
+                combined_std,
+                pairwise_std_floor,
+            )
+            pairwise_mean = float(target_peak - buffer_peak)
+            repeat_snr = (
+                pairwise_mean / regularized_pairwise_std
+                if regularized_pairwise_std > 1e-12
+                else 0.0
+            )
+        prominence = delta_peak / max(combined_noise, 1e-12)
+        buffer_classic = float(buffer_q["Q_channel"])
+        target_classic = float(target_q["Q_channel"])
+        success = min(float(buffer_q["success_score"]), float(target_q["success_score"]))
+        # Input validity is independent of the selected Classic-Q weights.
+        # Otherwise zero Classic-Q weights suppress valid paired-only terms.
+        valid_pair = success > 0
+        sign = -1.0 if delta_peak < 0 else 1.0
+        buffer_term = sign * float(paired_weights.get("buffer_classic_Q", 0.0)) * buffer_classic
+        target_term = sign * float(paired_weights.get("target_classic_Q", 0.0)) * target_classic
+        prominence_term = float(
+            paired_weights.get("peak_prominence", paired_weights.get("delta_peak", 1.0))
+        ) * prominence
+        repeat_term = float(paired_weights.get("repeat_scan_snr", 0.0)) * repeat_snr
+        if success <= 0:
+            buffer_term = target_term = prominence_term = repeat_term = q_channel = 0.0
+        else:
+            q_channel = buffer_term + target_term + prominence_term + repeat_term
+        per_channel[channel] = {
+            "Q_channel": q_channel,
+            "paired_Q_channel": q_channel,
+            "valid_source_pair": valid_pair,
+            "valid_classic_pair": valid_pair,
+            "buffer_classic_Q": buffer_classic,
+            "target_classic_Q": target_classic,
+            "classic_pair_Q": .5 * (buffer_classic + target_classic),
+            "buffer_classic_Q_contribution": buffer_term,
+            "target_classic_Q_contribution": target_term,
+            "peak_prominence_contribution": prominence_term,
+            "repeat_scan_snr_contribution": repeat_term,
+            "delta_peak_contribution": prominence_term,
+            "delta_peak_height_uA": delta_peak,
+            "abs_delta_peak_height_uA": abs(delta_peak),
+            "peak_prominence": prominence,
+            "repeat_scan_snr": repeat_snr,
+            "combined_channel_noise": combined_noise,
+            "combined_peak_std_uA": combined_std,
+            "pairwise_peak_difference_std_uA": raw_pairwise_std,
+            "pairwise_regularized_std_uA": regularized_pairwise_std,
+            "pairwise_std_floor_uA": pairwise_std_floor,
+            "unregularized_repeat_scan_snr": unregularized_repeat_snr,
+            **(
+                {"pairwise_peak_differences_uA": pairwise_differences}
+                if repeat_snr_definition == "pairwise"
+                else {}
+            ),
+            "success_score": success,
+            "repeat_relative_std": .5 * (
+                float(buffer_raw.get("repeat_relative_std", 0.0) or 0.0)
+                + float(target_raw.get("repeat_relative_std", 0.0) or 0.0)
+            ),
+            "buffer_classic_components": buffer_q,
+            "target_classic_components": target_q,
+        }
+    q_values = [float(data["Q_channel"]) for data in per_channel.values()] or [0.0]
+    mean_q = float(np.mean(q_values))
+    std_q = _rescore_sample_std(q_values)
+    run_weights = dict(scoring.get("run_weights") or {})
+    threshold = float(run_weights.get("low_channel_threshold", .5))
+    failed_fraction = sum(
+        float(data.get("success_score", 1.0)) <= 0.0
+        for data in per_channel.values()
+    ) / max(len(per_channel), 1)
+    if direction == "minimize":
+        poor_fraction = sum(value > threshold for value in q_values) / len(q_values)
+    elif direction == "survey":
+        poor_fraction = sum(abs(value) < threshold for value in q_values) / len(q_values)
+    else:
+        poor_fraction = sum(value < threshold for value in q_values) / len(q_values)
+    mean_repeat_std = float(np.mean([
+        float(data.get("repeat_relative_std", 0.0))
+        for data in per_channel.values()
+    ])) if per_channel else 0.0
+    repeat_penalty = float(
+        paired_weights.get("lambda_repeat_std", run_weights.get("lambda_repeat_std", 0.0))
+    ) * mean_repeat_std
+    penalty = (
+        float(run_weights.get("lambda_variability", .20)) * std_q
+        + float(run_weights.get("lambda_failed", .40)) * failed_fraction
+        + float(run_weights.get("lambda_low", .20)) * poor_fraction
+        + repeat_penalty
+    )
+    penalized = _rescore_penalized_value(mean_q, penalty, direction)
+    q_run = _rescore_clip_run(penalized, direction)
+
+    def mean_component(key: str) -> float:
+        return float(np.mean([
+            float(data.get(key, 0.0) or 0.0)
+            for data in per_channel.values()
+        ])) if per_channel else 0.0
+
+    return {
+        "Q_run": q_run,
+        "objective": "paired_response",
+        "mean_Q_channel": mean_q,
+        "mean_paired_Q_channel": mean_q,
+        "std_Q_channel": std_q,
+        "failed_channel_fraction": failed_fraction,
+        "low_channel_fraction": poor_fraction,
+        "poor_channel_fraction": poor_fraction,
+        "mean_repeat_relative_std": mean_repeat_std,
+        "repeat_std_penalty": repeat_penalty,
+        "optimization_direction": direction,
+        "run_penalty_magnitude": penalty,
+        "run_penalty_adjustment": penalized - mean_q,
+        "mean_delta_peak_height_uA": mean_component("delta_peak_height_uA"),
+        "mean_abs_delta_peak_height_uA": mean_component("abs_delta_peak_height_uA"),
+        "mean_peak_prominence": mean_component("peak_prominence"),
+        "mean_repeat_scan_snr": mean_component("repeat_scan_snr"),
+        "mean_combined_peak_std_uA": mean_component("combined_peak_std_uA"),
+        "mean_peak_prominence_contribution": mean_component("peak_prominence_contribution"),
+        "mean_repeat_scan_snr_contribution": mean_component("repeat_scan_snr_contribution"),
+        "mean_buffer_classic_Q": mean_component("buffer_classic_Q"),
+        "mean_target_classic_Q": mean_component("target_classic_Q"),
+        "Q_channels": {channel: data["Q_channel"] for channel, data in per_channel.items()},
+        "channel_components": per_channel,
+    }
+
+
+def _apply_rescored_quality_to_observation(
+    observation: dict,
+    quality: Mapping[str, Any],
+) -> dict:
+    """Synchronize every stored score view with a newly calculated quality."""
+    observation["quality"] = copy.deepcopy(dict(quality))
+    observation["Q_run"] = quality.get("Q_run")
+    paired = str(observation.get("objective") or "").lower() == "paired_response"
+    components = quality.get("channel_components") or {}
+
+    def update_channel_metrics(
+        source_name: str,
+        channel: str,
+        updates: Mapping[str, Any],
+    ) -> None:
+        source = observation.get(source_name)
+        if not isinstance(source, dict):
+            source = {}
+            observation[source_name] = source
+        source_key: Any = channel
+        if source_key not in source:
+            numeric = _finite_float(channel)
+            integer_key = int(numeric) if numeric is not None and numeric.is_integer() else None
+            if integer_key is not None and integer_key in source:
+                source_key = integer_key
+        metrics = dict(source.get(source_key) or {})
+        metrics.update({key: value for key, value in updates.items() if value is not None})
+        source[source_key] = metrics
+
+    for raw_channel, raw_component in components.items():
+        channel = str(raw_channel)
+        component = dict(raw_component or {})
+        q_channel = component.get("Q_channel")
+        if paired:
+            update_channel_metrics("channel_metrics", channel, {
+                "Q_channel": q_channel,
+                "paired_Q_channel": component.get("paired_Q_channel", q_channel),
+                "paired_Q": component.get("paired_Q_channel", q_channel),
+            })
+            for phase, nested_key in (
+                ("buffer", "buffer_classic_components"),
+                ("target", "target_classic_components"),
+            ):
+                classic = dict(component.get(nested_key) or {})
+                classic_q = classic.get("Q_channel")
+                update_channel_metrics(f"{phase}_channel_metrics", channel, {
+                    "Q_channel": classic_q,
+                    "classic_Q": classic_q,
+                })
+        else:
+            update_channel_metrics("channel_metrics", channel, {
+                "Q_channel": q_channel,
+                "classic_Q": q_channel,
+            })
+    return observation
+
+
+def _rescore_group_direction(config: Mapping[str, Any], group_id: int) -> str:
+    acquisition = dict(config.get("acquisition") or {})
+    direction = acquisition.get("optimization_direction", "maximize")
+    for group in config.get("channel_groups") or []:
+        if isinstance(group, dict) and int(group.get("id", 1)) == int(group_id):
+            direction = group.get("optimization_direction", direction)
+            break
+    return _rescore_direction(direction)
+
+
+def _rescore_observation_channels(
+    observation: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> set[str]:
+    """Return the channels that legitimately belong to this observation."""
+    channels = observation.get("channels")
+    if isinstance(channels, (list, tuple, set)) and channels:
+        return {str(channel) for channel in channels}
+    group_id = int(observation.get("group_id", 1) or 1)
+    for group in config.get("channel_groups") or []:
+        if not isinstance(group, Mapping):
+            continue
+        if int(group.get("id", 1) or 1) != group_id:
+            continue
+        configured = group.get("channels") or []
+        return {str(channel) for channel in configured}
+    return set()
+
+
+def _scoped_rescore_metrics(
+    metrics: Mapping[str, Any],
+    allowed_channels: set[str],
+) -> dict:
+    if not allowed_channels:
+        return dict(metrics)
+    return {
+        channel: value
+        for channel, value in metrics.items()
+        if str(channel) in allowed_channels
+    }
+
+
+def _rescore_observations(
+    observations: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict]:
+    rescored = []
+    total = len(observations)
+    for index, original in enumerate(observations, start=1):
+        observation = copy.deepcopy(original)
+        direction = _rescore_group_direction(
+            config,
+            int(observation.get("group_id", 1) or 1),
+        )
+        allowed_channels = _rescore_observation_channels(observation, config)
+        if str(observation.get("objective", "")).lower() == "paired_response":
+            if not observation.get("buffer_channel_metrics") or not observation.get(
+                "target_channel_metrics"
+            ):
+                observation["_viewer_rescore_skipped"] = True
+                rescored.append(observation)
+                if progress_callback:
+                    progress_callback(index, total)
+                continue
+            quality = _rescore_paired_quality(
+                _scoped_rescore_metrics(
+                    observation.get("buffer_channel_metrics") or {},
+                    allowed_channels,
+                ),
+                _scoped_rescore_metrics(
+                    observation.get("target_channel_metrics") or {},
+                    allowed_channels,
+                ),
+                scoring,
+                direction,
+            )
+        else:
+            if not observation.get("channel_metrics"):
+                observation["_viewer_rescore_skipped"] = True
+                rescored.append(observation)
+                if progress_callback:
+                    progress_callback(index, total)
+                continue
+            quality = _rescore_run_quality(
+                _scoped_rescore_metrics(
+                    observation.get("channel_metrics") or {},
+                    allowed_channels,
+                ),
+                scoring,
+                direction,
+            )
+        _apply_rescored_quality_to_observation(observation, quality)
+        rescored.append(observation)
+        if progress_callback:
+            progress_callback(index, total)
+    return rescored
+
+
+def _weighted_component_names(
+    weights: Mapping[str, Any],
+    definitions: Sequence[tuple[str, str, float]],
+) -> list[str]:
+    active = []
+    for key, label, default in definitions:
+        try:
+            weight = float(weights.get(key, default) or 0.0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        if not np.isclose(weight, 0.0):
+            active.append(f"{label} ({weight:g})")
+    return active
+
+
+def _q_run_penalty_text(
+    run_weights: Mapping[str, Any],
+    *,
+    repeat_std_weight: float | None = None,
+) -> str:
+    penalty_definitions = [
+        ("lambda_variability", "between-channel variability", .20),
+        ("lambda_failed", "failed-channel fraction", .40),
+        ("lambda_low", "poor-channel fraction", .20),
+    ]
+    penalties = _weighted_component_names(run_weights, penalty_definitions)
+    if repeat_std_weight is None:
+        try:
+            repeat_std_weight = float(
+                run_weights.get("lambda_repeat_std", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            repeat_std_weight = 0.0
+    if not np.isclose(float(repeat_std_weight), 0.0):
+        penalties.append(f"mean repeat relative STD ({float(repeat_std_weight):g})")
+    if not penalties:
+        return "No run-level penalties are active."
+    return "The channel mean is adjusted by " + ", ".join(penalties) + "."
+
+
+def _classic_q_description(config: Mapping[str, Any]) -> str:
+    scoring = dict((config or {}).get("scoring") or {})
+    mode = str(scoring.get("mode", "classic") or "classic").strip().lower()
+    weights = dict(scoring.get("channel_weights") or {})
+    run_weights = dict(scoring.get("run_weights") or {})
+    defaults = (
+        {
+            "peak_prominence": .45,
+            "repeat_scan_snr": 0.0,
+            "peak_height": .35,
+            "peak_shape": .05,
+            "baseline": .12,
+            "replicate_consistency": .03,
+            "success": 0.0,
+        }
+        if mode == "signal_priority_unbounded"
+        else {
+            "peak_prominence": .35,
+            "repeat_scan_snr": 0.0,
+            "peak_height": 0.0,
+            "peak_shape": .20,
+            "baseline": .20,
+            "replicate_consistency": .15,
+            "success": .10,
+        }
+    )
+    if "peak_prominence" not in weights and "snr" in weights:
+        weights["peak_prominence"] = weights["snr"]
+    components = _weighted_component_names(weights, [
+        ("peak_prominence", "peak prominence", defaults["peak_prominence"]),
+        ("repeat_scan_snr", "repeat-scan SNR", defaults["repeat_scan_snr"]),
+        ("peak_height", "peak height", defaults["peak_height"]),
+        ("peak_shape", "peak shape", defaults["peak_shape"]),
+        ("baseline", "baseline stability", defaults["baseline"]),
+        (
+            "replicate_consistency",
+            "replicate consistency",
+            defaults["replicate_consistency"],
+        ),
+        ("success", "scan success", defaults["success"]),
+    ])
+    component_text = ", ".join(components) if components else "no weighted components"
+    mode_text = (
+        "signal-priority unbounded mode, where prominence, repeat SNR, and peak "
+        "height are log-transformed before their weighted average"
+        if mode == "signal_priority_unbounded"
+        else "classic additive mode"
+    )
+    noise_text = ""
+    if mode != "signal_priority_unbounded":
+        try:
+            noise_weight = float(weights.get("noise_penalty", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            noise_weight = 0.0
+        if not np.isclose(noise_weight, 0.0):
+            noise_text = f" Trace RMS noise is penalized with weight {noise_weight:g}."
+    return (
+        "**Classic Q represents standalone SWV measurement quality under the "
+        "currently active scoring profile.** The channel score uses "
+        f"{mode_text} with: {component_text}.{noise_text} "
+        f"{_q_run_penalty_text(run_weights)} Components with zero weight do not "
+        "affect Q. Classic Q scores one buffer, target, or unpaired measurement; "
+        "it does not measure buffer-versus-target selectivity by itself."
+    )
+
+
+def _paired_q_description(config: Mapping[str, Any]) -> str:
+    scoring = dict((config or {}).get("scoring") or {})
+    weights = dict(scoring.get("paired_response_weights") or {})
+    run_weights = dict(scoring.get("run_weights") or {})
+    if (
+        "standard_quality" in weights
+        and "buffer_classic_Q" not in weights
+        and "target_classic_Q" not in weights
+    ):
+        legacy = max(0.0, float(weights.get("standard_quality", 0.0) or 0.0))
+        weights["buffer_classic_Q"] = legacy / 2
+        weights["target_classic_Q"] = legacy / 2
+    components = _weighted_component_names(weights, [
+        ("buffer_classic_Q", "buffer Classic Q", .25),
+        ("target_classic_Q", "target Classic Q", .25),
+        (
+            "peak_prominence",
+            "paired peak prominence (target − buffer peak divided by combined noise)",
+            float(weights.get("delta_peak", 1.0) or 0.0),
+        ),
+        ("repeat_scan_snr", "paired repeat-scan SNR", 0.0),
+    ])
+    component_text = ", ".join(components) if components else "no weighted components"
+    repeat_definition = str(
+        weights.get("repeat_scan_snr_definition", "original") or "original"
+    ).strip().lower()
+    try:
+        repeat_weight = float(weights.get("repeat_scan_snr", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        repeat_weight = 0.0
+    snr_text = ""
+    if not np.isclose(repeat_weight, 0.0):
+        if repeat_definition == "pairwise":
+            snr_text = (
+                " The active pairwise repeat-scan SNR uses mean target peak minus "
+                "mean buffer peak divided by the STD of all target−buffer replicate "
+                "pairs; therefore its positive direction is target > buffer."
+            )
+        else:
+            snr_text = (
+                " The active original repeat-scan SNR uses target minus buffer peak "
+                "divided by buffer peak STD plus target peak STD; its positive "
+                "direction is target > buffer."
+            )
+    try:
+        repeat_std_weight = float(
+            weights.get(
+                "lambda_repeat_std",
+                run_weights.get("lambda_repeat_std", 0.0),
+            ) or 0.0
+        )
+    except (TypeError, ValueError):
+        repeat_std_weight = 0.0
+    return (
+        "**Paired Q represents the buffer-versus-target response under the currently "
+        "active scoring profile.** It compares phases recorded at the same method "
+        f"settings using: {component_text}.{snr_text} The paired score is set to zero "
+        "when either phase has a nonpositive Classic Q. "
+        f"{_q_run_penalty_text(run_weights, repeat_std_weight=repeat_std_weight)} "
+        "Components with zero weight do not affect Q; use the equation below to "
+        "interpret the sign when active components use different sign conventions."
     )
 
 
 def _render_q_equation(config: dict, kind: str) -> None:
     if kind == "paired":
+        st.markdown(_paired_q_description(config))
         st.markdown("**Paired Q equation**")
         st.code(_paired_q_equation(config), language=None)
     elif kind == "classic":
+        st.markdown(_classic_q_description(config))
         st.markdown("**Classic Q equation**")
         st.code(_classic_q_equation(config), language=None)
 
@@ -15846,6 +17817,7 @@ def _metric_q_kind(metric: str, paired_objective: bool) -> str | None:
 def _q_weight_context(config: dict) -> dict:
     scoring = dict((config or {}).get("scoring") or {})
     channel = dict(scoring.get("channel_weights") or {})
+    run = dict(scoring.get("run_weights") or {})
     paired = dict(scoring.get("paired_response_weights") or {})
     if (
         "standard_quality" in paired
@@ -15856,7 +17828,10 @@ def _q_weight_context(config: dict) -> dict:
         paired["buffer_classic_Q"] = legacy / 2
         paired["target_classic_Q"] = legacy / 2
     return {
-        "snr": float(channel.get("snr", .35)),
+        "peak_prominence": float(
+            channel.get("peak_prominence", channel.get("snr", .35))
+        ),
+        "repeat_scan_snr": float(channel.get("repeat_scan_snr", 0)),
         "peak": float(channel.get("peak_height", 0)),
         "shape": float(channel.get("peak_shape", .20)),
         "baseline": float(channel.get("baseline", .20)),
@@ -15865,7 +17840,14 @@ def _q_weight_context(config: dict) -> dict:
         "noise": float(channel.get("noise_penalty", 0)),
         "buffer_classic": float(paired.get("buffer_classic_Q", .25)),
         "target_classic": float(paired.get("target_classic_Q", .25)),
-        "delta_peak": float(paired.get("delta_peak", 1)),
+        "paired_peak_prominence": float(
+            paired.get("peak_prominence", paired.get("delta_peak", 1))
+        ),
+        "paired_repeat_scan_snr": float(paired.get("repeat_scan_snr", 0)),
+        "repeat_std": float(run.get("lambda_repeat_std", 0)),
+        "paired_repeat_std": float(
+            paired.get("lambda_repeat_std", run.get("lambda_repeat_std", 0))
+        ),
     }
 
 
@@ -15903,16 +17885,29 @@ def _metric_impacts_q(
             )
     if "fractional delta" in normalized:
         return False
+    if "repeat relative std" in normalized or "repeat std" in normalized:
+        key = "paired_repeat_std" if paired_objective else "repeat_std"
+        return weights[key] != 0
+    if "repeat scan snr" in normalized or "repeat-scan snr" in normalized:
+        key = "paired_repeat_scan_snr" if paired_objective else "repeat_scan_snr"
+        return weights[key] != 0
+    if (
+        "normalized peak prominence" in normalized
+        or "prominence score" in normalized
+        or "snr score" in normalized
+    ):
+        return False  # Display-only normalization; Q uses raw prominence.
+    if "peak prominence" in normalized:
+        key = "paired_peak_prominence" if paired_objective else "peak_prominence"
+        return weights[key] != 0
     if "delta peak" in normalized:
-        return paired_objective and weights["delta_peak"] != 0
+        return paired_objective and weights["paired_peak_prominence"] != 0
     if "peak height" in normalized or normalized in {"peak ua", "peak µa"}:
         return (
-            paired_objective and weights["delta_peak"] != 0
+            paired_objective and weights["paired_peak_prominence"] != 0
         ) or (classic_enabled and weights["peak"] != 0)
     if "raw snr" in normalized or "snr raw" in normalized or normalized == "snr":
-        return classic_enabled and weights["snr"] != 0
-    if "snr score" in normalized:
-        return False  # Display-only normalization; Classic Q uses raw SNR.
+        return classic_enabled and weights["peak_prominence"] != 0
     if "shape" in normalized:
         return classic_enabled and weights["shape"] != 0
     if "baseline" in normalized:
@@ -17005,6 +19000,115 @@ def _surrogate_valid_plot_frame(
     return valid.dropna(subset=plot_columns)
 
 
+def _session_candidate_count(
+    session: dict,
+    group_id: int | None = None,
+) -> Any:
+    """Return effective candidate counts, preferring per-group metadata."""
+    state = session.get("state") or {}
+    config = session.get("config") or {}
+    acquisition = config.get("acquisition") or {}
+    counts_by_group = state.get("candidate_counts_by_group") or {}
+    state_groups = state.get("channel_groups") or []
+    config_groups = config.get("channel_groups") or []
+    history = session.get("history")
+
+    def groups_by_id(raw_groups: Sequence[Any]) -> dict[int, Mapping[str, Any]]:
+        result = {}
+        for raw_group in raw_groups:
+            if not isinstance(raw_group, Mapping):
+                continue
+            try:
+                result[int(raw_group.get("id", 1))] = raw_group
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    state_groups_by_id = groups_by_id(state_groups)
+    config_groups_by_id = groups_by_id(config_groups)
+    history_counts: dict[int, Any] = {}
+    if (
+        isinstance(history, pd.DataFrame)
+        and not history.empty
+        and "group_id" in history.columns
+        and "candidate_pool_size" in history.columns
+    ):
+        for raw_group_id, rows in history.groupby("group_id", dropna=True):
+            numeric_group_id = _finite_float(raw_group_id)
+            values = pd.to_numeric(
+                rows["candidate_pool_size"],
+                errors="coerce",
+            ).dropna()
+            if numeric_group_id is not None and not values.empty:
+                history_counts[int(numeric_group_id)] = values.iloc[-1]
+
+    def group_candidate_count(candidate_group_id: int) -> Any:
+        explicit_count = counts_by_group.get(str(candidate_group_id))
+        if explicit_count is None:
+            explicit_count = counts_by_group.get(candidate_group_id)
+        if explicit_count is not None:
+            return explicit_count
+        if candidate_group_id in history_counts:
+            return history_counts[candidate_group_id]
+        for group_mapping in (state_groups_by_id, config_groups_by_id):
+            raw_group = group_mapping.get(candidate_group_id)
+            if raw_group is not None:
+                requested = raw_group.get("candidate_pool_size")
+                if requested is not None:
+                    return requested
+        requested = acquisition.get(
+            "candidate_pool_size",
+            config.get("candidate_pool_size"),
+        )
+        if requested is not None:
+            return requested
+        return state.get("candidate_count")
+
+    configured_group_ids = set(state_groups_by_id) | set(config_groups_by_id)
+    configured_group_ids.update(history_counts)
+    for raw_group_id in counts_by_group:
+        try:
+            configured_group_ids.add(int(raw_group_id))
+        except (TypeError, ValueError):
+            continue
+    for observation in session.get("observations") or []:
+        try:
+            configured_group_ids.add(int(observation.get("group_id", 1)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+    if group_id is not None:
+        resolved = group_candidate_count(int(group_id))
+        return resolved if resolved is not None else "—"
+
+    if configured_group_ids:
+        resolved_counts = [
+            group_candidate_count(candidate_group_id)
+            for candidate_group_id in sorted(configured_group_ids)
+        ]
+        numeric_counts = [
+            numeric
+            for value in resolved_counts
+            if (numeric := _finite_float(value)) is not None
+        ]
+        if numeric_counts:
+            minimum = min(numeric_counts)
+            maximum = max(numeric_counts)
+            if np.isclose(minimum, maximum):
+                return int(minimum) if float(minimum).is_integer() else minimum
+            minimum_label = f"{minimum:g}"
+            maximum_label = f"{maximum:g}"
+            return f"{minimum_label}–{maximum_label}"
+
+    requested = acquisition.get(
+        "candidate_pool_size",
+        config.get("candidate_pool_size"),
+    )
+    if requested is not None:
+        return requested
+    return state.get("candidate_count", "—")
+
+
 def _surrogate_candidate_accounting_text(
     session: dict,
     group: dict | None,
@@ -17043,7 +19147,7 @@ def _surrogate_candidate_accounting_text(
                 )
         except (TypeError, ValueError):
             continue
-    state_candidate_count = (session.get("state") or {}).get("candidate_count")
+    state_candidate_count = _session_candidate_count(session, group_id)
     valid = _surrogate_valid_plot_frame(
         predictions,
         value,
@@ -20292,10 +22396,164 @@ def _stabilize_gif_figure_layout(figure) -> None:
         )
 
 
+def _numeric_color_extent(values) -> tuple[float, float] | None:
+    """Return the finite extent of values used by a numeric colormap."""
+    try:
+        numeric = np.asarray(values, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return None
+    numeric = numeric[np.isfinite(numeric)]
+    if not numeric.size:
+        return None
+    return float(numeric.min()), float(numeric.max())
+
+
+def _expanded_color_extent(
+    minimum: float,
+    maximum: float,
+) -> tuple[float, float]:
+    """Keep constant-valued animations renderable without changing their center."""
+    if np.isclose(minimum, maximum):
+        padding = max(abs(minimum) * 0.05, 1e-9)
+        return minimum - padding, maximum + padding
+    return minimum, maximum
+
+
+def _plotly_colorscale_key(colorscale) -> str:
+    try:
+        return json.dumps(colorscale, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(colorscale)
+
+
+def _lock_gif_colormap_ranges(figures: Sequence[Any]) -> None:
+    """Use one finite min/max per distinct numeric colormap across GIF frames."""
+    matplotlib_groups: dict[tuple[str, str], list[tuple[Any, tuple[float, float]]]] = {}
+    plotly_groups: dict[tuple[str, str, str], list[tuple[Any, str, tuple[float, float]]]] = {}
+    coloraxis_groups: dict[tuple[str, str], list[tuple[Any, tuple[float, float]]]] = {}
+
+    for figure in figures:
+        if isinstance(figure, go.Figure):
+            for trace in figure.data:
+                marker = getattr(trace, "marker", None)
+                coloraxis_name = (
+                    getattr(marker, "coloraxis", None)
+                    or getattr(trace, "coloraxis", None)
+                )
+                if coloraxis_name:
+                    coloraxis = getattr(figure.layout, str(coloraxis_name), None)
+                    coloraxis_values = (
+                        getattr(marker, "color", None)
+                        if getattr(marker, "coloraxis", None)
+                        else getattr(trace, "z", None)
+                    )
+                    coloraxis_extent = _numeric_color_extent(coloraxis_values)
+                    if coloraxis is not None and coloraxis_extent is not None:
+                        title = _plotly_colorbar_title_text(
+                            getattr(coloraxis, "colorbar", None)
+                        ) or ""
+                        key = (
+                            str(title),
+                            _plotly_colorscale_key(
+                                getattr(coloraxis, "colorscale", None)
+                            ),
+                        )
+                        coloraxis_groups.setdefault(key, []).append(
+                            (coloraxis, coloraxis_extent)
+                        )
+                marker_scale = getattr(marker, "colorscale", None)
+                marker_extent = _numeric_color_extent(getattr(marker, "color", None))
+                if marker_scale is not None and marker_extent is not None:
+                    title = _plotly_colorbar_title_text(
+                        getattr(marker, "colorbar", None)
+                    ) or ""
+                    key = (
+                        "marker",
+                        str(title),
+                        _plotly_colorscale_key(marker_scale),
+                    )
+                    plotly_groups.setdefault(key, []).append(
+                        (marker, "marker", marker_extent)
+                    )
+
+                trace_scale = getattr(trace, "colorscale", None)
+                if trace_scale is None:
+                    continue
+                value_attribute = None
+                for candidate in ("intensity", "surfacecolor", "z", "value"):
+                    extent = _numeric_color_extent(getattr(trace, candidate, None))
+                    if extent is not None:
+                        value_attribute = candidate
+                        break
+                if value_attribute is None:
+                    continue
+                title = _plotly_colorbar_title_text(
+                    getattr(trace, "colorbar", None)
+                ) or ""
+                key = (
+                    "trace",
+                    str(title),
+                    _plotly_colorscale_key(trace_scale),
+                )
+                plotly_groups.setdefault(key, []).append(
+                    (trace, value_attribute, extent)
+                )
+            continue
+
+        for ax in getattr(figure, "axes", []):
+            if getattr(ax, "_colorbar", None) is not None:
+                continue
+            for mappable in (*getattr(ax, "images", []), *getattr(ax, "collections", [])):
+                extent = _numeric_color_extent(getattr(mappable, "get_array", lambda: None)())
+                cmap = getattr(mappable, "get_cmap", lambda: None)()
+                if extent is None or cmap is None or not hasattr(mappable, "set_clim"):
+                    continue
+                colorbar = getattr(mappable, "colorbar", None)
+                label = ""
+                if colorbar is not None:
+                    try:
+                        label = colorbar.ax.get_ylabel() or colorbar.ax.get_xlabel() or ""
+                    except Exception:
+                        label = ""
+                key = (str(label), str(getattr(cmap, "name", cmap)))
+                matplotlib_groups.setdefault(key, []).append((mappable, extent))
+
+    for entries in matplotlib_groups.values():
+        minimum, maximum = _expanded_color_extent(
+            min(extent[0] for _mappable, extent in entries),
+            max(extent[1] for _mappable, extent in entries),
+        )
+        for mappable, _extent in entries:
+            mappable.set_clim(minimum, maximum)
+
+    for entries in plotly_groups.values():
+        minimum, maximum = _expanded_color_extent(
+            min(extent[0] for _target, _attribute, extent in entries),
+            max(extent[1] for _target, _attribute, extent in entries),
+        )
+        for target, attribute, _extent in entries:
+            if attribute == "z" and hasattr(target, "zmin"):
+                target.zmin = minimum
+                target.zmax = maximum
+            else:
+                target.cmin = minimum
+                target.cmax = maximum
+
+    for entries in coloraxis_groups.values():
+        minimum, maximum = _expanded_color_extent(
+            min(extent[0] for _coloraxis, extent in entries),
+            max(extent[1] for _coloraxis, extent in entries),
+        )
+        for coloraxis, _extent in entries:
+            coloraxis.cmin = minimum
+            coloraxis.cmax = maximum
+
+
 def _figures_to_gif(
     figures,
     duration_ms: int,
     *,
+    lock_colormap_range: bool = True,
     plotly_width: int = 1000,
     plotly_height: int = 700,
     matplotlib_width: int | None = None,
@@ -20304,9 +22562,12 @@ def _figures_to_gif(
     total_frames: int | None = None,
     progress_callback=None,
 ) -> bytes:
-    """Render Matplotlib/Plotly figures and encode an animated GIF."""
+    """Render figures and encode a GIF, optionally sharing colormap ranges."""
     from PIL import Image
 
+    figures = list(figures)
+    if lock_colormap_range:
+        _lock_gif_colormap_ranges(figures)
     frames = []
     for frame_index, figure in enumerate(figures, start=1):
         _stabilize_gif_figure_layout(figure)
@@ -20407,6 +22668,716 @@ def _figures_to_gif(
         optimize=False,
     )
     return output.getvalue()
+
+
+def _rescore_default_scoring(config: Mapping[str, Any]) -> dict:
+    scoring = json.loads(json.dumps(config.get("scoring") or {}))
+    mode = str(scoring.get("mode", "classic") or "classic")
+    channel = dict(scoring.get("channel_weights") or {})
+    paired = dict(scoring.get("paired_response_weights") or {})
+    run = dict(scoring.get("run_weights") or {})
+    if (
+        "standard_quality" in paired
+        and "buffer_classic_Q" not in paired
+        and "target_classic_Q" not in paired
+    ):
+        legacy = max(0.0, float(paired.get("standard_quality", 0.0) or 0.0))
+        paired["buffer_classic_Q"] = legacy / 2
+        paired["target_classic_Q"] = legacy / 2
+    signal_mode = mode.strip().lower() == "signal_priority_unbounded"
+    return {
+        "mode": "signal_priority_unbounded" if signal_mode else "classic",
+        "channel_weights": {
+            "peak_prominence": float(channel.get("peak_prominence", channel.get("snr", .45 if signal_mode else .35))),
+            "repeat_scan_snr": float(channel.get("repeat_scan_snr", 0.0)),
+            "peak_height": float(channel.get("peak_height", .35 if signal_mode else 0.0)),
+            "peak_shape": float(channel.get("peak_shape", .05 if signal_mode else .20)),
+            "baseline": float(channel.get("baseline", .12 if signal_mode else .20)),
+            "replicate_consistency": float(channel.get("replicate_consistency", .03 if signal_mode else .15)),
+            "success": float(channel.get("success", 0.0 if signal_mode else .10)),
+            "noise_penalty": float(channel.get("noise_penalty", 0.0)),
+            "peak_prominence_saturation": float(channel.get("peak_prominence_saturation", channel.get("snr_saturation", 20.0))),
+        },
+        "paired_response_weights": {
+            "buffer_classic_Q": float(paired.get("buffer_classic_Q", .25)),
+            "target_classic_Q": float(paired.get("target_classic_Q", .25)),
+            "peak_prominence": float(paired.get("peak_prominence", paired.get("delta_peak", 1.0))),
+            "repeat_scan_snr": float(paired.get("repeat_scan_snr", 0.0)),
+            "repeat_scan_snr_definition": str(
+                paired.get("repeat_scan_snr_definition", "original")
+                or "original"
+            ),
+            "pairwise_std_floor_uA": float(
+                paired.get("pairwise_std_floor_uA", 0.01)
+            ),
+            "lambda_repeat_std": float(paired.get("lambda_repeat_std", run.get("lambda_repeat_std", 0.0))),
+        },
+        "run_weights": {
+            "lambda_variability": float(run.get("lambda_variability", .20)),
+            "lambda_repeat_std": float(run.get("lambda_repeat_std", 0.0)),
+            "lambda_failed": float(run.get("lambda_failed", .40)),
+            "lambda_low": float(run.get("lambda_low", .20)),
+            "low_channel_threshold": float(run.get("low_channel_threshold", .50)),
+        },
+    }
+
+
+def _atomic_json_write(path: Path, payload: Any) -> None:
+    temporary = path.with_name(f".{path.name}.rescore.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _rescore_cache_path(session: Mapping[str, Any]) -> Path:
+    """Return the legacy on-disk cache path, retained only for cleanup."""
+    return Path(session["root"]) / "bo_rescore_cache.json"
+
+
+def _rescore_memory_key(session: Mapping[str, Any]) -> str:
+    root_token = hashlib.sha1(
+        str(Path(session["root"]).expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"bo_rescore_profiles_{root_token}"
+
+
+def _load_rescore_profiles(session: Mapping[str, Any]) -> dict[str, dict]:
+    profiles = st.session_state.get(_rescore_memory_key(session), {})
+    if not isinstance(profiles, dict):
+        return {}
+    normalized = copy.deepcopy(profiles)
+    changed = False
+    for profile_id, profile in list(normalized.items()):
+        is_calculated_profile = bool(
+            isinstance(profile, Mapping)
+            and "scoring" in profile
+            and "results" in profile
+        )
+        if (
+            is_calculated_profile
+            and int(profile.get("cache_version", 0) or 0) != RESCORE_CACHE_VERSION
+        ):
+            normalized.pop(profile_id, None)
+            changed = True
+    used_labels: set[str] = set()
+    next_number = 1
+    for profile in normalized.values():
+        label = str(profile.get("label") or "")
+        automatic = re.fullmatch(
+            r"\s*rescore\s+(\d+)\s*",
+            label,
+            flags=re.IGNORECASE,
+        )
+        label_key = label.strip().casefold()
+        if automatic and label_key in used_labels:
+            while f"rescore {next_number}" in used_labels:
+                next_number += 1
+            label = f"Rescore {next_number}"
+            profile["label"] = label
+            label_key = label.casefold()
+            changed = True
+        used_labels.add(label_key)
+        if automatic:
+            next_number = max(next_number, int(automatic.group(1)) + 1)
+    if changed:
+        st.session_state[_rescore_memory_key(session)] = copy.deepcopy(normalized)
+    return normalized
+
+
+def _store_rescore_profiles(
+    session: Mapping[str, Any],
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> None:
+    st.session_state[_rescore_memory_key(session)] = copy.deepcopy(dict(profiles))
+
+
+def _clear_rescore_profiles(session: Mapping[str, Any]) -> None:
+    """Remove the disposable rescore cache for a new browser page session."""
+    st.session_state.pop(_rescore_memory_key(session), None)
+    _rescore_cache_path(session).unlink(missing_ok=True)
+
+
+def _rescore_profile_id(scoring: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        {"cache_version": RESCORE_CACHE_VERSION, "scoring": scoring},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _next_rescore_label(profiles: Mapping[str, Mapping[str, Any]]) -> str:
+    """Return a unique, increasing default label for a new cached rescore."""
+    numbered_labels = []
+    for profile in profiles.values():
+        match = re.fullmatch(
+            r"\s*rescore\s+(\d+)\s*",
+            str(profile.get("label") or ""),
+            flags=re.IGNORECASE,
+        )
+        if match:
+            numbered_labels.append(int(match.group(1)))
+    next_number = max([len(profiles), *numbered_labels], default=0) + 1
+    return f"Rescore {next_number}"
+
+
+def _resolved_rescore_label(
+    requested_label: str,
+    requested_profile_id: str,
+    profiles: Mapping[str, Mapping[str, Any]],
+    active_profile: Mapping[str, Any] | None,
+) -> str:
+    """Keep rename behavior, but advance the label for newly changed settings."""
+    requested = str(requested_label or "").strip()
+    existing = profiles.get(requested_profile_id)
+    if existing:
+        return requested or str(existing.get("label") or "")
+    active_label = str((active_profile or {}).get("label") or "").strip()
+    if not requested or (active_profile and requested == active_label):
+        return _next_rescore_label(profiles)
+    return requested
+
+
+def _cache_rescore_profile(
+    session: Mapping[str, Any],
+    scoring: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+    label: str | None = None,
+) -> dict:
+    profiles = _load_rescore_profiles(session)
+    profile_id = _rescore_profile_id(scoring)
+    existing = profiles.get(profile_id) or {}
+    clean_observations = []
+    for observation in observations:
+        clean_observations.append({
+            "method_id": observation.get("method_id"),
+            "group_id": int(observation.get("group_id", 1) or 1),
+            "iteration": int(observation.get("iteration", 0) or 0),
+            "Q_run": observation.get("Q_run"),
+            "quality": observation.get("quality") or {},
+            "skipped": bool(observation.get("_viewer_rescore_skipped")),
+        })
+    profile = {
+        "id": profile_id,
+        "cache_version": RESCORE_CACHE_VERSION,
+        "label": str(label or existing.get("label") or _next_rescore_label(profiles)),
+        "created_at": existing.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "scoring": json.loads(json.dumps(scoring)),
+        "results": clean_observations,
+    }
+    profiles[profile_id] = profile
+    _store_rescore_profiles(session, profiles)
+    return profile
+
+
+def _delete_rescore_profile(session: Mapping[str, Any], profile_id: str) -> None:
+    profiles = _load_rescore_profiles(session)
+    profiles.pop(str(profile_id), None)
+    _store_rescore_profiles(session, profiles)
+
+
+def _rename_rescore_profile(
+    session: Mapping[str, Any],
+    profile_id: str,
+    label: str,
+) -> dict:
+    profiles = _load_rescore_profiles(session)
+    profile = profiles[str(profile_id)]
+    profile["label"] = str(label or profile.get("label") or profile_id)
+    profile["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _store_rescore_profiles(session, profiles)
+    return profile
+
+
+def _session_with_rescore_profile(
+    session: Mapping[str, Any],
+    profile: Mapping[str, Any] | None,
+) -> dict:
+    if not profile:
+        return dict(session)
+    result_lookup = {
+        (
+            str(item.get("method_id") or ""),
+            int(item.get("group_id", 1) or 1),
+            int(item.get("iteration", 0) or 0),
+        ): item
+        for item in profile.get("results") or []
+        if isinstance(item, dict)
+    }
+    observations = []
+    for original in session.get("observations") or []:
+        observation = copy.deepcopy(original)
+        key = (
+            str(observation.get("method_id") or ""),
+            int(observation.get("group_id", 1) or 1),
+            int(observation.get("iteration", 0) or 0),
+        )
+        cached = result_lookup.get(key)
+        if cached and not cached.get("skipped"):
+            _apply_rescored_quality_to_observation(
+                observation,
+                cached.get("quality") or {"Q_run": cached.get("Q_run")},
+            )
+        observations.append(observation)
+    rescored = dict(session)
+    rescored["observations"] = observations
+    rescored["config"] = json.loads(json.dumps(session.get("config") or {}))
+    rescored["config"]["scoring"] = json.loads(json.dumps(profile.get("scoring") or {}))
+    rescored["active_rescore_profile"] = dict(profile)
+    rescored["history"] = _observation_table({**rescored, "history": session.get("history")})
+    return rescored
+
+
+def _persist_rescored_bo_session(
+    session: Mapping[str, Any],
+    rescored_observations: Sequence[Mapping[str, Any]],
+    scoring: Mapping[str, Any],
+) -> list[Path]:
+    root = Path(session["root"])
+    state_path = root / "bo_state.json"
+    config_path = root / "bo_config_snapshot.json"
+    history_path = root / "history.csv"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    backups = []
+    for source in (state_path, config_path, history_path):
+        if source.is_file():
+            backup = source.with_name(f"{source.stem}.before_rescore_{timestamp}{source.suffix}")
+            shutil.copy2(source, backup)
+            backups.append(backup)
+
+    state = json.loads(json.dumps(session.get("state") or {}))
+    config = json.loads(json.dumps(session.get("config") or {}))
+    observations = json.loads(json.dumps(list(rescored_observations)))
+    for observation in observations:
+        observation.pop("_viewer_rescore_skipped", None)
+    config["scoring"] = json.loads(json.dumps(scoring))
+    state["observations"] = observations
+    q_by_method = {
+        str(observation.get("method_id")): observation.get("Q_run")
+        for observation in observations
+        if observation.get("method_id") is not None
+    }
+    for suggestion in state.get("suggestions") or []:
+        method_id = str(suggestion.get("method_id"))
+        if method_id in q_by_method:
+            suggestion["Q_run"] = q_by_method[method_id]
+    if observations:
+        direction = _rescore_direction(
+            (config.get("acquisition") or {}).get("optimization_direction")
+        )
+        key_function = (
+            (lambda observation: -float(observation.get("Q_run", 0.0)))
+            if direction == "minimize"
+            else (
+                lambda observation: abs(float(observation.get("Q_run", 0.0)))
+            ) if direction == "survey"
+            else (lambda observation: float(observation.get("Q_run", 0.0)))
+        )
+        state["best_observation"] = max(observations, key=key_function)
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    rescored_session = dict(session)
+    rescored_session["observations"] = observations
+    rescored_session["config"] = config
+    rescored_history = _observation_table(rescored_session)
+
+    _atomic_json_write(config_path, config)
+    _atomic_json_write(state_path, state)
+    temporary_history = history_path.with_name(f".{history_path.name}.rescore.tmp")
+    rescored_history.to_csv(temporary_history, index=False)
+    os.replace(temporary_history, history_path)
+    return backups
+
+
+def _render_rescore_q_tab(session: Mapping[str, Any]) -> None:
+    st.subheader("Rescore recorded Q values")
+    st.caption(
+        "Adjust scoring weights and preview every completed observation. "
+        "Cached comparisons are stored separately; canonical session Q values do "
+        "not change until Save rescored session is clicked."
+    )
+    root_token = hashlib.sha1(str(session["root"]).encode("utf-8")).hexdigest()[:12]
+    prefix = f"bo_rescore_{root_token}"
+    active_key = f"{prefix}_active_profile"
+    pending_active_key = f"{prefix}_pending_active_profile"
+    profiles = _load_rescore_profiles(session)
+    profile_options = ["original", *profiles]
+    active_profile_id = st.session_state.get(active_key, "original")
+    if active_profile_id not in profile_options:
+        active_profile_id = "original"
+    active_profile = profiles.get(active_profile_id)
+    active_label = (
+        str(active_profile.get("label"))
+        if active_profile
+        else "Original recorded Q"
+    )
+    active_columns = st.columns([4, 1])
+    active_columns[0].info(
+        f"Active scoring view: {active_label}. Change this with the scoring selector "
+        "at the top of the app."
+    )
+    if active_profile and active_columns[1].button(
+        "Delete",
+        key=f"{prefix}_delete_profile",
+        use_container_width=True,
+    ):
+        _delete_rescore_profile(session, active_profile_id)
+        st.session_state[pending_active_key] = "original"
+        st.rerun()
+
+    original_defaults = _rescore_default_scoring(session.get("config") or {})
+    controls_config = json.loads(json.dumps(session.get("config") or {}))
+    if active_profile:
+        controls_config["scoring"] = active_profile.get("scoring") or {}
+    defaults = _rescore_default_scoring(controls_config)
+    flash_key = f"{prefix}_flash"
+    if st.session_state.get(flash_key):
+        st.success(st.session_state.pop(flash_key))
+    controls_profile_key = f"{prefix}_controls_profile"
+    if st.session_state.get(controls_profile_key) != active_profile_id:
+        st.session_state[f"{prefix}_cache_label"] = (
+            str(active_profile.get("label"))
+            if active_profile else _next_rescore_label(profiles)
+        )
+        st.session_state[f"{prefix}_mode"] = defaults["mode"]
+        for section in (
+            "channel_weights",
+            "paired_response_weights",
+            "run_weights",
+        ):
+            for name, value in defaults[section].items():
+                st.session_state[f"{prefix}_{section}_{name}"] = (
+                    str(value)
+                    if name == "repeat_scan_snr_definition"
+                    else float(value)
+                )
+        st.session_state[controls_profile_key] = active_profile_id
+    if st.button(
+        "Reset controls to saved session weights",
+        key=f"{prefix}_reset_controls",
+    ):
+        st.session_state[f"{prefix}_cache_label"] = _next_rescore_label(profiles)
+        st.session_state[f"{prefix}_mode"] = original_defaults["mode"]
+        for section in (
+            "channel_weights",
+            "paired_response_weights",
+            "run_weights",
+        ):
+            for name, value in original_defaults[section].items():
+                st.session_state[f"{prefix}_{section}_{name}"] = (
+                    str(value)
+                    if name == "repeat_scan_snr_definition"
+                    else float(value)
+                )
+        st.session_state[controls_profile_key] = "original"
+        st.rerun()
+
+    form = st.form(f"{prefix}_form", clear_on_submit=False)
+    cache_label = form.text_input(
+        "Cached rescore name",
+        value=(
+            str(active_profile.get("label"))
+            if active_profile else _next_rescore_label(profiles)
+        ),
+        key=f"{prefix}_cache_label",
+        help="The same scoring settings reuse one cache entry; changing its name renames it.",
+    )
+    mode = form.selectbox(
+        "Classic Q scoring mode",
+        ["classic", "signal_priority_unbounded"],
+        index=0 if defaults["mode"] == "classic" else 1,
+        key=f"{prefix}_mode",
+        format_func=lambda value: value.replace("_", " ").title(),
+    )
+
+    def weight_input(container, label: str, section: str, name: str, step: float = .05):
+        return float(container.number_input(
+            label,
+            value=float(defaults[section][name]),
+            step=step,
+            format="%.6g",
+            key=f"{prefix}_{section}_{name}",
+        ))
+
+    form.markdown("#### Classic channel Q weights")
+    classic_columns = form.columns(3)
+    channel_weights = {
+        "peak_prominence": weight_input(classic_columns[0], "Peak prominence", "channel_weights", "peak_prominence"),
+        "repeat_scan_snr": weight_input(classic_columns[1], "Repeat-scan SNR", "channel_weights", "repeat_scan_snr"),
+        "peak_height": weight_input(classic_columns[2], "Peak height", "channel_weights", "peak_height"),
+        "peak_shape": weight_input(classic_columns[0], "Peak shape", "channel_weights", "peak_shape"),
+        "baseline": weight_input(classic_columns[1], "Baseline stability", "channel_weights", "baseline"),
+        "replicate_consistency": weight_input(classic_columns[2], "Replicate consistency", "channel_weights", "replicate_consistency"),
+        "success": weight_input(classic_columns[0], "Success", "channel_weights", "success"),
+        "noise_penalty": weight_input(classic_columns[1], "Noise penalty", "channel_weights", "noise_penalty"),
+        "peak_prominence_saturation": weight_input(classic_columns[2], "Prominence saturation", "channel_weights", "peak_prominence_saturation", 1.0),
+    }
+    form.markdown("#### Paired-response Q weights")
+    paired_columns = form.columns(3)
+    saved_snr_definition = str(
+        defaults["paired_response_weights"]["repeat_scan_snr_definition"]
+    ).strip().lower()
+    repeat_snr_definition = paired_columns[0].selectbox(
+        "Paired repeat-scan SNR definition",
+        ["original", "pairwise"],
+        index=1 if saved_snr_definition == "pairwise" else 0,
+        key=f"{prefix}_paired_response_weights_repeat_scan_snr_definition",
+        format_func=lambda value: (
+            "Original: Δpeak / (buffer STD + target STD)"
+            if value == "original"
+            else "Pairwise target − buffer differences"
+        ),
+    )
+    paired_weights = {
+        "buffer_classic_Q": weight_input(paired_columns[0], "Buffer classic Q", "paired_response_weights", "buffer_classic_Q"),
+        "target_classic_Q": weight_input(paired_columns[1], "Target classic Q", "paired_response_weights", "target_classic_Q"),
+        "peak_prominence": weight_input(paired_columns[2], "Paired peak prominence", "paired_response_weights", "peak_prominence"),
+        "repeat_scan_snr": weight_input(paired_columns[1], "Paired repeat-scan SNR", "paired_response_weights", "repeat_scan_snr"),
+        "repeat_scan_snr_definition": repeat_snr_definition,
+        "pairwise_std_floor_uA": weight_input(
+            paired_columns[2],
+            "Pairwise STD regularization floor (µA)",
+            "paired_response_weights",
+            "pairwise_std_floor_uA",
+            0.001,
+        ),
+        "lambda_repeat_std": weight_input(paired_columns[1], "Paired repeat-STD penalty", "paired_response_weights", "lambda_repeat_std"),
+    }
+    form.markdown("#### Run-level penalties")
+    run_columns = form.columns(3)
+    run_weights = {
+        "lambda_variability": weight_input(run_columns[0], "Channel variability", "run_weights", "lambda_variability"),
+        "lambda_repeat_std": weight_input(run_columns[1], "Repeat relative-STD", "run_weights", "lambda_repeat_std"),
+        "lambda_failed": weight_input(run_columns[2], "Failed-channel fraction", "run_weights", "lambda_failed"),
+        "lambda_low": weight_input(run_columns[0], "Poor-channel fraction", "run_weights", "lambda_low"),
+        "low_channel_threshold": weight_input(run_columns[1], "Poor-channel threshold", "run_weights", "low_channel_threshold"),
+    }
+    scoring = json.loads(json.dumps(
+        (session.get("config") or {}).get("scoring") or {}
+    ))
+    scoring["mode"] = mode
+    scoring.setdefault("channel_weights", {}).update(channel_weights)
+    scoring.setdefault("paired_response_weights", {}).update(paired_weights)
+    scoring.setdefault("run_weights", {}).update(run_weights)
+    submitted = form.form_submit_button("Run and cache rescore", use_container_width=True)
+    if submitted:
+        progress_bar = st.progress(0.0, text="Preparing rescore...")
+        rescore_started_at = time.perf_counter()
+        try:
+            requested_profile_id = _rescore_profile_id(scoring)
+            current_profiles = _load_rescore_profiles(session)
+            existing_profile = current_profiles.get(requested_profile_id)
+            requested_label = _resolved_rescore_label(
+                cache_label,
+                requested_profile_id,
+                current_profiles,
+                active_profile,
+            )
+            if existing_profile:
+                progress_bar.progress(
+                    0.9,
+                    text="Found matching cached values. Activating profile...",
+                )
+                profile = _rename_rescore_profile(
+                    session,
+                    requested_profile_id,
+                    requested_label or str(existing_profile.get("label") or ""),
+                )
+            else:
+                observations_to_rescore = session.get("observations") or []
+                if str(
+                    (scoring.get("paired_response_weights") or {}).get(
+                        "repeat_scan_snr_definition",
+                        "original",
+                    )
+                ).strip().lower() == "pairwise":
+                    enriched_observations = []
+                    saved_analysis = _bo_analysis_settings(
+                        session.get("config") or {}
+                    )
+                    total_observations = len(observations_to_rescore)
+                    for observation_index, observation in enumerate(
+                        observations_to_rescore,
+                        start=1,
+                    ):
+                        enriched = observation
+                        if (
+                            str(observation.get("objective") or "").lower()
+                            == "paired_response"
+                        ):
+                            enriched = _observation_with_trace_peak_replicates(
+                                observation,
+                                _trace_paths(session, observation),
+                                saved_analysis,
+                            )
+                        enriched_observations.append(enriched)
+                        progress_bar.progress(
+                            min(
+                                0.2,
+                                0.2
+                                * observation_index
+                                / max(total_observations, 1),
+                            ),
+                            text=(
+                                "Recovering saved SWV replicate peaks "
+                                f"{observation_index:,} of {total_observations:,}..."
+                            ),
+                        )
+                    observations_to_rescore = enriched_observations
+
+                def update_rescore_progress(completed: int, total: int) -> None:
+                    fraction = completed / max(total, 1)
+                    progress_bar.progress(
+                        min(0.85, 0.2 + 0.65 * fraction),
+                        text=(
+                            f"Rescoring observation {completed:,} of {total:,}..."
+                        ),
+                    )
+
+                rescored = _rescore_observations(
+                    observations_to_rescore,
+                    session.get("config") or {},
+                    scoring,
+                    progress_callback=update_rescore_progress,
+                )
+                progress_bar.progress(0.9, text="Writing rescore cache...")
+                profile = _cache_rescore_profile(
+                    session,
+                    scoring,
+                    rescored,
+                    requested_label or None,
+                )
+            elapsed = time.perf_counter() - rescore_started_at
+            progress_bar.progress(
+                1.0,
+                text=(
+                    f"Rescore ready in {elapsed:.1f} seconds. "
+                    "Rebuilding plots with the selected profile..."
+                ),
+            )
+            # The active-profile selectbox has already been instantiated in this
+            # run, so apply its new value at the start of the next rerun.
+            st.session_state[pending_active_key] = profile["id"]
+            st.session_state[controls_profile_key] = profile["id"]
+            st.session_state[flash_key] = (
+                (
+                    "Reused cached values for "
+                    if existing_profile else "Calculated and cached "
+                )
+                + f"{profile['label']}. Other tabs now use this rescore."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Rescoring failed: {exc}")
+
+    if not active_profile:
+        st.info(
+            "Original recorded Q is active. Set the weights and click Run and cache "
+            "rescore to create a comparison profile."
+        )
+        return
+    active_session = _session_with_rescore_profile(session, active_profile)
+    rescored_observations = active_session["observations"]
+    cached_result_lookup = {
+        (
+            str(item.get("method_id") or ""),
+            int(item.get("group_id", 1) or 1),
+            int(item.get("iteration", 0) or 0),
+        ): item
+        for item in active_profile.get("results") or []
+    }
+    old_by_key = {
+        (int(obs.get("group_id", 1)), int(obs.get("iteration", 0))): obs
+        for obs in session.get("observations") or []
+    }
+    comparison_rows = []
+    for observation in rescored_observations:
+        key = (
+            int(observation.get("group_id", 1)),
+            int(observation.get("iteration", 0)),
+        )
+        cache_key = (
+            str(observation.get("method_id") or ""),
+            key[0],
+            key[1],
+        )
+        original_q = _finite_float((old_by_key.get(key) or {}).get("Q_run"))
+        rescored_q = float(observation.get("Q_run", 0.0))
+        comparison_rows.append({
+            "Group": key[0],
+            "Iteration": key[1],
+            "Objective": observation.get("objective"),
+            "Original Q": original_q,
+            "Rescored Q": rescored_q,
+            "Change": rescored_q - original_q if original_q is not None else None,
+            "Status": (
+                "Skipped: required metrics unavailable"
+                if (cached_result_lookup.get(cache_key) or {}).get("skipped")
+                else "Rescored"
+            ),
+        })
+    comparison = pd.DataFrame(comparison_rows)
+    st.markdown("#### Rescoring preview")
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
+    skipped_count = int((comparison["Status"] != "Rescored").sum()) if not comparison.empty else 0
+    if skipped_count:
+        st.warning(
+            f"{skipped_count} observation(s) do not contain the saved metrics required "
+            "for rescoring. Their existing Q values will be preserved."
+        )
+    equation_config = json.loads(json.dumps(session.get("config") or {}))
+    equation_config["scoring"] = active_profile["scoring"]
+    equation_columns = st.columns(2)
+    equation_columns[0].code(_classic_q_equation(equation_config), language=None)
+    equation_columns[1].code(_paired_q_equation(equation_config), language=None)
+    download_columns = st.columns(2)
+    download_columns[0].download_button(
+        "Download comparison CSV",
+        comparison.to_csv(index=False).encode("utf-8"),
+        file_name="rescored_q_comparison.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_columns[1].download_button(
+        "Download rescored observations JSON",
+        json.dumps([
+            {
+                key: value
+                for key, value in observation.items()
+            }
+            for observation in rescored_observations
+        ], indent=2).encode("utf-8"),
+        file_name="rescored_bo_observations.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    confirm = st.checkbox(
+        "I understand this will replace Q values in the loaded session",
+        key=f"{prefix}_confirm_save",
+    )
+    if st.button(
+        "Save rescored session",
+        type="primary",
+        disabled=not confirm,
+        use_container_width=True,
+        key=f"{prefix}_save",
+    ):
+        try:
+            backups = _persist_rescored_bo_session(
+                session,
+                rescored_observations,
+                active_profile["scoring"],
+            )
+            st.session_state[pending_active_key] = "original"
+            st.session_state[controls_profile_key] = "original"
+            st.session_state[flash_key] = (
+                f"Saved rescored Q values. Created {len(backups)} timestamped backup file(s)."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not save rescored session: {exc}")
 
 
 def _render_app_scrollbar_style() -> None:
@@ -20583,6 +23554,55 @@ def render_bo_session_app() -> None:
     except Exception as exc:
         st.error(str(exc))
         return
+    source_session = session
+    rescore_page_marker = "bo_rescore_cache_initialized_for_page"
+    # Older viewer versions persisted comparison profiles beside bo_state.json.
+    # Remove that legacy artifact on every load; current profiles live only in
+    # this browser page's Streamlit session state.
+    try:
+        _rescore_cache_path(source_session).unlink(missing_ok=True)
+    except OSError as exc:
+        st.warning(f"Could not remove the legacy rescore cache: {exc}")
+    if not st.session_state.get(rescore_page_marker):
+        try:
+            _clear_rescore_profiles(source_session)
+        except OSError as exc:
+            st.warning(f"Could not clear the saved rescore cache: {exc}")
+        for state_key in list(st.session_state.keys()):
+            if str(state_key).startswith("bo_rescore_"):
+                st.session_state.pop(state_key, None)
+        st.session_state[rescore_page_marker] = True
+    rescore_profiles = _load_rescore_profiles(source_session)
+    rescore_root_token = hashlib.sha1(
+        str(source_session["root"]).encode("utf-8")
+    ).hexdigest()[:12]
+    active_rescore_key = f"bo_rescore_{rescore_root_token}_active_profile"
+    pending_rescore_key = f"bo_rescore_{rescore_root_token}_pending_active_profile"
+    valid_rescore_options = ["original", *rescore_profiles]
+    pending_rescore_id = st.session_state.pop(pending_rescore_key, None)
+    if pending_rescore_id in valid_rescore_options:
+        st.session_state[active_rescore_key] = pending_rescore_id
+    if st.session_state.get(active_rescore_key) not in valid_rescore_options:
+        st.session_state[active_rescore_key] = "original"
+    active_rescore_id = st.selectbox(
+        "Scoring values shown throughout the analysis",
+        valid_rescore_options,
+        key=active_rescore_key,
+        format_func=lambda profile_id: (
+            "Original recorded Q"
+            if profile_id == "original"
+            else str(
+                (rescore_profiles.get(profile_id) or {}).get("label")
+                or profile_id
+            )
+        ),
+        help=(
+            "Switching scoring views reruns the complete app and refreshes plots in "
+            "every tab using the selected cached Q values."
+        ),
+    )
+    active_rescore_profile = rescore_profiles.get(active_rescore_id)
+    session = _session_with_rescore_profile(source_session, active_rescore_profile)
     _reset_bo_group_channel_selector_defaults(
         str(Path(selected_session_folder).expanduser().resolve())
     )
@@ -20591,6 +23611,14 @@ def render_bo_session_app() -> None:
     groups = _session_channel_groups(session)
     with st.sidebar:
         st.divider()
+        st.caption(
+            "Scoring view: "
+            + (
+                str(active_rescore_profile.get("label"))
+                if active_rescore_profile
+                else "Original recorded Q"
+            )
+        )
         if len(groups) > 1:
             group_ids = [group["id"] for group in groups]
             _preserve_valid_widget_value(
@@ -21070,12 +24098,13 @@ def render_bo_session_app() -> None:
         str(obs.get("objective", "")).lower() == "paired_response"
         for obs in observations
     )
-    q_values = [float(obs.get("Q_run", np.nan)) for obs in observations]
-    best_index = int(np.nanargmax(q_values))
-    best = observations[best_index]
+    best = _best_run_q_observation(observations)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Completed observations", len(observations))
-    c2.metric("Best Q", f"{best.get('Q_run', 0):.4g}")
+    best_q_label = (
+        "Best paired-response Q_run" if paired_objective else "Best Q_run"
+    )
+    c2.metric(best_q_label, f"{best.get('Q_run', 0):.4g}")
     best_group_name = best.get("group_name") or f"Group {best.get('group_id', 1)}"
     best_label = (
         f"{best_group_name} iter {best.get('iteration')}"
@@ -21083,7 +24112,15 @@ def render_bo_session_app() -> None:
         else best.get("iteration")
     )
     c3.metric("Best observation", best_label)
-    c4.metric("Candidates", session["state"].get("candidate_count", "—"))
+    c4.metric(
+        "Candidates",
+        _session_candidate_count(session, selected_group_id),
+        help=(
+            "Effective candidate count from per-group metadata. In the all-groups "
+            "view, a range is shown only when group counts differ. The legacy "
+            "session-wide count is used only as a final fallback."
+        ),
+    )
     simulation_channel_optima = _simulation_channel_optima_frame(full_session)
     if not simulation_channel_optima.empty:
         st.markdown("#### Simulation ground-truth optima")
@@ -21202,9 +24239,10 @@ def render_bo_session_app() -> None:
     observation_is_single = len(selected_observations) == 1
     iteration_options = scoped_iterations
     iteration_state_key = "bo_requested_observation_iteration"
-    overview, metadata_tab, traces, real_data, surrogate, simulation, gifs, pdf_export = st.tabs(
+    overview, rescore_tab, metadata_tab, traces, real_data, surrogate, simulation, gifs, pdf_export = st.tabs(
         [
             "History & scores",
+            "Rescore Q",
             "Optimization metadata",
             "SWV traces",
             "Real data landscapes",
@@ -21214,6 +24252,8 @@ def render_bo_session_app() -> None:
             "PDF Export",
         ]
     )
+    with rescore_tab:
+        _render_rescore_q_tab(source_session)
     with metadata_tab:
         st.subheader("Channel-group optimization metadata")
         optimization_metadata = _channel_group_optimization_metadata(
@@ -22150,6 +25190,38 @@ def render_bo_session_app() -> None:
                     "Reference lines remain fully opaque."
                 ),
             ))
+            moving_average_columns = st.columns([1, 2])
+            show_trend_moving_average = moving_average_columns[0].checkbox(
+                "Show moving average",
+                key=(
+                    f"bo_trend_moving_average_{trend_scope_key}_"
+                    f"{plot_metric_kind}_{plot_metric}"
+                ),
+                help=(
+                    "Adds a trailing moving-average line to every displayed trend. "
+                    "Channels and groups are smoothed independently."
+                ),
+            )
+            trend_moving_average_window = int(
+                moving_average_columns[1].number_input(
+                    "Moving-average window",
+                    min_value=2,
+                    max_value=1000,
+                    value=3,
+                    step=1,
+                    disabled=not show_trend_moving_average,
+                    key=(
+                        f"bo_trend_moving_average_window_{trend_scope_key}_"
+                        f"{plot_metric_kind}_{plot_metric}"
+                    ),
+                    help="Number of consecutive plotted observations in each trailing average.",
+                )
+            )
+            applied_moving_average_window = (
+                trend_moving_average_window
+                if show_trend_moving_average
+                else None
+            )
             trend_group_ids = (
                 tuple(
                     sorted(
@@ -22173,6 +25245,7 @@ def render_bo_session_app() -> None:
             )
             trend_render_gate_key = "bo_history_scores_large_plot_render_signature"
             trend_figure = None
+            trend_figures: list[tuple[str, go.Figure]] = []
             trend_events = []
             skip_large_trend_render = False
 
@@ -22292,27 +25365,92 @@ def render_bo_session_app() -> None:
                         tuple(trend_channels),
                         trend_group_ids,
                         trend_trace_opacity,
+                        applied_moving_average_window,
                     )
                     if _history_trend_render_allowed(
                         signature=trend_signature,
                         channel_count=len(trend_channels),
                         simulation_count=trend_simulation_count,
                     ):
-                        trend_figure = _plot_channel_trend(
-                            trend_history,
-                            plot_metric,
-                            channel_metrics[plot_metric],
-                            trend_channels,
-                            channel_layout,
-                            group_layout,
-                            group_color_values,
-                            group_color_label,
-                            group_average_values,
-                            group_average_label,
-                            reference_values_by_group=trend_reference_values_by_group,
-                            reference_label=trend_reference_label,
-                            trace_opacity=trend_trace_opacity,
+                        separate_channel_figures = channel_layout == "Separate plots"
+                        separate_group_figures = (
+                            group_layout == "Plot groups separately"
+                            and "group_id" in trend_history.columns
                         )
+                        channel_targets = (
+                            [(channel, [channel]) for channel in trend_channels]
+                            if separate_channel_figures
+                            else [(None, trend_channels)]
+                        )
+                        if separate_group_figures:
+                            group_targets = [
+                                (
+                                    group_id,
+                                    (
+                                        str(rows["group_name"].iloc[0])
+                                        if "group_name" in rows.columns
+                                        else f"Group {int(group_id)}"
+                                    ),
+                                    rows.copy(),
+                                )
+                                for group_id, rows in trend_history.groupby(
+                                    "group_id",
+                                    sort=True,
+                                )
+                            ]
+                        else:
+                            group_targets = [(None, "", trend_history)]
+                        for group_id, group_name, group_frame in group_targets:
+                            for channel, target_channels in channel_targets:
+                                figure = _plot_channel_trend(
+                                    group_frame,
+                                    plot_metric,
+                                    channel_metrics[plot_metric],
+                                    target_channels,
+                                    (
+                                        "Overlay selected channels"
+                                        if separate_channel_figures
+                                        else channel_layout
+                                    ),
+                                    (
+                                        "Plot groups overlaid"
+                                        if separate_group_figures
+                                        else group_layout
+                                    ),
+                                    group_color_values,
+                                    group_color_label,
+                                    group_average_values,
+                                    group_average_label,
+                                    reference_values_by_group=(
+                                        {
+                                            int(group_id): trend_reference_values_by_group[
+                                                int(group_id)
+                                            ]
+                                        }
+                                        if group_id is not None
+                                        and int(group_id) in trend_reference_values_by_group
+                                        else trend_reference_values_by_group
+                                    ),
+                                    reference_label=trend_reference_label,
+                                    trace_opacity=trend_trace_opacity,
+                                    moving_average_window=(
+                                        applied_moving_average_window
+                                    ),
+                                )
+                                title_parts = []
+                                if group_name:
+                                    title_parts.append(group_name)
+                                if channel is not None:
+                                    title_parts.append(f"Channel {channel}")
+                                figure_label = " — ".join(title_parts)
+                                if figure_label:
+                                    figure.update_layout(
+                                        title=(
+                                            f"{_metric_label(plot_metric)} — "
+                                            f"{figure_label}"
+                                        )
+                                    )
+                                trend_figures.append((figure_label, figure))
                     else:
                         skip_large_trend_render = True
                 else:
@@ -22345,55 +25483,118 @@ def render_bo_session_app() -> None:
                     group_average_label,
                     trend_group_ids,
                     trend_trace_opacity,
+                    applied_moving_average_window,
                 )
                 if _history_trend_render_allowed(
                     signature=trend_signature,
                     simulation_count=trend_simulation_count,
                 ):
-                    trend_figure = _plot_trend(
-                        trend_history,
-                        metric,
-                        group_layout,
-                        group_color_values,
-                        group_color_label,
-                        group_average_values,
-                        group_average_label,
-                        reference_value=trend_reference_value,
-                        reference_label=trend_reference_label,
-                        reference_values_by_group=trend_reference_values_by_group,
-                        trace_opacity=trend_trace_opacity,
-                    )
+                    if (
+                        group_layout == "Plot groups separately"
+                        and "group_id" in trend_history.columns
+                    ):
+                        for group_id, group_frame in trend_history.groupby(
+                            "group_id",
+                            sort=True,
+                        ):
+                            group_name = (
+                                str(group_frame["group_name"].iloc[0])
+                                if "group_name" in group_frame.columns
+                                else f"Group {int(group_id)}"
+                            )
+                            figure = _plot_trend(
+                                group_frame,
+                                metric,
+                                "Plot groups overlaid",
+                                group_color_values,
+                                group_color_label,
+                                group_average_values,
+                                group_average_label,
+                                reference_value=(
+                                    trend_reference_values_by_group.get(int(group_id))
+                                    if trend_reference_values_by_group
+                                    else trend_reference_value
+                                ),
+                                reference_label=trend_reference_label,
+                                trace_opacity=trend_trace_opacity,
+                                moving_average_window=(
+                                    applied_moving_average_window
+                                ),
+                            )
+                            figure.update_layout(
+                                title=f"{_metric_label(metric)} — {group_name}"
+                            )
+                            trend_figures.append((group_name, figure))
+                    else:
+                        trend_figure = _plot_trend(
+                            trend_history,
+                            metric,
+                            group_layout,
+                            group_color_values,
+                            group_color_label,
+                            group_average_values,
+                            group_average_label,
+                            reference_value=trend_reference_value,
+                            reference_label=trend_reference_label,
+                            reference_values_by_group=trend_reference_values_by_group,
+                            trace_opacity=trend_trace_opacity,
+                            moving_average_window=applied_moving_average_window,
+                        )
                 else:
                     skip_large_trend_render = True
             chart_key_suffix = (
                 f"{trend_scope_key}_{iteration_start}_{iteration_end}_"
-                f"{chart_key_suffix}"
+                f"{chart_key_suffix}_ma_"
+                f"{applied_moving_average_window or 'off'}"
             )
-            if trend_figure is not None and group_color_values is None:
-                trend_figure = _strip_categorical_plot_colorbars(trend_figure)
             if trend_figure is not None:
-                trend_y_limits = _manual_y_axis_range_control(
-                    "trend",
-                    f"bo_trend_{trend_scope_key}_{metric}",
-                    [trend_figure],
-                )
-                if trend_y_limits is not None:
-                    _apply_y_axis_range(trend_figure, *trend_y_limits)
-                    chart_key_suffix = (
-                        f"{chart_key_suffix}_ylim_{trend_y_limits[0]:g}_{trend_y_limits[1]:g}"
+                trend_figures.append(("", trend_figure))
+            if group_color_values is None:
+                trend_figures = [
+                    (label, _strip_categorical_plot_colorbars(figure))
+                    for label, figure in trend_figures
+                ]
+            if trend_figures:
+                trend_events = []
+                for figure_index, (figure_label, figure) in enumerate(
+                    trend_figures,
+                    start=1,
+                ):
+                    figure_token = _safe_download_stem(
+                        figure_label or f"trend_{figure_index}"
                     )
-                trend_events = [
-                    _render_downloadable_plotly(
+                    trend_y_limits = _manual_y_axis_range_control(
+                        (
+                            f"trend — {figure_label}"
+                            if figure_label
+                            else "trend"
+                        ),
+                        (
+                            f"bo_trend_{trend_scope_key}_{metric}_"
+                            f"{figure_token}"
+                        ),
+                        [figure],
+                    )
+                    if trend_y_limits is not None:
+                        _apply_y_axis_range(figure, *trend_y_limits)
+                    else:
+                        _fit_y_axis_to_figure(figure)
+                    trend_events.append(_render_downloadable_plotly(
                         st,
-                        trend_figure,
-                        key=f"bo_trend_{chart_key_suffix}",
-                        file_stem=f"history_scores_trend_{chart_key_suffix}",
+                        figure,
+                        key=(
+                            f"bo_trend_{chart_key_suffix}_{figure_index}_"
+                            f"{figure_token}"
+                        ),
+                        file_stem=(
+                            f"history_scores_trend_{chart_key_suffix}_"
+                            f"{figure_token}"
+                        ),
                         width_percent=plot_width_percent,
-                        export_height=int(trend_figure.layout.height or 520),
+                        export_height=int(figure.layout.height or 520),
                         on_select="rerun",
                         selection_mode="points",
-                    )
-                ]
+                    ))
                 trend_q_kind = _metric_q_kind(metric, paired_objective)
                 if trend_q_kind:
                     _render_q_equation(session["config"], trend_q_kind)
@@ -23821,7 +27022,8 @@ def render_bo_session_app() -> None:
                                         ),
                                     ))
                                     hp_gif_key = rendered_gif_key
-                                    generate_hp_gif = st.button(
+                                    hp_gif_actions = st.columns([1.15, 1.0])
+                                    generate_hp_gif = hp_gif_actions[0].button(
                                         "Generate hyperparameter response GIF",
                                         key=f"{hp_gif_key}_button",
                                     ) or bool(
@@ -23829,6 +27031,11 @@ def render_bo_session_app() -> None:
                                             hp_pending_gif_key,
                                             False,
                                         )
+                                    )
+                                    hp_gif_lock_colormap = hp_gif_actions[1].checkbox(
+                                        "Lock color range across frames",
+                                        value=True,
+                                        key=f"{hp_gif_key}_lock_colormap",
                                     )
                                     if generate_hp_gif:
                                         try:
@@ -23965,6 +27172,9 @@ def render_bo_session_app() -> None:
                                             gif_bytes = _figures_to_gif(
                                                 hp_gif_figures(),
                                                 hp_gif_duration,
+                                                lock_colormap_range=(
+                                                    hp_gif_lock_colormap
+                                                ),
                                                 plotly_width=hp_gif_width,
                                                 plotly_height=hp_gif_height,
                                                 total_frames=len(frame_rows),
@@ -24194,6 +27404,14 @@ def render_bo_session_app() -> None:
                     horizontal=True,
                     key=paired_layout_key,
                 )
+                paired_plot_difference = paired_form.checkbox(
+                    "Plot target − buffer difference",
+                    key=f"bo_paired_plot_difference_{paired_metric}",
+                    help=(
+                        "Plots the signed target metric minus the buffer metric "
+                        "at each iteration. This works with every display layout."
+                    ),
+                )
                 paired_render_signature = (
                     session["state"].get("session_id", session["root"].name),
                     trend_scope_key,
@@ -24204,6 +27422,7 @@ def render_bo_session_app() -> None:
                     paired_metric,
                     tuple(selected_paired_channels),
                     paired_layout,
+                    paired_plot_difference,
                 )
                 paired_render_key = "bo_paired_trends_render_signature"
                 if paired_form.form_submit_button(
@@ -24223,108 +27442,121 @@ def render_bo_session_app() -> None:
                     paired_events = []
                     paired_chart_suffix = (
                         f"{iteration_start}_{iteration_end}_{paired_metric}_{paired_layout}_"
+                        f"{'difference' if paired_plot_difference else 'phases'}_"
                         f"groups_{paired_group_token}_"
                         f"{'_'.join(selected_paired_channels) or 'none'}"
                     )
-                elif selected_paired_channels:
-                    paired_figure = _plot_paired_phase_trend(
-                        paired_series,
-                        paired_metric,
-                        selected_paired_channels,
-                        paired_layout,
-                    )
-                else:
-                    paired_figure = go.Figure()
-                    paired_figure.add_annotation(
-                        text="Select at least one buffer/target channel.",
-                        x=.5, y=.5, xref="paper", yref="paper", showarrow=False,
-                    )
-                    paired_figure.update_layout(height=360)
                 paired_chart_suffix = (
                     f"{iteration_start}_{iteration_end}_{paired_metric}_{paired_layout}_"
+                    f"{'difference' if paired_plot_difference else 'phases'}_"
                     f"groups_{paired_group_token}_"
                     f"{'_'.join(selected_paired_channels) or 'none'}"
                 )
                 if render_paired_trends:
-                    paired_figures = [paired_figure]
-                    paired_overlay_figure = None
-                    paired_separate_figure = None
-                    if (
-                        paired_layout == "Average selected channels"
-                        and selected_paired_channels
-                    ):
-                        paired_overlay_figure = _plot_paired_phase_trend(
-                            paired_series,
-                            paired_metric,
-                            selected_paired_channels,
-                            "Overlay selected channels",
+                    paired_render_figures: list[tuple[str, go.Figure]] = []
+                    if not selected_paired_channels:
+                        empty_figure = go.Figure()
+                        empty_figure.add_annotation(
+                            text="Select at least one buffer/target channel.",
+                            x=.5,
+                            y=.5,
+                            xref="paper",
+                            yref="paper",
+                            showarrow=False,
                         )
-                        paired_separate_figure = _plot_paired_phase_trend(
-                            paired_series,
-                            paired_metric,
-                            selected_paired_channels,
-                            "Separate plots",
-                        )
-                        paired_figures.extend([
-                            paired_overlay_figure,
-                            paired_separate_figure,
-                        ])
-                    paired_y_limits = _manual_y_axis_range_control(
-                        "buffer/target trend",
-                        f"bo_paired_trend_{paired_metric}_{paired_layout}",
-                        paired_figures,
-                    )
-                    if paired_y_limits is not None:
-                        for figure in paired_figures:
-                            _apply_y_axis_range(figure, *paired_y_limits)
-                        paired_chart_suffix = (
-                            f"{paired_chart_suffix}_ylim_"
-                            f"{paired_y_limits[0]:g}_{paired_y_limits[1]:g}"
-                        )
-                    paired_events = []
-                    if (
-                        paired_layout == "Average selected channels"
-                        and selected_paired_channels
-                    ):
-                        average_column, overlay_column = st.columns(2)
-                        paired_events.append(_render_downloadable_plotly(
-                            average_column,
-                            paired_figure,
-                            key=f"bo_paired_trend_{paired_chart_suffix}_average",
-                            file_stem=f"buffer_target_trend_{paired_chart_suffix}_average",
-                            width_percent=plot_width_percent,
-                            export_height=int(paired_figure.layout.height or 400),
-                            on_select="rerun",
-                            selection_mode="points",
-                        ))
-                        paired_events.append(_render_downloadable_plotly(
-                            overlay_column,
-                            paired_overlay_figure,
-                            key=f"bo_paired_trend_{paired_chart_suffix}_overlay",
-                            file_stem=f"buffer_target_trend_{paired_chart_suffix}_overlay",
-                            width_percent=plot_width_percent,
-                            export_height=int(paired_overlay_figure.layout.height or 400),
-                            on_select="rerun",
-                            selection_mode="points",
-                        ))
-                        paired_events.append(_render_downloadable_plotly(
-                            st,
-                            paired_separate_figure,
-                            key=f"bo_paired_trend_{paired_chart_suffix}_separate",
-                            file_stem=f"buffer_target_trend_{paired_chart_suffix}_separate",
-                            width_percent=plot_width_percent,
-                            export_height=int(paired_separate_figure.layout.height or 520),
-                            on_select="rerun",
-                            selection_mode="points",
-                        ))
+                        empty_figure.update_layout(height=360)
+                        paired_render_figures.append(("selection", empty_figure))
+                    elif paired_layout == "Separate plots":
+                        for channel in selected_paired_channels:
+                            channel_figure = _plot_paired_phase_trend(
+                                paired_series,
+                                paired_metric,
+                                [channel],
+                                "Overlay selected channels",
+                                paired_plot_difference,
+                            )
+                            channel_figure.update_layout(
+                                title=(
+                                    f"Buffer vs target {paired_metric} — "
+                                    f"Channel {channel}"
+                                )
+                            )
+                            paired_render_figures.append(
+                                (f"channel_{channel}", channel_figure)
+                            )
                     else:
+                        primary_figure = _plot_paired_phase_trend(
+                            paired_series,
+                            paired_metric,
+                            selected_paired_channels,
+                            paired_layout,
+                            paired_plot_difference,
+                        )
+                        paired_render_figures.append(
+                            (
+                                "average"
+                                if paired_layout == "Average selected channels"
+                                else "overlay",
+                                primary_figure,
+                            )
+                        )
+                        if paired_layout == "Average selected channels":
+                            paired_render_figures.append((
+                                "overlay",
+                                _plot_paired_phase_trend(
+                                    paired_series,
+                                    paired_metric,
+                                    selected_paired_channels,
+                                    "Overlay selected channels",
+                                    paired_plot_difference,
+                                ),
+                            ))
+                            for channel in selected_paired_channels:
+                                channel_figure = _plot_paired_phase_trend(
+                                    paired_series,
+                                    paired_metric,
+                                    [channel],
+                                    "Overlay selected channels",
+                                    paired_plot_difference,
+                                )
+                                channel_figure.update_layout(
+                                    title=(
+                                        f"Buffer vs target {paired_metric} — "
+                                        f"Channel {channel}"
+                                    )
+                                )
+                                paired_render_figures.append(
+                                    (f"channel_{channel}", channel_figure)
+                                )
+                    paired_events = []
+                    for figure_label, figure in paired_render_figures:
+                        figure_token = _safe_download_stem(figure_label)
+                        paired_y_limits = _manual_y_axis_range_control(
+                            f"buffer/target trend — {figure_label}",
+                            (
+                                f"bo_paired_trend_{paired_metric}_{paired_layout}_"
+                                f"{'difference' if paired_plot_difference else 'phases'}_"
+                                f"{figure_token}"
+                            ),
+                            [figure],
+                        )
+                        if paired_y_limits is not None:
+                            _apply_y_axis_range(figure, *paired_y_limits)
+                        else:
+                            _fit_y_axis_to_figure(figure)
                         paired_events.append(_render_downloadable_plotly(
                             st,
-                            paired_figure,
-                            key=f"bo_paired_trend_{paired_chart_suffix}",
-                            file_stem=f"buffer_target_trend_{paired_chart_suffix}",
+                            figure,
+                            key=(
+                                f"bo_paired_trend_{paired_chart_suffix}_"
+                                f"{figure_token}"
+                            ),
+                            file_stem=(
+                                f"buffer_target_trend_{paired_chart_suffix}_"
+                                f"{figure_token}"
+                            ),
                             width_percent=plot_width_percent,
-                            export_height=int(paired_figure.layout.height or 400),
+                            export_height=int(figure.layout.height or 400),
                             on_select="rerun",
                             selection_mode="points",
                         ))
@@ -24515,6 +27747,9 @@ def render_bo_session_app() -> None:
                     if chronological_points.empty:
                         st.info("No chronological values are available for this selection.")
                     else:
+                        chronological_render_figures: list[
+                            tuple[str, go.Figure]
+                        ] = []
                         if chronological_raw_points is not None:
                             chronological_average_figure = _plot_chronological(
                                 chronological_points,
@@ -24532,19 +27767,13 @@ def render_bo_session_app() -> None:
                                 chronological_show_fluid_exchange_lines,
                                 chronological_show_iteration_lines,
                             )
-                            chronological_separate_figure = _plot_chronological(
-                                chronological_raw_points,
-                                phase_transitions,
-                                chronological_metric,
-                                "Separate plots",
-                                chronological_show_fluid_exchange_lines,
-                                chronological_show_iteration_lines,
-                            )
-                            chronological_figures = [
-                                chronological_average_figure,
-                                chronological_overlay_figure,
-                                chronological_separate_figure,
-                            ]
+                            chronological_render_figures.extend([
+                                ("average", chronological_average_figure),
+                                ("overlay", chronological_overlay_figure),
+                            ])
+                            individual_points = chronological_raw_points
+                        elif chronological_mode == "Separate plots":
+                            individual_points = chronological_points
                         else:
                             chronological_figure = _plot_chronological(
                                 chronological_points,
@@ -24554,66 +27783,67 @@ def render_bo_session_app() -> None:
                                 chronological_show_fluid_exchange_lines,
                                 chronological_show_iteration_lines,
                             )
-                            chronological_figures = [chronological_figure]
-                        chronological_y_limits = _manual_y_axis_range_control(
-                            "chronological",
-                            f"bo_chronological_{chronological_metric}_{chronological_mode}",
-                            chronological_figures,
-                        )
-                        if chronological_y_limits is not None:
-                            for figure in chronological_figures:
-                                _apply_y_axis_range(figure, *chronological_y_limits)
-                            chronological_suffix = (
-                                f"{chronological_suffix}_ylim_"
-                                f"{chronological_y_limits[0]:g}_{chronological_y_limits[1]:g}"
+                            chronological_render_figures.append(
+                                ("overlay", chronological_figure)
                             )
+                            individual_points = None
+                        if individual_points is not None:
+                            available_individual_channels = set(
+                                individual_points["channel"].astype(str)
+                            )
+                            for channel in selected_chronological_channels:
+                                channel_text = str(channel)
+                                if channel_text not in available_individual_channels:
+                                    continue
+                                channel_points = individual_points.loc[
+                                    individual_points["channel"].astype(str)
+                                    == channel_text
+                                ].copy()
+                                channel_figure = _plot_chronological(
+                                    channel_points,
+                                    phase_transitions,
+                                    chronological_metric,
+                                    "Overlay selected channels",
+                                    chronological_show_fluid_exchange_lines,
+                                    chronological_show_iteration_lines,
+                                )
+                                channel_figure.update_layout(
+                                    title=(
+                                        f"Chronological {chronological_metric} — "
+                                        f"Channel {channel_text}"
+                                    )
+                                )
+                                chronological_render_figures.append(
+                                    (f"channel_{channel_text}", channel_figure)
+                                )
                         chronological_events = []
-                        if chronological_raw_points is not None:
-                            average_column, overlay_column = st.columns(2)
-                            chronological_events.append(_render_downloadable_plotly(
-                                average_column,
-                                chronological_average_figure,
-                                key=f"bo_chronological_{chronological_suffix}_average",
-                                file_stem=f"chronological_buffer_target_{chronological_suffix}_average",
-                                width_percent=plot_width_percent,
-                                export_height=int(
-                                    chronological_average_figure.layout.height or 420
+                        for figure_label, figure in chronological_render_figures:
+                            figure_token = _safe_download_stem(figure_label)
+                            chronological_y_limits = _manual_y_axis_range_control(
+                                f"chronological — {figure_label}",
+                                (
+                                    f"bo_chronological_{chronological_metric}_"
+                                    f"{chronological_mode}_{figure_token}"
                                 ),
-                                on_select="rerun",
-                                selection_mode="points",
-                            ))
-                            chronological_events.append(_render_downloadable_plotly(
-                                overlay_column,
-                                chronological_overlay_figure,
-                                key=f"bo_chronological_{chronological_suffix}_overlay",
-                                file_stem=f"chronological_buffer_target_{chronological_suffix}_overlay",
-                                width_percent=plot_width_percent,
-                                export_height=int(
-                                    chronological_overlay_figure.layout.height or 420
-                                ),
-                                on_select="rerun",
-                                selection_mode="points",
-                            ))
+                                [figure],
+                            )
+                            if chronological_y_limits is not None:
+                                _apply_y_axis_range(figure, *chronological_y_limits)
+                            else:
+                                _fit_y_axis_to_figure(figure)
                             chronological_events.append(_render_downloadable_plotly(
                                 st,
-                                chronological_separate_figure,
-                                key=f"bo_chronological_{chronological_suffix}_separate",
-                                file_stem=f"chronological_buffer_target_{chronological_suffix}_separate",
-                                width_percent=plot_width_percent,
-                                export_height=int(
-                                    chronological_separate_figure.layout.height or 560
+                                figure,
+                                key=(
+                                    f"bo_chronological_{chronological_suffix}_"
+                                    f"{figure_token}"
                                 ),
-                                on_select="rerun",
-                                selection_mode="points",
-                            ))
-                        else:
-                            chronological_events.append(_render_downloadable_plotly(
-                                st,
-                                chronological_figure,
-                                key=f"bo_chronological_{chronological_suffix}",
-                                file_stem=f"chronological_buffer_target_{chronological_suffix}",
+                                file_stem=(
+                                    f"chronological_buffer_target_"
+                                    f"{chronological_suffix}_{figure_token}"
+                                ),
                                 width_percent=plot_width_percent,
-                                export_height=int(chronological_figure.layout.height or 420),
+                                export_height=int(figure.layout.height or 420),
                                 on_select="rerun",
                                 selection_mode="points",
                             ))
@@ -24772,6 +28002,18 @@ def render_bo_session_app() -> None:
         @st.fragment
         def _render_swv_traces_tab() -> None:
             selected_group_label = selected_observation_group_scope_label
+            trace_settings_form = st.form(
+                key=(
+                    "bo_swv_trace_settings_form_"
+                    f"{selected_observation_group_scope}"
+                ),
+                clear_on_submit=False,
+                enter_to_submit=False,
+            )
+            trace_settings_form.caption(
+                "Adjust SWV plotting settings here, then click "
+                "Render SWV settings to redraw."
+            )
             trace_iteration_mode_options = [
                 "Selected observation iteration",
                 "Iteration range",
@@ -24794,13 +28036,15 @@ def render_bo_session_app() -> None:
                 trace_iteration_mode_options,
                 default_trace_iteration_mode,
             )
-            trace_iteration_mode = st.radio(
+            trace_iteration_mode = trace_settings_form.radio(
                 "SWV iterations to display",
                 trace_iteration_mode_options,
                 horizontal=True,
                 key=trace_iteration_mode_key,
             )
-            if trace_iteration_mode == "Iteration range" and len(scoped_iterations) >= 2:
+            trace_iteration_start = int(scoped_iterations[0])
+            trace_iteration_end = int(scoped_iterations[-1])
+            if len(scoped_iterations) >= 2:
                 selected_iteration_for_default = (
                     int(selected_iteration_scope)
                     if selected_iteration_scope != "all"
@@ -24816,7 +28060,7 @@ def render_bo_session_app() -> None:
                     if selected_iteration_scope == "all"
                     else selected_iteration_for_default
                 )
-                range_columns = st.columns(2)
+                range_columns = trace_settings_form.columns(2)
                 trace_iteration_start_input = range_columns[0].number_input(
                     "Iteration start",
                     min_value=int(scoped_iterations[0]),
@@ -24845,6 +28089,10 @@ def render_bo_session_app() -> None:
                         int(trace_iteration_end_input),
                     )
                 )
+                trace_settings_form.caption(
+                    "Iteration start and end apply when Iteration range is selected."
+                )
+            if trace_iteration_mode == "Iteration range":
                 trace_observations = [
                     obs for obs in group_scoped_observations
                     if trace_iteration_start
@@ -24881,7 +28129,14 @@ def render_bo_session_app() -> None:
                 ),
             )
             if not trace_observations:
-                st.info("No observations match the selected SWV iteration range.")
+                trace_settings_form.info(
+                    "No observations match the selected SWV iteration range."
+                )
+                trace_settings_form.form_submit_button(
+                    "Render SWV settings",
+                    use_container_width=True,
+                    disabled=True,
+                )
                 return
             trace_focus_observation = trace_observations[-1]
             trace_all_mode = len(trace_observations) > 1
@@ -24913,9 +28168,14 @@ def render_bo_session_app() -> None:
                     key=_channel_sort_key,
                 )
             if not available_traces:
-                st.info(
+                trace_settings_form.info(
                     "No locally accessible raw SWV files were found for this selection. "
                     "The recorded CSVs must remain inside or beside the experiment folder."
+                )
+                trace_settings_form.form_submit_button(
+                    "Render SWV settings",
+                    use_container_width=True,
+                    disabled=True,
                 )
             else:
                 trace_phase_options = {
@@ -24938,7 +28198,7 @@ def render_bo_session_app() -> None:
                         list(trace_phase_options),
                         selected_trace_phase_label,
                     )
-                    selected_trace_phase_label = st.radio(
+                    selected_trace_phase_label = trace_settings_form.radio(
                         "Paired trace phases",
                         list(trace_phase_options),
                         horizontal=True,
@@ -24980,7 +28240,7 @@ def render_bo_session_app() -> None:
                         available_channels,
                     )
                 )
-                selected_channels = st.multiselect(
+                selected_channels = trace_settings_form.multiselect(
                     "Channels to display",
                     available_channels,
                     default=trace_channels_display,
@@ -25005,7 +28265,7 @@ def render_bo_session_app() -> None:
                     trace_channel_layout_options,
                     trace_channel_layout_options[0],
                 )
-                trace_channel_layout = st.radio(
+                trace_channel_layout = trace_settings_form.radio(
                     "Channel layout",
                     trace_channel_layout_options,
                     horizontal=True,
@@ -25013,9 +28273,10 @@ def render_bo_session_app() -> None:
                 )
                 trace_layout_options = [
                     "Each SWV trace separately",
+                    "Plot each iteration separately",
                     "Overlay SWV traces",
                 ]
-                if trace_all_mode:
+                if len(group_scoped_observations) > 1:
                     trace_layout_options.append("Chronological diagonal stack")
                 trace_layout_key = (
                     f"bo_trace_layout_{selected_observation_group_scope}"
@@ -25025,7 +28286,7 @@ def render_bo_session_app() -> None:
                     trace_layout_options,
                     "Overlay SWV traces",
                 )
-                trace_layout = st.radio(
+                trace_layout = trace_settings_form.radio(
                     "Plot layout",
                     trace_layout_options,
                     horizontal=True,
@@ -25066,7 +28327,7 @@ def render_bo_session_app() -> None:
                         ["Corrected"],
                     )
                 )
-                selected_trace_types = st.multiselect(
+                selected_trace_types = trace_settings_form.multiselect(
                     "Trace types",
                     trace_type_options,
                     default=trace_types_display,
@@ -25125,7 +28386,7 @@ def render_bo_session_app() -> None:
                     trace_transform_key,
                 ) = _selected_trace_type_settings(primary_trace_type)
                 analysis_settings = _bo_analysis_settings(session["config"])
-                trace_voltage_columns = st.columns(2)
+                trace_voltage_columns = trace_settings_form.columns(2)
                 trace_voltage_min = float(trace_voltage_columns[0].number_input(
                     "Voltage crop min (V)",
                     value=float(analysis_settings["crop_min_v"]),
@@ -25171,7 +28432,7 @@ def render_bo_session_app() -> None:
                 )
                 st.session_state.setdefault(trace_y_min_key, default_trace_y_min)
                 st.session_state.setdefault(trace_y_max_key, default_trace_y_max)
-                trace_y_limit_columns = st.columns([1.2, 1, 1])
+                trace_y_limit_columns = trace_settings_form.columns([1.2, 1, 1])
                 manual_trace_y_limits = trace_y_limit_columns[0].checkbox(
                     "Set SWV y-axis limits manually",
                     key=(
@@ -25190,7 +28451,6 @@ def render_bo_session_app() -> None:
                     step=0.1,
                     format="%.4f",
                     key=trace_y_min_key,
-                    disabled=not manual_trace_y_limits,
                 ))
                 draft_trace_y_max = float(trace_y_limit_columns[2].number_input(
                     "SWV y-axis maximum",
@@ -25198,8 +28458,11 @@ def render_bo_session_app() -> None:
                     step=0.1,
                     format="%.4f",
                     key=trace_y_max_key,
-                    disabled=not manual_trace_y_limits,
                 ))
+                trace_settings_form.caption(
+                    "The SWV y-axis minimum and maximum apply only when manual "
+                    "y-axis limits are enabled."
+                )
                 if manual_trace_y_limits:
                     trace_y_min = draft_trace_y_min
                     trace_y_max = draft_trace_y_max
@@ -25219,101 +28482,110 @@ def render_bo_session_app() -> None:
                 stack_y_max = None
                 stack_phase_display = "Overlay buffer and target"
                 manual_stack_y_limits = False
-                if trace_layout == "Chronological diagonal stack":
-                    if selected_trace_phase_set == {"buffer", "target"}:
-                        stack_phase_display = st.radio(
-                            "Paired trace display",
-                            [
-                                "Overlay buffer and target",
-                                "Separate buffer and target plots",
-                            ],
-                            horizontal=True,
-                            key=(
-                                f"bo_trace_stack_phase_display_"
-                                f"{selected_observation_group_scope}"
-                            ),
-                        )
-                    offset_columns = st.columns(3)
-                    stack_x_offset = offset_columns[0].number_input(
-                        "X offset per iteration (V)",
-                        value=0.002,
-                        step=0.001,
-                        format="%.4f",
+                stack_settings = trace_settings_form.expander(
+                    "Chronological diagonal stack settings",
+                    expanded=True,
+                )
+                stack_settings.caption(
+                    "These controls apply only when Plot layout is set to "
+                    "Chronological diagonal stack."
+                )
+                if trace_has_paired_phases:
+                    stack_phase_display = stack_settings.radio(
+                        "Paired trace display",
+                        [
+                            "Overlay buffer and target",
+                            "Separate buffer and target plots",
+                        ],
+                        horizontal=True,
                         key=(
-                            f"bo_trace_stack_x_offset_"
+                            f"bo_trace_stack_phase_display_"
                             f"{selected_observation_group_scope}"
                         ),
-                        help="Positive values shift newer traces to the right; negative values shift them left.",
                     )
-                    stack_y_offset = offset_columns[1].number_input(
-                        "Y offset per iteration",
-                        value=0.02 if normalize_to_peak else 0.1,
-                        step=0.01,
-                        format="%.4f",
-                        key=(
-                            f"bo_trace_stack_y_offset_"
-                            f"{selected_observation_group_scope}_"
-                            f"{trace_transform_key}"
-                        ),
-                        help="Positive values shift newer traces upward; negative values shift them downward.",
-                    )
-                    stack_trace_height = offset_columns[2].slider(
-                        "Trace height",
-                        min_value=0.1,
-                        max_value=5.0,
-                        value=1.0,
-                        step=0.1,
-                        key=(
-                            f"bo_trace_stack_height_"
-                            f"{selected_observation_group_scope}_"
-                            f"{trace_transform_key}"
-                        ),
-                        help="Scales each SWV vertically before applying the chronological offset.",
-                    )
-                    manual_stack_y_limits = st.checkbox(
-                        "Crop each SWV trace by current before stacking",
-                        key=(
-                            f"bo_trace_stack_manual_y_limits_"
-                            f"{selected_observation_group_scope}_"
-                            f"{trace_transform_key}"
-                        ),
-                    )
+                offset_columns = stack_settings.columns(3)
+                stack_x_offset = offset_columns[0].number_input(
+                    "X offset per iteration (V)",
+                    value=0.002,
+                    step=0.001,
+                    format="%.4f",
+                    key=(
+                        f"bo_trace_stack_x_offset_"
+                        f"{selected_observation_group_scope}"
+                    ),
+                    help="Positive values shift newer traces to the right; negative values shift them left.",
+                )
+                stack_y_offset = offset_columns[1].number_input(
+                    "Y offset per iteration",
+                    value=0.02 if normalize_to_peak else 0.1,
+                    step=0.01,
+                    format="%.4f",
+                    key=(
+                        f"bo_trace_stack_y_offset_"
+                        f"{selected_observation_group_scope}_"
+                        f"{trace_transform_key}"
+                    ),
+                    help="Positive values shift newer traces upward; negative values shift them downward.",
+                )
+                stack_trace_height = offset_columns[2].slider(
+                    "Trace height",
+                    min_value=0.1,
+                    max_value=100.0,
+                    value=1.0,
+                    step=0.1,
+                    key=(
+                        f"bo_trace_stack_height_"
+                        f"{selected_observation_group_scope}_"
+                        f"{trace_transform_key}"
+                    ),
+                    help="Scales each SWV vertically before applying the chronological offset.",
+                )
+                manual_stack_y_limits = stack_settings.checkbox(
+                    "Crop each SWV trace by current before stacking",
+                    key=(
+                        f"bo_trace_stack_manual_y_limits_"
+                        f"{selected_observation_group_scope}_"
+                        f"{trace_transform_key}"
+                    ),
+                )
+                default_stack_y_min = -0.2 if normalize_to_peak else -1.0
+                default_stack_y_max = 1.2 if normalize_to_peak else 1.0
+                y_limit_columns = stack_settings.columns(2)
+                stack_y_min_key = (
+                    f"bo_trace_stack_trace_y_min_"
+                    f"{selected_observation_group_scope}_"
+                    f"{trace_transform_key}"
+                )
+                stack_y_max_key = (
+                    f"bo_trace_stack_trace_y_max_"
+                    f"{selected_observation_group_scope}_"
+                    f"{trace_transform_key}"
+                )
+                st.session_state.setdefault(
+                    stack_y_min_key,
+                    default_stack_y_min,
+                )
+                st.session_state.setdefault(
+                    stack_y_max_key,
+                    default_stack_y_max,
+                )
+                draft_stack_y_min = float(y_limit_columns[0].number_input(
+                    "Per-trace current minimum",
+                    value=float(st.session_state[stack_y_min_key]),
+                    step=0.1,
+                    format="%.4f",
+                    key=stack_y_min_key,
+                ))
+                draft_stack_y_max = float(y_limit_columns[1].number_input(
+                    "Per-trace current maximum",
+                    value=float(st.session_state[stack_y_max_key]),
+                    step=0.1,
+                    format="%.4f",
+                    key=stack_y_max_key,
+                ))
                 if manual_stack_y_limits:
-                    default_stack_y_min = -0.2 if normalize_to_peak else -1.0
-                    default_stack_y_max = 1.2 if normalize_to_peak else 1.0
-                    y_limit_columns = st.columns(2)
-                    stack_y_min_key = (
-                        f"bo_trace_stack_trace_y_min_"
-                        f"{selected_observation_group_scope}_"
-                        f"{trace_transform_key}"
-                    )
-                    stack_y_max_key = (
-                        f"bo_trace_stack_trace_y_max_"
-                        f"{selected_observation_group_scope}_"
-                        f"{trace_transform_key}"
-                    )
-                    st.session_state.setdefault(
-                        stack_y_min_key,
-                        default_stack_y_min,
-                    )
-                    st.session_state.setdefault(
-                        stack_y_max_key,
-                        default_stack_y_max,
-                    )
-                    stack_y_min = float(y_limit_columns[0].number_input(
-                        "Per-trace current minimum",
-                        value=float(st.session_state[stack_y_min_key]),
-                        step=0.1,
-                        format="%.4f",
-                        key=stack_y_min_key,
-                    ))
-                    stack_y_max = float(y_limit_columns[1].number_input(
-                        "Per-trace current maximum",
-                        value=float(st.session_state[stack_y_max_key]),
-                        step=0.1,
-                        format="%.4f",
-                        key=stack_y_max_key,
-                    ))
+                    stack_y_min = draft_stack_y_min
+                    stack_y_max = draft_stack_y_max
                     if stack_y_min >= stack_y_max:
                         st.warning(
                             "Per-trace current minimum must be less than the "
@@ -25321,7 +28593,7 @@ def render_bo_session_app() -> None:
                         )
                         stack_y_min = None
                         stack_y_max = None
-                trace_gif_duration = st.slider(
+                trace_gif_duration = trace_settings_form.slider(
                     "SWV GIF frame duration (ms)",
                     min_value=100,
                     max_value=1500,
@@ -25330,7 +28602,7 @@ def render_bo_session_app() -> None:
                     key=(
                         f"bo_trace_gif_duration_{selected_observation_group_scope}"
                     ),
-                    disabled=not trace_all_mode,
+                    help="Used when the rendered selection contains multiple iterations.",
                 )
 
                 trace_render_signature = (
@@ -25356,10 +28628,9 @@ def render_bo_session_app() -> None:
                     trace_gif_duration,
                 )
                 trace_render_key = "bo_swv_traces_render_signature"
-                if st.button(
-                    "Render SWV traces",
+                if trace_settings_form.form_submit_button(
+                    "Render SWV settings",
                     use_container_width=True,
-                    key="bo_swv_traces_render",
                 ):
                     st.session_state[trace_render_key] = trace_render_signature
                 render_swv_traces = (
@@ -25368,7 +28639,7 @@ def render_bo_session_app() -> None:
                 )
                 if not render_swv_traces:
                     st.info(
-                        "Click Render SWV traces to process and display traces "
+                        "Click Render SWV settings to process and display traces "
                         "for this selection."
                     )
 
@@ -25431,41 +28702,17 @@ def render_bo_session_app() -> None:
                                             for entry_observation, trace in separate_entries
                                             if entry_observation is trace_observation
                                         ]
-                                        observation_channels = sorted(
-                                            {
-                                                _trace_channel_key(trace)
-                                                for trace in observation_entries
-                                            },
-                                            key=_channel_sort_key,
+                                        separate_plot_entries.extend(
+                                            (
+                                                trace_observation,
+                                                trace_pair,
+                                                single_channel,
+                                            )
+                                            for single_channel, trace_pair
+                                            in _pair_buffer_target_traces(
+                                                observation_entries
+                                            )
                                         )
-                                        for single_channel in observation_channels:
-                                            traces_by_phase = {}
-                                            for trace in observation_entries:
-                                                if (
-                                                    _trace_channel_key(trace)
-                                                    != single_channel
-                                                ):
-                                                    continue
-                                                phase = str(
-                                                    trace.get("phase", "")
-                                                ).lower()
-                                                if phase in {"buffer", "target"}:
-                                                    traces_by_phase.setdefault(
-                                                        phase,
-                                                        trace,
-                                                    )
-                                            if all(
-                                                phase in traces_by_phase
-                                                for phase in ("buffer", "target")
-                                            ):
-                                                separate_plot_entries.append((
-                                                    trace_observation,
-                                                    [
-                                                        traces_by_phase["buffer"],
-                                                        traces_by_phase["target"],
-                                                    ],
-                                                    single_channel,
-                                                ))
                                 else:
                                     separate_plot_entries = [
                                         (
@@ -25581,6 +28828,162 @@ def render_bo_session_app() -> None:
                                             width_percent=plot_width_percent,
                                             enable_series_customization=True,
                                         )
+                                        for error in errors:
+                                            st.warning(error)
+                                continue
+                            if trace_layout == "Plot each iteration separately":
+                                iteration_entries = [
+                                    (trace_observation, trace)
+                                    for trace_observation, trace
+                                    in display_trace_entries
+                                    if _trace_channel_key(trace) in channel_group
+                                    and (
+                                        selected_stack_phases is None
+                                        or str(trace.get("phase", "")).lower()
+                                        in {
+                                            str(phase).lower()
+                                            for phase in selected_stack_phases
+                                        }
+                                    )
+                                ]
+                                grouped_iteration_entries = (
+                                    _trace_entries_by_iteration(iteration_entries)
+                                )
+                                if not grouped_iteration_entries:
+                                    st.info(
+                                        "No SWV traces match this channel and "
+                                        "phase selection."
+                                    )
+                                    continue
+                                multiple_trace_groups = len({
+                                    group_id
+                                    for group_id, _iteration, _observation, _traces
+                                    in grouped_iteration_entries
+                                }) > 1
+                                for (
+                                    iteration_plot_index,
+                                    (
+                                        iteration_group_id,
+                                        iteration_value,
+                                        iteration_observation,
+                                        iteration_traces,
+                                    ),
+                                ) in enumerate(grouped_iteration_entries, start=1):
+                                    iteration_group_name = str(
+                                        iteration_observation.get("group_name")
+                                        or f"Group {iteration_group_id}"
+                                    )
+                                    iteration_heading = f"Iteration {iteration_value}"
+                                    if multiple_trace_groups:
+                                        iteration_heading = (
+                                            f"{iteration_group_name} — "
+                                            f"{iteration_heading}"
+                                        )
+                                    st.markdown(f"**{iteration_heading}**")
+                                    for selected_trace_type in selected_trace_types:
+                                        (
+                                            current_corrected,
+                                            current_offset_to_baseline,
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            _current_trace_transform_key,
+                                        ) = _selected_trace_type_settings(
+                                            selected_trace_type
+                                        )
+                                        if len(selected_trace_types) > 1:
+                                            st.markdown(f"**{selected_trace_type}**")
+                                        with st.spinner(
+                                            "Processing corrected traces..."
+                                            if current_corrected
+                                            else "Loading raw traces..."
+                                        ):
+                                            figure, errors = _plot_traces(
+                                                session,
+                                                iteration_observation,
+                                                current_corrected,
+                                                channel_group,
+                                                trace_analysis,
+                                                correction_label,
+                                                True,
+                                                iteration_traces,
+                                                current_normalize_to_peak,
+                                                current_corrected_trace_key,
+                                                current_offset_to_baseline,
+                                                trace_voltage_min,
+                                                trace_voltage_max,
+                                            )
+                                        if (
+                                            trace_y_min is not None
+                                            and trace_y_max is not None
+                                            and figure.axes
+                                        ):
+                                            figure.axes[0].set_ylim(
+                                                trace_y_min,
+                                                trace_y_max,
+                                            )
+                                        iteration_score_channels = sorted(
+                                            {
+                                                str(trace.get("channel", "Unknown"))
+                                                for trace in iteration_traces
+                                            },
+                                            key=_channel_sort_key,
+                                        )
+                                        score_observation = (
+                                            _observation_with_trace_peak_replicates(
+                                                iteration_observation,
+                                                iteration_traces,
+                                                trace_analysis,
+                                            )
+                                        )
+                                        score_observation = (
+                                            _observation_with_plotted_peak_replicates(
+                                                score_observation,
+                                                iteration_traces,
+                                                figure,
+                                            )
+                                        )
+                                        iteration_score_text = "\n".join(
+                                            _iteration_trace_q_score_lines(
+                                                score_observation,
+                                                iteration_score_channels,
+                                                session.get("config") or {},
+                                            )
+                                        )
+                                        iteration_channel_token = (
+                                            "_".join(map(str, channel_group))
+                                            or "all_channels"
+                                        )
+                                        trace_file_stem = (
+                                            f"swv_traces_{selected_trace_type}_"
+                                            f"{iteration_group_name}_"
+                                            f"iteration_{iteration_value}_"
+                                            f"{selected_trace_phase_label}_"
+                                            f"{iteration_channel_token}"
+                                        )
+                                        _render_downloadable_pyplot(
+                                            st,
+                                            figure,
+                                            key=(
+                                                f"bo_trace_plot_iteration_"
+                                                f"{selected_observation_group_scope}_"
+                                                f"{trace_iteration_token}_"
+                                                f"{iteration_plot_index}_"
+                                                f"{iteration_group_id}_"
+                                                f"{iteration_value}_"
+                                                f"{selected_trace_type}_"
+                                                f"{phase_label or 'all'}_"
+                                                f"{iteration_channel_token}_"
+                                                f"{trace_voltage_min:g}_"
+                                                f"{trace_voltage_max:g}_"
+                                                f"{trace_y_min if trace_y_min is not None else 'auto'}_"
+                                                f"{trace_y_max if trace_y_max is not None else 'auto'}"
+                                            ),
+                                            file_stem=trace_file_stem,
+                                            width_percent=plot_width_percent,
+                                            enable_series_customization=True,
+                                        )
+                                        st.markdown("**Iteration scoring details**")
+                                        st.text(iteration_score_text)
                                         for error in errors:
                                             st.warning(error)
                                 continue
@@ -26068,16 +29471,10 @@ def render_bo_session_app() -> None:
                         max(parameter_values),
                     )
             real_metric_options = [
-                metric for metric in _q_relevant_metrics(
-                    REAL_DATA_METRICS,
-                    session["config"],
-                    paired_objective,
-                    phase=None,
-                )
-                if paired_objective or metric != "Paired Q"
-            ] + [
-                "Count",
-            ]
+                metric
+                for metric in REAL_DATA_METRICS
+                if paired_objective or not _real_metric_phase_independent(metric)
+            ] + ["Count"]
             _preserve_valid_widget_value(
                 "bo_real_metric",
                 real_metric_options,
@@ -26089,7 +29486,7 @@ def render_bo_session_app() -> None:
                 key="bo_real_metric",
             )
             count_mode = real_metric == "Count"
-            paired_q_mode = real_metric == "Paired Q"
+            phase_independent_metric = _real_metric_phase_independent(real_metric)
             if count_mode:
                 real_phase = "measurement"
                 real_settings_form.caption(
@@ -26120,14 +29517,21 @@ def render_bo_session_app() -> None:
                         key="bo_count_step_bin",
                     )),
                 }
-            elif paired_q_mode:
+            elif phase_independent_metric:
                 real_phase = "measurement"
                 count_bin_sizes = {}
-                real_settings_form.caption(
-                    "Paired Q is independent of buffer/target phase. Channel and "
-                    "group plots use stored per-channel paired Q values when "
-                    "available, with run-level Q_run as a fallback."
-                )
+                if real_metric == "Paired Q":
+                    real_settings_form.caption(
+                        "Paired Q is independent of buffer/target phase. Channel and "
+                        "group plots use stored per-channel paired Q values when "
+                        "available, with run-level Q_run as a fallback."
+                    )
+                else:
+                    real_settings_form.caption(
+                        "This paired metric combines the buffer and target values "
+                        "recorded at the same method settings, so it has no separate "
+                        "phase selector."
+                    )
             else:
                 real_phase_options = (
                     ["buffer", "target", "both"]
@@ -26147,6 +29551,13 @@ def render_bo_session_app() -> None:
                     key="bo_real_phase",
                 )
                 count_bin_sizes = {}
+            with real_settings_form.expander(
+                "What Classic Q and Paired Q represent",
+                expanded=False,
+            ):
+                _render_q_equation(session["config"], "classic")
+                if paired_objective:
+                    _render_q_equation(session["config"], "paired")
             observed_group_ids = {
                 int(observation.get("group_id", 1))
                 for observation in real_observations
@@ -30843,7 +34254,13 @@ def render_bo_session_app() -> None:
                             f"{real_2d_slice_token}"
                         )
                     )
-                    if real_gif_form.form_submit_button(
+                    real_gif_actions = real_gif_form.columns([1.15, 1.0])
+                    real_gif_lock_colormap = real_gif_actions[1].checkbox(
+                        "Lock color range across frames",
+                        value=True,
+                        key=f"{real_gif_key}_lock_colormap",
+                    )
+                    if real_gif_actions[0].form_submit_button(
                         "Generate real-data GIF",
                         disabled=real_view in {
                             "Parallel coordinates",
@@ -31052,6 +34469,9 @@ def render_bo_session_app() -> None:
                                     generated_gifs[target_name] = _figures_to_gif(
                                         real_frames(),
                                         real_gif_duration,
+                                        lock_colormap_range=(
+                                            real_gif_lock_colormap
+                                        ),
                                         plotly_width=max(
                                             500,
                                             int(plot_width_percent),
@@ -32347,7 +35767,15 @@ def render_bo_session_app() -> None:
                             f"obs{int(bool(surrogate_show_observed_points))}_"
                             f"contour{int(bool(surrogate_show_2d_contours))}"
                         )
-                        if st.button(
+                        surrogate_gif_actions = st.columns([1.15, 1.0])
+                        surrogate_gif_lock_colormap = (
+                            surrogate_gif_actions[1].checkbox(
+                                "Lock color range across frames",
+                                value=True,
+                                key=f"{surrogate_gif_key}_lock_colormap",
+                            )
+                        )
+                        if surrogate_gif_actions[0].button(
                             f"Generate {group_name} GIF",
                             key=f"{surrogate_gif_key}_button",
                         ):
@@ -32459,6 +35887,9 @@ def render_bo_session_app() -> None:
                                 gif_bytes = _figures_to_gif(
                                     surrogate_frames(),
                                     surrogate_gif_duration,
+                                    lock_colormap_range=(
+                                        surrogate_gif_lock_colormap
+                                    ),
                                     plotly_width=max(
                                         500,
                                         int(plot_width_percent),
@@ -33649,7 +37080,17 @@ def render_bo_session_app() -> None:
                                 )
                                 return frame_figure
 
-                            if st.button(
+                            loaded_gif_actions = st.columns([1.15, 1.0])
+                            loaded_sweep_gif_lock_colormap = (
+                                loaded_gif_actions[1].checkbox(
+                                    "Lock color range across frames",
+                                    value=True,
+                                    key=(
+                                        f"{loaded_sweep_gif_key}_lock_colormap"
+                                    ),
+                                )
+                            )
+                            if loaded_gif_actions[0].button(
                                 "Generate loaded simulated sweep GIF",
                                 key=f"{loaded_sweep_gif_key}_button",
                                 disabled=not loaded_sweep_gif_iterations,
@@ -33673,6 +37114,9 @@ def render_bo_session_app() -> None:
                                     gif_bytes = _figures_to_gif(
                                         gif_frames(),
                                         loaded_sweep_gif_duration,
+                                        lock_colormap_range=(
+                                            loaded_sweep_gif_lock_colormap
+                                        ),
                                         plotly_width=loaded_sweep_gif_context[
                                             "export_width"
                                         ],
@@ -34151,7 +37595,7 @@ def render_bo_session_app() -> None:
                         paired_objective,
                         phase=None,
                     )
-                    if paired_objective or metric != "Paired Q"
+                    if paired_objective or not _real_metric_phase_independent(metric)
                 ]
                 if not sim_metric_options:
                     st.info("No real-data metrics are available for simulation.")
@@ -34167,9 +37611,10 @@ def render_bo_session_app() -> None:
                         sim_metric_options,
                         key="bo_sim_real_metric",
                     )
+                    sim_phase_independent = _real_metric_phase_independent(sim_metric)
                     sim_phase_options = (
                         ["measurement"]
-                        if sim_metric == "Paired Q"
+                        if sim_phase_independent
                         else ["buffer", "target", "measurement"]
                         if paired_objective
                         else ["measurement"]
@@ -34180,14 +37625,14 @@ def render_bo_session_app() -> None:
                         "measurement" if "measurement" in sim_phase_options else sim_phase_options[0],
                     )
                     def sim_phase_label(phase_name: str) -> str:
-                        if paired_objective and sim_metric != "Paired Q":
+                        if paired_objective and not sim_phase_independent:
                             return f"{str(phase_name).title()} {sim_metric}"
                         return str(phase_name).title()
 
                     sim_phase = sim_controls[1].selectbox(
                         (
                             f"{sim_metric} source"
-                            if paired_objective and sim_metric != "Paired Q"
+                            if paired_objective and not sim_phase_independent
                             else "Metric phase"
                         ),
                         sim_phase_options,
@@ -34196,7 +37641,7 @@ def render_bo_session_app() -> None:
                     )
                     sim_value_label = (
                         sim_phase_label(sim_phase)
-                        if paired_objective and sim_metric != "Paired Q"
+                        if paired_objective and not sim_phase_independent
                         else sim_metric
                     )
                     sim_channel_options = _real_data_channels(group_scoped_observations)
@@ -34496,7 +37941,7 @@ def render_bo_session_app() -> None:
                             else:
                                 sim_value_label = (
                                     sim_phase_label(sim_phase)
-                                    if paired_objective and sim_metric != "Paired Q"
+                                    if paired_objective and not sim_phase_independent
                                     else sim_metric
                                 )
                                 sim_source_points = valid_points
@@ -35429,7 +38874,7 @@ def render_bo_session_app() -> None:
                             if sim_source == "Interpolate loaded real observations":
                                 sim_value_label = (
                                     sim_phase_label(sim_phase)
-                                    if paired_objective and sim_metric != "Paired Q"
+                                    if paired_objective and not sim_phase_independent
                                     else sim_metric
                                 )
                             sim_ground_truth = grid_frame.rename(
@@ -35605,7 +39050,7 @@ def render_bo_session_app() -> None:
                             )
                             sim_value_label = (
                                 sim_phase_label(sim_phase)
-                                if paired_objective and sim_metric != "Paired Q"
+                                if paired_objective and not sim_phase_independent
                                 else sim_metric
                             )
                         simulation_settings = {
@@ -37492,7 +40937,13 @@ def render_bo_session_app() -> None:
                         f"bo_synced_gifs_{selected_gif_group}_"
                         f"{len(gif_iterations)}_{gif_duration}"
                     )
-                    if st.button(
+                    batch_gif_actions = st.columns([1.15, 1.0])
+                    batch_gif_lock_colormap = batch_gif_actions[1].checkbox(
+                        "Lock color range across frames",
+                        value=True,
+                        key=f"{batch_key}_lock_colormap",
+                    )
+                    if batch_gif_actions[0].button(
                         "Generate all GIFs",
                         type="primary",
                         key=f"{batch_key}_button",
@@ -37580,6 +41031,7 @@ def render_bo_session_app() -> None:
                                 generated_gifs[name] = _figures_to_gif(
                                     swv_gif_frames(normalized_raw, y_limits),
                                     gif_duration,
+                                    lock_colormap_range=batch_gif_lock_colormap,
                                     total_frames=len(gif_iterations),
                                     progress_callback=lambda current, total, target=name: update_batch_progress(
                                         target,
@@ -37629,6 +41081,7 @@ def render_bo_session_app() -> None:
                                 generated_gifs[name] = _figures_to_gif(
                                     surrogate_frames(value_key, "3D tensor", x_name, y_name, z_name),
                                     gif_duration,
+                                    lock_colormap_range=batch_gif_lock_colormap,
                                     plotly_width=max(500, int(plot_width_percent)),
                                     plotly_height=plot_3d_height,
                                     plotly_camera=shared_gif_camera,
@@ -37650,6 +41103,7 @@ def render_bo_session_app() -> None:
                                     generated_gifs[name] = _figures_to_gif(
                                         surrogate_frames(value_key, "2D map", pair_x, pair_y),
                                         gif_duration,
+                                        lock_colormap_range=batch_gif_lock_colormap,
                                         total_frames=len(gif_iterations),
                                         progress_callback=lambda current, total, target=name: update_batch_progress(
                                             target,

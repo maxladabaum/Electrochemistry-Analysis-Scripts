@@ -79,6 +79,27 @@ def _score_from_cv(values: Iterable[Any]) -> float:
     return _clip01(1.0 / (1.0 + _cv(values)))
 
 
+def _pairwise_repeat_snr(
+    buffer_peak_currents: Iterable[Any],
+    target_peak_currents: Iterable[Any],
+) -> Tuple[float, float]:
+    """Return (target-minus-buffer mean / pairwise sample STD, pairwise STD)."""
+    buffer_values = _finite(buffer_peak_currents)
+    target_values = _finite(target_peak_currents)
+    if not buffer_values or not target_values:
+        return 0.0, 0.0
+    pairwise_differences = [
+        target_value - buffer_value
+        for buffer_value in buffer_values
+        for target_value in target_values
+    ]
+    pairwise_std = _std(pairwise_differences)
+    if len(pairwise_differences) < 2 or pairwise_std <= 1e-12:
+        return 0.0, pairwise_std
+    mean_difference = _mean(target_values) - _mean(buffer_values)
+    return mean_difference / pairwise_std, pairwise_std
+
+
 def _build_channel_metrics(results: List[dict]) -> Dict[str, dict]:
     grouped: Dict[str, List[dict]] = {}
     for row in results:
@@ -96,35 +117,62 @@ def _build_channel_metrics(results: List[dict]) -> Dict[str, dict]:
         if not ok_rows:
             metrics[channel] = {
                 "snr": 0.0,
+                "snr_unadjusted": 0.0,
+                "peak_prominence": 0.0,
+                "repeat_scan_snr": 0.0,
                 "peak_shape_score": 0.0,
                 "baseline_stability_score": 0.0,
                 "replicate_consistency_score": 0.0,
                 "success_score": _clip01(success_score),
                 "ok_scan_count": 0,
                 "total_scan_count": total,
+                "std_peak_current_uA": 0.0,
+                "peak_currents_uA": [],
+                "std_background_rms_uA": 0.0,
+                "repeat_relative_std": 0.0,
             }
             continue
 
         peak_currents = [abs(r.get("peak_current", 0.0)) for r in ok_rows]
         background_rms = [abs(r.get("background_current_rms", 0.0)) for r in ok_rows]
-        snr_values = [
-            abs(float(r.get("peak_current", 0.0))) / max(abs(float(r.get("background_current_rms", 0.0))), 1e-12)
-            for r in ok_rows
-        ]
         offset_scores = [max(0.0, 1.0 - abs(float(r.get("peak_offset_norm", 0.0)))) for r in ok_rows]
         width_scores = _score_from_cv(r.get("bracket_width_V", 0.0) for r in ok_rows)
         baseline_scores = _score_from_cv(background_rms)
         replicate_scores = _score_from_cv(peak_currents)
+        mean_peak_current = _mean(peak_currents, 0.0)
+        mean_background_rms = _mean(background_rms, 0.0)
+        std_peak_current = _std(peak_currents)
+        std_background_rms = _std(background_rms)
+        repeat_relative_std = 0.5 * (
+            _cv(peak_currents) + _cv(background_rms)
+        )
+        peak_prominence = mean_peak_current / max(mean_background_rms, 1e-12)
+        repeat_scan_snr = (
+            mean_peak_current / max(std_peak_current, 1e-12)
+            if len(peak_currents) > 1
+            else 0.0
+        )
         metrics[channel] = {
-            "snr": _median(snr_values, 0.0),
-            "peak_shape_score": _clip01(0.5 * _median(offset_scores, 0.0) + 0.5 * width_scores),
+            # Keep the old names so archived automation releases can consume
+            # summaries produced by this analysis worker.
+            "snr": peak_prominence,
+            "snr_unadjusted": peak_prominence,
+            "peak_prominence": peak_prominence,
+            "repeat_scan_snr": repeat_scan_snr,
+            "peak_shape_score": _clip01(0.5 * _mean(offset_scores, 0.0) + 0.5 * width_scores),
             "baseline_stability_score": _clip01(baseline_scores),
             "replicate_consistency_score": _clip01(replicate_scores),
             "success_score": _clip01(success_score),
             "ok_scan_count": len(ok_rows),
             "total_scan_count": total,
             "median_peak_current_uA": _median(peak_currents, 0.0),
+            "mean_peak_current_uA": mean_peak_current,
+            "std_peak_current_uA": std_peak_current,
+            "peak_currents_uA": peak_currents,
             "median_background_rms_uA": _median(background_rms, 0.0),
+            "mean_background_rms_uA": mean_background_rms,
+            "std_background_rms_uA": std_background_rms,
+            "repeat_relative_std": repeat_relative_std,
         }
     return metrics
 
