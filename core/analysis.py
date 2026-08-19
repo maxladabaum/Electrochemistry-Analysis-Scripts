@@ -217,6 +217,7 @@ def _process_file_cached(
     minima_search_window_V: float,
     use_prominent_minima: bool,
     use_double_correction: bool,
+    use_triple_correction: bool,
     min_peak_height_uA: Optional[float],
     compute_skew: bool,
     compute_wavelet_energy: bool,
@@ -240,6 +241,7 @@ def _process_file_cached(
             minima_search_window_V=minima_search_window_V,
             use_prominent_minima=use_prominent_minima,
             use_double_correction=use_double_correction,
+            use_triple_correction=use_triple_correction,
             min_peak_height_uA=min_peak_height_uA,
             compute_skew=compute_skew,
             compute_wavelet_energy=compute_wavelet_energy,
@@ -258,6 +260,7 @@ def _process_file_cached(
             minima_search_window_V=minima_search_window_V,
             use_prominent_minima=use_prominent_minima,
             use_double_correction=use_double_correction,
+            use_triple_correction=use_triple_correction,
             compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
             use_wavelet_for_correction=use_wavelet_for_correction,
         )
@@ -380,6 +383,7 @@ def analyze_swv_file(
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
     use_double_correction: bool = False,
+    use_triple_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -404,6 +408,7 @@ def analyze_swv_file(
         minima_search_window_V=minima_search_window_V,
         use_prominent_minima=use_prominent_minima,
         use_double_correction=use_double_correction,
+        use_triple_correction=use_triple_correction,
         min_peak_height_uA=min_peak_height_uA,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
@@ -422,6 +427,7 @@ def analyze_swv_arrays(
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
     use_double_correction: bool = False,
+    use_triple_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -455,10 +461,13 @@ def analyze_swv_arrays(
         minima_search_window_V=minima_search_window_V,
         use_prominent_minima=use_prominent_minima,
     )
+    second_pass_requested = bool(use_double_correction or use_triple_correction)
     final_pass = first_pass
     second_pass = None
+    third_pass = None
     double_correction_error = None
-    if use_double_correction:
+    triple_correction_error = None
+    if second_pass_requested:
         try:
             second_pass = _run_correction_pass(
                 v=v,
@@ -472,6 +481,20 @@ def analyze_swv_arrays(
             final_pass = second_pass
         except Exception as exc:
             double_correction_error = str(exc)
+    if use_triple_correction and second_pass is not None:
+        try:
+            third_pass = _run_correction_pass(
+                v=v,
+                y_for_correction=second_pass["corrected_current"],
+                peak_source=second_pass["smoothed_corrected_current"],
+                smooth_window=smooth_window,
+                smooth_polyorder=smooth_polyorder,
+                minima_search_window_V=minima_search_window_V,
+                use_prominent_minima=use_prominent_minima,
+            )
+            final_pass = third_pass
+        except Exception as exc:
+            triple_correction_error = str(exc)
 
     y_corr = final_pass["corrected_current"]
     y_corr_smooth = final_pass["smoothed_corrected_current"]
@@ -508,9 +531,9 @@ def analyze_swv_arrays(
         "corrected_current": y_corr,
         "smoothed_corrected_current": y_corr_smooth,
         "local_baseline": first_pass["local_baseline"],
-        "first_pass_corrected_current": first_pass["corrected_current"] if use_double_correction else None,
-        "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if use_double_correction else None,
-        "first_pass_local_baseline": first_pass["local_baseline"] if use_double_correction else None,
+        "first_pass_corrected_current": first_pass["corrected_current"] if second_pass_requested else None,
+        "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if second_pass_requested else None,
+        "first_pass_local_baseline": first_pass["local_baseline"] if second_pass_requested else None,
         # Use corrected-trace peak position for peak voltage (and drift downstream)
         "peak_voltage": float(v[peak_idx_corr]),
         "peak_current": peak_height,
@@ -523,17 +546,17 @@ def analyze_swv_arrays(
         "left_local_min_candidates": np.asarray(final_pass["left_local_min_candidates"], dtype=int),
         "right_local_min_candidates": np.asarray(final_pass["right_local_min_candidates"], dtype=int),
         "minima_mode": final_pass["minima_mode"],
-        "first_pass_peak_idx": first_pass["peak_idx"] if use_double_correction else None,
-        "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if use_double_correction else None,
-        "first_pass_left_min_idx": first_pass["left_idx"] if use_double_correction else None,
-        "first_pass_right_min_idx": first_pass["right_idx"] if use_double_correction else None,
+        "first_pass_peak_idx": first_pass["peak_idx"] if second_pass_requested else None,
+        "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if second_pass_requested else None,
+        "first_pass_left_min_idx": first_pass["left_idx"] if second_pass_requested else None,
+        "first_pass_right_min_idx": first_pass["right_idx"] if second_pass_requested else None,
         "first_pass_left_local_min_candidates": (
-            np.asarray(first_pass["left_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+            np.asarray(first_pass["left_local_min_candidates"], dtype=int) if second_pass_requested else np.array([], dtype=int)
         ),
         "first_pass_right_local_min_candidates": (
-            np.asarray(first_pass["right_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+            np.asarray(first_pass["right_local_min_candidates"], dtype=int) if second_pass_requested else np.array([], dtype=int)
         ),
-        "first_pass_minima_mode": first_pass["minima_mode"] if use_double_correction else None,
+        "first_pass_minima_mode": first_pass["minima_mode"] if second_pass_requested else None,
         "second_pass_corrected_current": second_pass["corrected_current"] if second_pass is not None else None,
         "second_pass_smoothed_corrected_current": (
             second_pass["smoothed_corrected_current"] if second_pass is not None else None
@@ -550,11 +573,28 @@ def analyze_swv_arrays(
             np.asarray(second_pass["right_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
         ),
         "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
-        "double_correction_requested": bool(use_double_correction),
+        "third_pass_corrected_current": third_pass["corrected_current"] if third_pass is not None else None,
+        "third_pass_smoothed_corrected_current": third_pass["smoothed_corrected_current"] if third_pass is not None else None,
+        "third_pass_local_baseline": third_pass["local_baseline"] if third_pass is not None else None,
+        "third_pass_peak_idx": third_pass["peak_idx"] if third_pass is not None else None,
+        "third_pass_peak_idx_corr": third_pass["peak_idx_corr"] if third_pass is not None else None,
+        "third_pass_left_min_idx": third_pass["left_idx"] if third_pass is not None else None,
+        "third_pass_right_min_idx": third_pass["right_idx"] if third_pass is not None else None,
+        "third_pass_left_local_min_candidates": (
+            np.asarray(third_pass["left_local_min_candidates"], dtype=int) if third_pass is not None else np.array([], dtype=int)
+        ),
+        "third_pass_right_local_min_candidates": (
+            np.asarray(third_pass["right_local_min_candidates"], dtype=int) if third_pass is not None else np.array([], dtype=int)
+        ),
+        "third_pass_minima_mode": third_pass["minima_mode"] if third_pass is not None else None,
+        "double_correction_requested": second_pass_requested,
         "double_correction_applied": bool(second_pass is not None),
+        "triple_correction_requested": bool(use_triple_correction),
+        "triple_correction_applied": bool(third_pass is not None),
         "wavelet_correction_applied": bool(use_wavelet_for_correction and wavelet_denoised_current is not None),
         "double_correction_error": double_correction_error,
-        "correction_passes": 2 if second_pass is not None else 1,
+        "triple_correction_error": triple_correction_error,
+        "correction_passes": 3 if third_pass is not None else (2 if second_pass is not None else 1),
         "skew": skew_val,
         "peak_offset_norm": peak_offset_norm,
         "wavelet_energy": wavelet_energy,
@@ -570,9 +610,11 @@ def partial_traces_for_failure_arrays(
     minima_search_window_V: float,
     use_prominent_minima: bool,
     use_double_correction: bool,
+    use_triple_correction: bool,
     compute_wavelet_denoised_trace: bool,
     use_wavelet_for_correction: bool,
 ) -> dict:
+    second_pass_requested = bool(use_double_correction or use_triple_correction)
     initial_mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
     base = dict(background_current_rms=np.nan,
                 background_current_median=_compute_outside_crop_median(i_raw, initial_mask),
@@ -604,10 +646,23 @@ def partial_traces_for_failure_arrays(
                 second_pass_left_local_min_candidates=np.array([], dtype=int),
                 second_pass_right_local_min_candidates=np.array([], dtype=int),
                 second_pass_minima_mode=None,
-                double_correction_requested=bool(use_double_correction),
+                third_pass_corrected_current=None,
+                third_pass_smoothed_corrected_current=None,
+                third_pass_local_baseline=None,
+                third_pass_peak_idx=None,
+                third_pass_peak_idx_corr=None,
+                third_pass_left_min_idx=None,
+                third_pass_right_min_idx=None,
+                third_pass_left_local_min_candidates=np.array([], dtype=int),
+                third_pass_right_local_min_candidates=np.array([], dtype=int),
+                third_pass_minima_mode=None,
+                double_correction_requested=second_pass_requested,
                 double_correction_applied=False,
+                triple_correction_requested=bool(use_triple_correction),
+                triple_correction_applied=False,
                 wavelet_correction_applied=False,
                 double_correction_error=None,
+                triple_correction_error=None,
                 correction_passes=1)
     try:
         mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
@@ -641,8 +696,10 @@ def partial_traces_for_failure_arrays(
         )
         final_pass = first_pass
         second_pass = None
+        third_pass = None
         double_correction_error = None
-        if use_double_correction:
+        triple_correction_error = None
+        if second_pass_requested:
             try:
                 second_pass = _run_correction_pass(
                     v=v,
@@ -656,6 +713,20 @@ def partial_traces_for_failure_arrays(
                 final_pass = second_pass
             except Exception as exc:
                 double_correction_error = str(exc)
+        if use_triple_correction and second_pass is not None:
+            try:
+                third_pass = _run_correction_pass(
+                    v=v,
+                    y_for_correction=second_pass["corrected_current"],
+                    peak_source=second_pass["smoothed_corrected_current"],
+                    smooth_window=smooth_window,
+                    smooth_polyorder=smooth_polyorder,
+                    minima_search_window_V=minima_search_window_V,
+                    use_prominent_minima=use_prominent_minima,
+                )
+                final_pass = third_pass
+            except Exception as exc:
+                triple_correction_error = str(exc)
 
         return {
             **base,
@@ -669,20 +740,20 @@ def partial_traces_for_failure_arrays(
             "left_local_min_candidates": np.asarray(final_pass["left_local_min_candidates"], dtype=int),
             "right_local_min_candidates": np.asarray(final_pass["right_local_min_candidates"], dtype=int),
             "minima_mode": final_pass["minima_mode"],
-            "first_pass_corrected_current": first_pass["corrected_current"] if use_double_correction else None,
-            "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if use_double_correction else None,
-            "first_pass_local_baseline": first_pass["local_baseline"] if use_double_correction else None,
-            "first_pass_peak_idx": first_pass["peak_idx"] if use_double_correction else None,
-            "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if use_double_correction else None,
-            "first_pass_left_min_idx": first_pass["left_idx"] if use_double_correction else None,
-            "first_pass_right_min_idx": first_pass["right_idx"] if use_double_correction else None,
+            "first_pass_corrected_current": first_pass["corrected_current"] if second_pass_requested else None,
+            "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if second_pass_requested else None,
+            "first_pass_local_baseline": first_pass["local_baseline"] if second_pass_requested else None,
+            "first_pass_peak_idx": first_pass["peak_idx"] if second_pass_requested else None,
+            "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if second_pass_requested else None,
+            "first_pass_left_min_idx": first_pass["left_idx"] if second_pass_requested else None,
+            "first_pass_right_min_idx": first_pass["right_idx"] if second_pass_requested else None,
             "first_pass_left_local_min_candidates": (
-                np.asarray(first_pass["left_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+                np.asarray(first_pass["left_local_min_candidates"], dtype=int) if second_pass_requested else np.array([], dtype=int)
             ),
             "first_pass_right_local_min_candidates": (
-                np.asarray(first_pass["right_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+                np.asarray(first_pass["right_local_min_candidates"], dtype=int) if second_pass_requested else np.array([], dtype=int)
             ),
-            "first_pass_minima_mode": first_pass["minima_mode"] if use_double_correction else None,
+            "first_pass_minima_mode": first_pass["minima_mode"] if second_pass_requested else None,
             "second_pass_corrected_current": second_pass["corrected_current"] if second_pass is not None else None,
             "second_pass_smoothed_corrected_current": (
                 second_pass["smoothed_corrected_current"] if second_pass is not None else None
@@ -699,10 +770,27 @@ def partial_traces_for_failure_arrays(
                 np.asarray(second_pass["right_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
             ),
             "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
+            "third_pass_corrected_current": third_pass["corrected_current"] if third_pass is not None else None,
+            "third_pass_smoothed_corrected_current": third_pass["smoothed_corrected_current"] if third_pass is not None else None,
+            "third_pass_local_baseline": third_pass["local_baseline"] if third_pass is not None else None,
+            "third_pass_peak_idx": third_pass["peak_idx"] if third_pass is not None else None,
+            "third_pass_peak_idx_corr": third_pass["peak_idx_corr"] if third_pass is not None else None,
+            "third_pass_left_min_idx": third_pass["left_idx"] if third_pass is not None else None,
+            "third_pass_right_min_idx": third_pass["right_idx"] if third_pass is not None else None,
+            "third_pass_left_local_min_candidates": (
+                np.asarray(third_pass["left_local_min_candidates"], dtype=int) if third_pass is not None else np.array([], dtype=int)
+            ),
+            "third_pass_right_local_min_candidates": (
+                np.asarray(third_pass["right_local_min_candidates"], dtype=int) if third_pass is not None else np.array([], dtype=int)
+            ),
+            "third_pass_minima_mode": third_pass["minima_mode"] if third_pass is not None else None,
             "double_correction_applied": bool(second_pass is not None),
+            "triple_correction_requested": bool(use_triple_correction),
+            "triple_correction_applied": bool(third_pass is not None),
             "wavelet_correction_applied": bool(use_wavelet_for_correction and wavelet_denoised_current is not None),
             "double_correction_error": double_correction_error,
-            "correction_passes": 2 if second_pass is not None else 1,
+            "triple_correction_error": triple_correction_error,
+            "correction_passes": 3 if third_pass is not None else (2 if second_pass is not None else 1),
             "partial_error": None,
         }
     except Exception as e:
@@ -812,6 +900,7 @@ def _process_swv_work_item(
     minima_search_window_V: float,
     use_prominent_minima: bool,
     use_double_correction: bool,
+    use_triple_correction: bool,
     min_peak_height_uA: Optional[float],
     min_start_voltage: float,
     compute_skew: bool,
@@ -845,6 +934,7 @@ def _process_swv_work_item(
         minima_search_window_V=minima_search_window_V,
         use_prominent_minima=use_prominent_minima,
         use_double_correction=use_double_correction,
+        use_triple_correction=use_triple_correction,
         min_peak_height_uA=min_peak_height_uA,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
@@ -864,6 +954,7 @@ def run_batch(
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
     use_double_correction: bool = False,
+    use_triple_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
     scan_windows: Optional[Tuple[Tuple[int, int], ...]] = None,
@@ -1023,8 +1114,14 @@ def run_batch(
                     "second_pass_left_min_idx", "second_pass_right_min_idx",
                     "second_pass_left_local_min_candidates", "second_pass_right_local_min_candidates",
                     "second_pass_minima_mode", "double_correction_requested",
+                    "third_pass_corrected_current", "third_pass_smoothed_corrected_current",
+                    "third_pass_local_baseline", "third_pass_peak_idx", "third_pass_peak_idx_corr",
+                    "third_pass_left_min_idx", "third_pass_right_min_idx",
+                    "third_pass_left_local_min_candidates", "third_pass_right_local_min_candidates",
+                    "third_pass_minima_mode", "triple_correction_requested",
                     "wavelet_correction_applied",
                     "double_correction_applied", "double_correction_error",
+                    "triple_correction_applied", "triple_correction_error",
                     "correction_passes",
                 )},
             })
@@ -1042,6 +1139,7 @@ def run_batch(
             minima_search_window_V=minima_search_window_V,
             use_prominent_minima=use_prominent_minima,
             use_double_correction=use_double_correction,
+            use_triple_correction=use_triple_correction,
             min_peak_height_uA=min_peak_height_uA,
             min_start_voltage=min_start_voltage,
             compute_skew=compute_skew,

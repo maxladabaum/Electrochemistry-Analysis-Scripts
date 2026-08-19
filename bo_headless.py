@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -209,6 +209,7 @@ def _analysis_args_from_request(payload: dict) -> dict:
         "minima_search_window_V": float(analysis.get("minima_search_window_v", 0.30)),
         "use_prominent_minima": bool(analysis.get("use_prominent_minima", False)) or require_minima,
         "use_double_correction": bool(analysis.get("use_double_correction", False)),
+        "use_triple_correction": bool(analysis.get("use_triple_correction", False)),
         "min_peak_height_uA": (
             None if analysis.get("min_peak_height_ua") in (None, "", "none")
             else float(analysis.get("min_peak_height_ua"))
@@ -228,7 +229,11 @@ def run_request(payload: dict) -> dict:
     folders = args.pop("folders")
     if not folders:
         raise ValueError("At least one folder is required")
-    results = run_batch(folders=folders, **args)
+    results = run_batch(
+        folders=folders,
+        progress_callback=payload.get("progress_callback"),
+        **args,
+    )
     _apply_result_constraints(results, dict(payload.get("analysis") or {}))
     channel_metrics = _build_channel_metrics(results)
     output_dir = Path(payload.get("output_dir") or Path(folders[0]) / "bo_analysis")
@@ -267,6 +272,14 @@ def _apply_result_constraints(results: List[dict], analysis: dict) -> None:
     peak_max = analysis.get("peak_voltage_max_v")
     peak_min = None if peak_min in (None, "", "none") else float(peak_min)
     peak_max = None if peak_max in (None, "", "none") else float(peak_max)
+    left_min = analysis.get("left_min_voltage_min_v")
+    left_max = analysis.get("left_min_voltage_max_v")
+    right_min = analysis.get("right_min_voltage_min_v")
+    right_max = analysis.get("right_min_voltage_max_v")
+    left_min = None if left_min in (None, "", "none") else float(left_min)
+    left_max = None if left_max in (None, "", "none") else float(left_max)
+    right_min = None if right_min in (None, "", "none") else float(right_min)
+    right_max = None if right_max in (None, "", "none") else float(right_max)
     require_minima = bool(analysis.get("require_local_minima_on_both_sides", False))
     for row in results:
         if str(row.get("status") or "").upper() != "OK":
@@ -277,6 +290,41 @@ def _apply_result_constraints(results: List[dict], analysis: dict) -> None:
             reasons.append(f"peak voltage {float(peak_voltage):g} V is below {peak_min:g} V")
         if peak_max is not None and float(peak_voltage) > peak_max:
             reasons.append(f"peak voltage {float(peak_voltage):g} V is above {peak_max:g} V")
+        voltage = row.get("voltage")
+        left_index = row.get("left_min_idx")
+        right_index = row.get("right_min_idx")
+        try:
+            left_voltage = float(voltage[int(left_index)])
+        except (IndexError, TypeError, ValueError):
+            left_voltage = None
+        try:
+            right_voltage = float(voltage[int(right_index)])
+        except (IndexError, TypeError, ValueError):
+            right_voltage = None
+        if left_min is not None and (left_voltage is None or left_voltage < left_min):
+            reasons.append(
+                "left minimum voltage is unavailable"
+                if left_voltage is None
+                else f"left minimum voltage {left_voltage:g} V is below {left_min:g} V"
+            )
+        if left_max is not None and (left_voltage is None or left_voltage > left_max):
+            reasons.append(
+                "left minimum voltage is unavailable"
+                if left_voltage is None
+                else f"left minimum voltage {left_voltage:g} V is above {left_max:g} V"
+            )
+        if right_min is not None and (right_voltage is None or right_voltage < right_min):
+            reasons.append(
+                "right minimum voltage is unavailable"
+                if right_voltage is None
+                else f"right minimum voltage {right_voltage:g} V is below {right_min:g} V"
+            )
+        if right_max is not None and (right_voltage is None or right_voltage > right_max):
+            reasons.append(
+                "right minimum voltage is unavailable"
+                if right_voltage is None
+                else f"right minimum voltage {right_voltage:g} V is above {right_max:g} V"
+            )
         if require_minima:
             left = row.get("left_local_min_candidates")
             right = row.get("right_local_min_candidates")
@@ -292,6 +340,10 @@ def _json_safe(value):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
     try:
         import numpy as np
 
