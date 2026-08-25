@@ -19,6 +19,7 @@ from bo_session_viewer import (
     _compact_simulation_observations_from_history,
     _iteration_trace_q_score_lines,
     _observation_with_plotted_peak_replicates,
+    _offset_hyperparameter_response_channels,
     _overlay_trace_scoring_blocks,
     _pair_buffer_target_traces,
     _paired_trend_differences,
@@ -28,6 +29,7 @@ from bo_session_viewer import (
     _plot_iteration_trace_overlay,
     _plot_traces,
     _real_metric_phase_independent,
+    _real_heatmap_full_export_height,
     _real_metric_points,
     _recorded_file_index,
     _resolve_recorded_path,
@@ -107,6 +109,114 @@ def test_channel_iteration_heatmap_preserves_legacy_unidentified_repeats():
     heatmap = figure.data[-1]
     assert len(heatmap.y) == 3
     assert sum(int(row[0][0]) for row in heatmap.customdata) == 3
+
+
+def test_channel_iteration_heatmap_can_group_runs_by_channel():
+    rows = []
+    for channel, group_id, exploration in (
+        ("1", 1, 0.1),
+        ("1", 2, 0.2),
+        ("2", 3, 0.1),
+        ("2", 4, 0.2),
+    ):
+        for iteration in (1, 2):
+            rows.append({
+                "channel": channel,
+                "iteration": iteration,
+                "value": float(group_id + iteration),
+                "group_id": group_id,
+                "run_label": f"explore={exploration}",
+                "exploration": exploration,
+            })
+
+    figure = _plot_real_channel_iteration_heatmap(
+        pd.DataFrame(rows),
+        metric_label="Q",
+        phase="measurement",
+        group_runs_by_channel=True,
+    )
+
+    heatmap = figure.data[-1]
+    row_channels = [
+        str(row_label).split("|", 1)[0].strip()
+        for row_label in heatmap.y
+    ]
+    assert row_channels == ["1", "1", "2", "2"]
+    assert any(
+        shape.y0 == pytest.approx(1.5)
+        and shape.line.width == pytest.approx(3.2)
+        for shape in figure.layout.shapes
+    )
+    separator_positions = [float(shape.y0) for shape in figure.layout.shapes]
+    assert len(separator_positions) == len(set(separator_positions))
+
+
+def test_full_heatmap_export_height_preserves_each_row_without_display_cap():
+    assert _real_heatmap_full_export_height(
+        5_000,
+        2,
+        1_000,
+    ) == 5_240
+    assert _real_heatmap_full_export_height(
+        5_000,
+        4,
+        1_000,
+    ) == 10_240
+
+
+def test_channel_iteration_heatmap_limits_only_interactive_display_rows():
+    points = pd.DataFrame({
+        "channel": ["1"] * 24,
+        "iteration": [1, 2] * 12,
+        "value": [float(value) for value in range(24)],
+        "run_index": [run for run in range(12) for _ in range(2)],
+    })
+
+    preview = _plot_real_channel_iteration_heatmap(
+        points,
+        metric_label="Q",
+        phase="measurement",
+        max_display_rows=5,
+    )
+    complete = _plot_real_channel_iteration_heatmap(
+        points,
+        metric_label="Q",
+        phase="measurement",
+        max_display_rows=None,
+    )
+
+    assert len(preview.data[-1].y) == 5
+    assert preview.layout.meta["bo_heatmap_displayed_rows"] == 5
+    assert preview.layout.meta["bo_heatmap_total_rows"] == 12
+    assert len(complete.data[-1].y) == 12
+
+
+def test_hyperparameter_channel_offset_zeros_each_channel_surface_minimum():
+    response = pd.DataFrame({
+        "ground_truth_channel": ["1", "1", "1", "1", "2", "2", "2", "2"],
+        "x": [0, 0, 1, 1, 0, 0, 1, 1],
+        "y": [0] * 8,
+        "metric_value": [0.1, 0.3, 0.7, 0.9, 10.4, 10.6, 11.4, 11.6],
+    })
+
+    offset = _offset_hyperparameter_response_channels(
+        response,
+        group_axes=["x", "y"],
+        aggregate="Mean",
+    )
+
+    channel_surfaces = (
+        offset.groupby(["ground_truth_channel", "x", "y"])["metric_value"]
+        .mean()
+    )
+    assert channel_surfaces.groupby(level=0).min().to_dict() == pytest.approx({
+        "1": 0.0,
+        "2": 0.0,
+    })
+    assert offset["channel_q_baseline"].drop_duplicates().tolist() == pytest.approx([
+        0.2,
+        10.5,
+    ])
 
 
 def test_heatmap_history_join_does_not_mix_channels_with_reused_group_ids():

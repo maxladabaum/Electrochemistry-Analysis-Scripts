@@ -85,6 +85,28 @@ def test_langmuir_and_snr_use_distinct_direction_family_shades():
                 for offset in range(3)
             )
 
+    clean_langmuir_figure = plot_titration_langmuir(
+        results,
+        metric="peak_current_selected",
+        vlines=vlines,
+        concentration_unit="uM",
+        edge_trim_fraction=0,
+        baseline_mode="preceding_buffer",
+    )
+    clean_annotations = "\n".join(
+        text.get_text() for text in clean_langmuir_figure.axes[0].texts
+    )
+    assert clean_langmuir_figure.axes[0].get_xlabel() == "Ligand Concentration (uM)"
+    assert clean_langmuir_figure.axes[0].get_ylabel() == "Peak Height (uA)"
+    assert not any(
+        detail in clean_annotations
+        for detail in ("Kd", "LOD", "ULOQ", "Sat.", "saturation")
+    )
+    assert not any(
+        label.endswith((" LOD", " ULOQ"))
+        for label in clean_langmuir_figure.axes[0].get_legend_handles_labels()[1]
+    )
+
     langmuir_figure = plot_titration_langmuir(
         results,
         metric="peak_current_selected",
@@ -97,17 +119,17 @@ def test_langmuir_and_snr_use_distinct_direction_family_shades():
     langmuir_colors = {
         collection.get_label(): collection.get_facecolors()[0]
         for collection in langmuir_axis.collections
-        if collection.get_label().startswith("Ch")
+        if collection.get_label().startswith("Channel ")
     }
-    assert langmuir_colors["Ch1 (signal-on)"][0] > langmuir_colors["Ch1 (signal-on)"][2]
-    assert langmuir_colors["Ch2 (signal-off)"][2] > langmuir_colors["Ch2 (signal-off)"][0]
+    assert langmuir_colors["Channel 1 (signal-on)"][0] > langmuir_colors["Channel 1 (signal-on)"][2]
+    assert langmuir_colors["Channel 2 (signal-off)"][2] > langmuir_colors["Channel 2 (signal-off)"][0]
     assert not np.allclose(
-        langmuir_colors["Ch1 (signal-on)"],
-        langmuir_colors["Ch3 (signal-on)"],
+        langmuir_colors["Channel 1 (signal-on)"],
+        langmuir_colors["Channel 3 (signal-on)"],
     )
     assert not np.allclose(
-        langmuir_colors["Ch2 (signal-off)"],
-        langmuir_colors["Ch4 (signal-off)"],
+        langmuir_colors["Channel 2 (signal-off)"],
+        langmuir_colors["Channel 4 (signal-off)"],
     )
 
     snr_rows = [
@@ -139,15 +161,15 @@ def test_langmuir_and_snr_use_distinct_direction_family_shades():
     snr_colors = {
         line.get_label(): line.get_color()
         for line in snr_figure.axes[0].lines
-        if line.get_label().startswith("Ch") and "fit" not in line.get_label()
+        if line.get_label().startswith("Channel ") and "fit" not in line.get_label()
     }
-    assert snr_colors["Ch1 (signal-on)"][0] > snr_colors["Ch1 (signal-on)"][2]
-    assert snr_colors["Ch2 (signal-off)"][2] > snr_colors["Ch2 (signal-off)"][0]
+    assert snr_colors["Channel 1 (signal-on)"][0] > snr_colors["Channel 1 (signal-on)"][2]
+    assert snr_colors["Channel 2 (signal-off)"][2] > snr_colors["Channel 2 (signal-off)"][0]
     assert not np.allclose(
-        snr_colors["Ch1 (signal-on)"], snr_colors["Ch3 (signal-on)"]
+        snr_colors["Channel 1 (signal-on)"], snr_colors["Channel 3 (signal-on)"]
     )
     assert not np.allclose(
-        snr_colors["Ch2 (signal-off)"], snr_colors["Ch4 (signal-off)"]
+        snr_colors["Channel 2 (signal-off)"], snr_colors["Channel 4 (signal-off)"]
     )
 
 
@@ -176,8 +198,8 @@ def test_mixed_response_peak_plot_uses_direction_specific_axes_and_colors():
     signal_on_axis, signal_off_axis = figure.axes
     assert signal_on_axis._swv_response_direction == "signal-on"
     assert signal_off_axis._swv_response_direction == "signal-off"
-    assert np.allclose(signal_on_axis.get_ylim(), [1.0, 4.0])
-    assert np.allclose(signal_off_axis.get_ylim(), [4.0, 10.0])
+    assert np.allclose(signal_on_axis.get_ylim(), [0.7, 4.3])
+    assert np.allclose(signal_off_axis.get_ylim(), [3.4, 10.6])
     assert "signal-on" in signal_on_axis.get_ylabel()
     assert "signal-off" in signal_off_axis.get_ylabel()
     signal_on_color = signal_on_axis.lines[0].get_color()
@@ -187,8 +209,8 @@ def test_mixed_response_peak_plot_uses_direction_specific_axes_and_colors():
     legend_labels = [
         text.get_text() for text in signal_on_axis.get_legend().get_texts()
     ]
-    assert "Ch1 (signal-on)" in legend_labels
-    assert "Ch2 (signal-off)" in legend_labels
+    assert "Channel 1 (signal-on)" in legend_labels
+    assert "Channel 2 (signal-off)" in legend_labels
 
 
 def test_explicit_channel_palette_is_stable_when_plotting_a_subset():
@@ -265,8 +287,8 @@ def test_mixed_response_plot_uses_shades_not_styles_for_swv_settings():
     ) > 0.35
     assert signal_on_lines[0].get_linestyle() == signal_on_lines[1].get_linestyle()
     assert signal_on_lines[0].get_marker() == signal_on_lines[1].get_marker()
-    assert signal_on_lines[0].get_color()[0] > signal_on_lines[0].get_color()[2]
-    assert signal_on_lines[1].get_color()[0] > signal_on_lines[1].get_color()[2]
+    assert signal_on_lines[0].get_color()[2] > signal_on_lines[0].get_color()[0]
+    assert signal_on_lines[1].get_color()[2] > signal_on_lines[1].get_color()[0]
     assert figure.axes[1].lines[0].get_color()[2] > figure.axes[1].lines[0].get_color()[0]
 
 
@@ -291,23 +313,33 @@ def test_same_direction_swv_settings_use_distinct_same_family_shades():
         rows,
         metric="peak_current_selected",
         channels=[method_1, method_2],
+        ylabel="Change in Peak Height (uA)",
+        xlabel="SWV Measurement Number",
         response_directions={method_1: "signal-on", method_2: "signal-on"},
     )
 
     assert len(figure.axes) == 1
     lines = figure.axes[0].lines
+    assert [line.get_label() for line in lines] == [
+        "Optimized Method",
+        "Manual Method",
+    ]
+    assert figure.axes[0].get_legend().get_title().get_text() == ""
+    assert figure.axes[0].get_ylabel() == "Change in Peak Height (uA)"
+    assert figure.axes[0].get_xlabel() == "SWV Measurement Number"
     assert lines[0].get_color() != lines[1].get_color()
     assert np.linalg.norm(
         np.asarray(lines[0].get_color())[:3]
         - np.asarray(lines[1].get_color())[:3]
     ) > 0.35
-    assert lines[0].get_color()[0] > lines[0].get_color()[2]
-    assert lines[1].get_color()[0] > lines[1].get_color()[2]
+    assert lines[0].get_color()[2] > lines[0].get_color()[0]
+    assert lines[1].get_color()[2] > lines[1].get_color()[0]
     assert lines[0].get_linestyle() == lines[1].get_linestyle()
     assert lines[0].get_marker() == lines[1].get_marker()
+    assert figure.axes[0].get_legend()._loc == 6  # center left
 
 
-def test_method_pairs_remain_high_contrast_in_a_large_orange_palette():
+def test_method_colors_are_fixed_across_physical_channels():
     channels = [f"{physical} group {method}" for physical in range(1, 5) for method in (1, 2)]
     rows = [
         {
@@ -327,8 +359,38 @@ def test_method_pairs_remain_high_contrast_in_a_large_orange_palette():
     )
     line_colors = [np.asarray(line.get_color())[:3] for line in figure.axes[0].lines]
 
-    for method_1_color, method_2_color in zip(line_colors[::2], line_colors[1::2]):
-        assert np.linalg.norm(method_1_color - method_2_color) > 0.25
+    method_1_colors = line_colors[::2]
+    method_2_colors = line_colors[1::2]
+    for method_1_color, method_2_color in zip(method_1_colors, method_2_colors):
+        assert np.linalg.norm(method_1_color - method_2_color) > 0.65
+        assert method_1_color[2] > method_1_color[0]
+        assert method_2_color[2] > method_2_color[0]
+    assert all(np.allclose(color, method_1_colors[0]) for color in method_1_colors)
+    assert all(np.allclose(color, method_2_colors[0]) for color in method_2_colors)
+    assert np.mean(method_1_colors[0]) < np.mean(method_2_colors[0])
+
+
+def test_metric_y_axes_stay_black_for_response_colored_channels():
+    rows = [
+        {
+            "channel": channel,
+            "scan_number": scan_number,
+            "peak_current_selected": value,
+        }
+        for channel, values in ((1, [1.0, 2.0]), (2, [8.0, 6.0]))
+        for scan_number, value in enumerate(values, start=1)
+    ]
+    figure = plot_metric_vs_scan(
+        rows,
+        metric="peak_current_selected",
+        channels=[1, 2],
+        response_directions={1: "signal-on", 2: "signal-off"},
+    )
+
+    for axis, spine_name in zip(figure.axes, ("left", "right")):
+        assert axis.yaxis.label.get_color() == "black"
+        assert axis.spines[spine_name].get_edgecolor()[:3] == (0.0, 0.0, 0.0)
+        assert all(tick.get_color() == "black" for tick in axis.get_yticklabels())
 
 
 def test_normalized_mixed_response_plot_retains_direction_axes_and_colors():
@@ -355,8 +417,8 @@ def test_normalized_mixed_response_plot_retains_direction_axes_and_colors():
     )
 
     signal_on_axis, signal_off_axis = figure.axes
-    assert np.allclose(signal_on_axis.get_ylim(), [0.0, 1.0])
-    assert np.allclose(signal_off_axis.get_ylim(), [-1.0, 0.0])
+    assert np.allclose(signal_on_axis.get_ylim(), [-0.1, 1.1])
+    assert np.allclose(signal_off_axis.get_ylim(), [-1.1, 0.1])
     assert np.allclose(signal_on_axis.lines[0].get_ydata(), [0.0, 0.25, 1.0])
     assert np.allclose(signal_off_axis.lines[0].get_ydata(), [0.0, -1.0 / 3.0, -1.0])
     assert signal_on_axis.lines[0].get_color()[0] > signal_on_axis.lines[0].get_color()[2]
@@ -391,7 +453,7 @@ def test_buffer_offset_mixed_response_plot_uses_one_signed_axis():
     axis = figure.axes[0]
     assert np.allclose(axis.lines[0].get_ydata(), [0.0, 1.0, 4.0])
     assert np.allclose(axis.lines[1].get_ydata(), [0.0, -3.0, -9.0])
-    assert np.allclose(axis.get_ylim(), [-9.0, 4.0])
+    assert np.allclose(axis.get_ylim(), [-10.3, 5.3])
     assert axis.lines[0].get_color()[0] > axis.lines[0].get_color()[2]
     assert axis.lines[1].get_color()[2] > axis.lines[1].get_color()[0]
     assert any(
@@ -429,6 +491,7 @@ def test_other_metric_uses_direction_colors_without_axis_manipulation():
     assert axis.get_ylabel() == "Skew"
     assert np.allclose(axis.lines[0].get_ydata(), [0.2, 0.4, 0.3])
     assert np.allclose(axis.lines[1].get_ydata(), [-0.1, -0.3, -0.2])
+    assert np.allclose(axis.get_ylim(), [-0.37, 0.47])
     assert axis.lines[0].get_color()[0] > axis.lines[0].get_color()[2]
     assert axis.lines[1].get_color()[2] > axis.lines[1].get_color()[0]
 
@@ -498,11 +561,11 @@ def test_plateau_plot_respects_response_colors_and_buffer_translation():
     axis = figure.axes[0]
     signal_on_points = next(
         collection for collection in axis.collections
-        if collection.get_label() == "Ch1 (signal-on)"
+        if collection.get_label() == "Channel 1 (signal-on)"
     )
     signal_off_points = next(
         collection for collection in axis.collections
-        if collection.get_label() == "Ch2 (signal-off)"
+        if collection.get_label() == "Channel 2 (signal-off)"
     )
     assert np.allclose(signal_on_points.get_offsets()[:, 1], [0.0, 1.0, 0.0, 3.0])
     assert np.allclose(signal_off_points.get_offsets()[:, 1], [0.0, -3.0, 0.0, -6.0])
@@ -546,19 +609,29 @@ def test_concentration_diagnostics_use_response_direction_colors():
     accuracy_axis = accuracy_figure.axes[0]
     accuracy_on = next(
         collection for collection in accuracy_axis.collections
-        if collection.get_label() == "Ch1 (signal-on)"
+        if collection.get_label() == "Channel 1 (signal-on)"
     )
     accuracy_off = next(
         collection for collection in accuracy_axis.collections
-        if collection.get_label() == "Ch2 (signal-off)"
+        if collection.get_label() == "Channel 2 (signal-off)"
     )
     accuracy_on_2 = next(
         collection for collection in accuracy_axis.collections
-        if collection.get_label() == "Ch3 (signal-on)"
+        if collection.get_label() == "Channel 3 (signal-on)"
     )
     accuracy_off_2 = next(
         collection for collection in accuracy_axis.collections
-        if collection.get_label() == "Ch4 (signal-off)"
+        if collection.get_label() == "Channel 4 (signal-off)"
+    )
+    assert all(
+        np.isclose(collection.get_alpha(), 0.30)
+        and collection._swv_preserve_alpha is True
+        for collection in (
+            accuracy_on,
+            accuracy_off,
+            accuracy_on_2,
+            accuracy_off_2,
+        )
     )
     assert accuracy_on.get_facecolors()[0, 0] > accuracy_on.get_facecolors()[0, 2]
     assert accuracy_off.get_facecolors()[0, 2] > accuracy_off.get_facecolors()[0, 0]
@@ -571,21 +644,23 @@ def test_concentration_diagnostics_use_response_direction_colors():
 
     measurement_figure = plot_titration_concentration_vs_measurement(rows)
     measurement_axis = measurement_figure.axes[0]
+    assert measurement_axis.get_ylabel() == "Predicted Concentration (uM)"
+    assert measurement_axis.get_legend()._loc == 2
     measurement_on = next(
         collection for collection in measurement_axis.collections
-        if collection.get_label() == "Ch1 (signal-on)"
+        if collection.get_label() == "Channel 1 (signal-on)"
     )
     measurement_off = next(
         collection for collection in measurement_axis.collections
-        if collection.get_label() == "Ch2 (signal-off)"
+        if collection.get_label() == "Channel 2 (signal-off)"
     )
     measurement_on_2 = next(
         collection for collection in measurement_axis.collections
-        if collection.get_label() == "Ch3 (signal-on)"
+        if collection.get_label() == "Channel 3 (signal-on)"
     )
     measurement_off_2 = next(
         collection for collection in measurement_axis.collections
-        if collection.get_label() == "Ch4 (signal-off)"
+        if collection.get_label() == "Channel 4 (signal-off)"
     )
     assert measurement_on.get_facecolors()[0, 0] > measurement_on.get_facecolors()[0, 2]
     assert measurement_off.get_facecolors()[0, 2] > measurement_off.get_facecolors()[0, 0]
@@ -595,6 +670,57 @@ def test_concentration_diagnostics_use_response_direction_colors():
     assert not np.allclose(
         measurement_off.get_facecolors()[0], measurement_off_2.get_facecolors()[0]
     )
+
+
+def test_accuracy_plot_reports_color_coded_rms_fold_error_by_method():
+    rows = []
+    for channel, predictions in (
+        ("2 group 1 | optimized", [100.0, 260.0]),
+        ("2 group 2 | manual", [110.0, 190.0]),
+    ):
+        for scan_number, (known, predicted) in enumerate(
+            zip([100.0, 200.0], predictions),
+            start=1,
+        ):
+            rows.append({
+                "channel": channel,
+                "original_channel": 2,
+                "scan_number": scan_number,
+                "known_concentration": known,
+                "predicted_concentration": predicted,
+                "absolute_percent_error": 100.0 * abs(predicted - known) / known,
+                "fit_amplitude": 1.0,
+                "limit_of_detection": None,
+                "upper_limit_of_quantification": None,
+            })
+
+    figure = plot_titration_concentration_accuracy(rows, concentration_unit="uM")
+    axis = figure.axes[0]
+    annotation_by_label = {
+        text.get_text().split(" RMS Fold Error", 1)[0]: text
+        for text in axis.texts
+        if " RMS Fold Error:" in text.get_text()
+    }
+    assert annotation_by_label["Optimized"].get_text() == (
+        "Optimized RMS Fold Error: 1.20×"
+    )
+    assert annotation_by_label["Manual"].get_text() == (
+        "Manual RMS Fold Error: 1.08×"
+    )
+    for compact_method_label, annotation in annotation_by_label.items():
+        method_label = f"{compact_method_label} Method"
+        method_points = next(
+            collection for collection in axis.collections
+            if collection.get_label() == method_label
+        )
+        assert np.allclose(
+            np.asarray(annotation.get_color())[:3],
+            method_points.get_facecolors()[0, :3],
+        )
+    assert [text.get_text() for text in axis.get_legend().get_texts()] == [
+        "Within ±20%",
+        "1:1",
+    ]
 
 
 def test_propagated_langmuir_uncertainty_grows_toward_saturation():
@@ -721,6 +847,22 @@ def test_channel_specific_vlines_keep_swv_groups_independent():
         ("1 group 2", 200.0),
     ]
     assert all(row["original_channel"] == 1 for row in rows)
+
+    figure = plot_titration_langmuir(
+        results,
+        metric="peak_current_selected",
+        vlines=[],
+        vlines_by_channel=by_channel,
+        channels=["1 group 1", "1 group 2"],
+        concentration_unit="uM",
+        edge_trim_fraction=0,
+    )
+    assert figure is not None
+    assert figure.axes[0].get_ylim()[0] == 0.0
+    legend = figure.axes[0].get_legend()
+    assert legend.get_title().get_text() == ""
+    legend_labels = [text.get_text() for text in legend.get_texts()]
+    assert legend_labels == ["Optimized Method", "Manual Method"]
 
 
 def test_langmuir_axis_keeps_highest_concentration_after_earlier_saturation():
@@ -1055,6 +1197,17 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
     assert accuracy_figure is not None
     assert accuracy_figure.axes[0].get_xscale() == "log"
     assert accuracy_figure.axes[0].get_yscale() == "log"
+    assert accuracy_figure.axes[0].get_title() == "Predicted vs. Known"
+    assert accuracy_figure.axes[0].get_aspect() == 1.0
+    assert not any(
+        bool(getattr(collection, "_swv_concentration_errorbar", False))
+        for collection in accuracy_figure.axes[0].collections
+    )
+    accuracy_axis_position = accuracy_figure.axes[0].get_position()
+    assert np.isclose(
+        accuracy_axis_position.width * accuracy_figure.get_figwidth(),
+        accuracy_axis_position.height * accuracy_figure.get_figheight(),
+    )
     expected_log_margin = 0.05 * np.log(80.0 / 10.0)
     expected_limits = [
         10.0 / np.exp(expected_log_margin),
@@ -1088,16 +1241,31 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
         / error_bound_lines[1].get_xdata()[-1],
         1.2,
     )
-    assert accuracy_figure.axes[0].get_legend()._loc == 9
+    accuracy_legend = accuracy_figure.axes[0].get_legend()
+    assert accuracy_legend._loc == 4
+    assert accuracy_legend.get_title().get_text() == ""
+    assert [text.get_text() for text in accuracy_legend.get_texts()] == [
+        "Within ±20%",
+        "1:1",
+    ]
     accuracy_annotation = "\n".join(
         text.get_text() for text in accuracy_figure.axes[0].texts
     )
-    expected_rmse = np.sqrt(np.mean([
-        row["absolute_concentration_error"] ** 2
+    assert "RMS Fold Error:" in accuracy_annotation
+    assert "% RMSE:" not in accuracy_annotation
+    assert "within ±20%:" not in accuracy_annotation
+    assert "Median |error|" not in accuracy_annotation
+    expected_log_rmse = np.sqrt(np.mean([
+        np.log10(
+            row["predicted_concentration"] / row["known_concentration"]
+        ) ** 2
         for row in accuracy_rows
-        if row["absolute_concentration_error"] is not None
     ]))
-    assert f"RMSE: {expected_rmse:.4g} uM" in accuracy_annotation
+    expected_rms_fold_error = 10.0 ** expected_log_rmse
+    assert (
+        f"RMS Fold Error: {expected_rms_fold_error:.2f}×"
+        in accuracy_annotation
+    )
 
     custom_alpha_figure = plot_titration_concentration_accuracy(
         accuracy_rows,
@@ -1110,19 +1278,28 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
     )
     assert np.isclose(custom_region.get_alpha(), 0.35)
 
+    interleaved_source_measurement_rows = [
+        {
+            **row,
+            "source_scan_number": 2 * row["scan_number"],
+        }
+        for row in measurement_rows
+    ]
     time_figure = plot_titration_concentration_vs_measurement(
-        measurement_rows,
+        interleaved_source_measurement_rows,
         concentration_unit="uM",
         vlines=vlines,
     )
     assert time_figure is not None
-    assert time_figure.axes[0].get_xlabel() == "Measurement number"
-    assert time_figure.axes[0].get_ylabel() == "Concentration (uM)"
-    assert time_figure.axes[0].get_yscale() == "linear"
     assert np.isclose(
-        time_figure.axes[0].get_ylim()[1],
-        1.0 + np.log2(1.3 * max(concentrations) / min(concentrations)),
+        accuracy_figure.get_figheight(),
+        time_figure.get_figheight(),
     )
+    assert time_figure.axes[0].get_xlabel() == "SWV Measurement Number"
+    assert time_figure.axes[0].get_ylabel() == "Predicted Concentration (uM)"
+    assert not bool(getattr(time_figure, "_swv_manual_layout", False))
+    assert time_figure.axes[0].get_yscale() == "linear"
+    assert time_figure.axes[0].get_position().width > 0.7
     assert time_figure.axes[0]._swv_concentration_doubling_scale is True
     assert np.isclose(
         time_figure.axes[0]._swv_concentration_doubling_reference,
@@ -1132,8 +1309,9 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
         "0", "10", "20", "40", "80",
     ]
     time_labels = time_figure.axes[0].get_legend_handles_labels()[1]
-    assert "Known concentration" in time_labels
-    assert "Known concentration ±20%" in time_labels
+    assert "Known Concentration" in time_labels
+    assert "Known Concentration ±20%" not in time_labels
+    assert time_figure.axes[0].get_legend().get_title().get_text() == ""
     titration_annotation_labels = {
         text.get_text() for text in time_figure.axes[0].texts
     }
@@ -1143,29 +1321,86 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
         if line.get_color() == "gray" and line.get_linestyle() == "--"
     ]
     assert len(titration_boundary_lines) == len(vlines)
+    vline_label_artists = [
+        text for text in time_figure.axes[0].texts
+        if text.get_text() in labels
+    ]
+    assert vline_label_artists
+    assert all(text.get_fontsize() == 9 for text in vline_label_artists)
     known_reference = next(
         line for line in time_figure.axes[0].lines
-        if line.get_label() == "Known concentration"
+        if line.get_label() == "Known Concentration"
     )
     known_reference_levels = np.asarray(known_reference.get_ydata(), dtype=float)
+    assert max(known_reference.get_xdata()) == max(
+        row["scan_number"] for row in measurement_rows
+    )
+    assert max(known_reference.get_xdata()) * 2 == max(
+        row["source_scan_number"]
+        for row in interleaved_source_measurement_rows
+    )
+    assert known_reference.get_zorder() > max(
+        collection.get_zorder()
+        for collection in time_figure.axes[0].collections
+    )
     assert np.isclose(np.min(known_reference_levels), 0.0)
     assert set(np.unique(known_reference_levels)) == {0.0, 1.0, 2.0, 3.0, 4.0}
     prediction_collections = [
         collection for collection in time_figure.axes[0].collections
-        if collection.get_label().startswith("Ch")
+        if collection.get_label().startswith("Channel ")
     ]
     assert prediction_collections
     plotted_prediction_levels = np.concatenate([
         np.asarray(collection.get_offsets())[:, 1]
         for collection in prediction_collections
     ])
+    errorbar_levels = np.concatenate([
+        np.asarray(segment)[:, 1]
+        for collection in time_figure.axes[0].collections
+        if hasattr(collection, "get_segments")
+        for segment in collection.get_segments()
+        if np.asarray(segment).size
+    ])
+    all_displayed_levels = np.concatenate((
+        known_reference_levels,
+        plotted_prediction_levels,
+        errorbar_levels,
+    ))
+    displayed_minimum = float(np.nanmin(all_displayed_levels))
+    displayed_maximum = float(np.nanmax(all_displayed_levels))
+    displayed_span = displayed_maximum - displayed_minimum
+    assert np.allclose(
+        time_figure.axes[0].get_ylim(),
+        [
+            displayed_minimum - (0.1 * displayed_span),
+            displayed_maximum + (0.1 * displayed_span),
+        ],
+    )
     assert np.nanmin(plotted_prediction_levels) < 0
     assert time_figure.axes[0].get_ylim()[0] < np.nanmin(plotted_prediction_levels)
     measurement_annotation = "\n".join(
         text.get_text() for text in time_figure.axes[0].texts
     )
-    assert "All displayed predictions vs known: RMSE =" in measurement_annotation
-    assert "Nonzero targets within ±20%:" in measurement_annotation
+    assert "All displayed predictions vs known" not in measurement_annotation
+    assert "Nonzero targets within ±20%" not in measurement_annotation
+    time_figure.set_size_inches(8, 4, forward=True)
+    time_figure.axes[0].yaxis.label.set_fontsize(24)
+    time_figure.tight_layout(pad=4 / 3)
+    time_figure.canvas.draw()
+    renderer = time_figure.canvas.get_renderer()
+    ylabel_box = time_figure.axes[0].yaxis.label.get_window_extent(renderer)
+    assert ylabel_box.x0 >= time_figure.bbox.x0
+    time_legend = time_figure.axes[0].get_legend()
+    legend_box = time_legend.get_window_extent(renderer)
+    axes_box = time_figure.axes[0].get_window_extent(renderer)
+    vline_label_boxes = [
+        artist.get_window_extent(renderer)
+        for artist in vline_label_artists
+    ]
+    assert time_legend._ncols == 1
+    assert legend_box.x0 >= axes_box.x0
+    assert legend_box.y1 <= axes_box.y1
+    assert legend_box.y1 < min(box.y0 for box in vline_label_boxes)
     assert any(
         isinstance(collection, LineCollection)
         for collection in time_figure.axes[0].collections
@@ -1228,10 +1463,18 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
         concentration_unit="uM",
         edge_trim_fraction=0,
         baseline_mode="preceding_buffer",
+        show_lod=True,
+        show_uloq=True,
     )
     assert langmuir_figure is not None
     assert langmuir_figure.axes[0].get_xscale() == "linear"
     assert _has_nonzero_vertical_errorbar(langmuir_figure.axes[0])
+    langmuir_errorbar_caps = [
+        line for line in langmuir_figure.axes[0].lines
+        if bool(getattr(line, "_swv_langmuir_errorbar_cap", False))
+    ]
+    assert langmuir_errorbar_caps
+    assert all(cap.get_markersize() >= 14.0 for cap in langmuir_errorbar_caps)
     assert any(line.get_label().endswith(" LOD") for line in langmuir_figure.axes[0].lines)
     assert any("ULOQ" in line.get_label() for line in langmuir_figure.axes[0].lines)
 
@@ -1349,6 +1592,7 @@ def test_signal_off_langmuir_fit_and_inversion_are_supported():
             concentration_unit="uM",
             edge_trim_fraction=0,
             baseline_mode="preceding_buffer",
+            show_fit_details=True,
         )
         assert figure is not None
         assert "signal-off" in "\n".join(

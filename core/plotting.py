@@ -51,13 +51,48 @@ def _high_contrast_response_shades(count: int) -> np.ndarray:
     ])
 
 
+_SWV_METHOD_BLUE_SHADES = {
+    1: 0.90,
+    2: 0.40,
+}
+
+
+def _swv_method_blue(channel: Any) -> Optional[Any]:
+    """Return the fixed blue assigned to a displayed SWV method, if known."""
+    match = re.match(
+        r"(?:Ch)?\d+\s+group\s+(\d+)(?:\s*\||\s*$)",
+        str(channel).strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    shade = _SWV_METHOD_BLUE_SHADES.get(int(match.group(1)))
+    return plt.get_cmap("Blues")(shade) if shade is not None else None
+
+
+def _swv_method_trace_label(channel: Any) -> Optional[str]:
+    """Return the concise legend label for a displayed two-method SWV trace."""
+    match = re.match(
+        r"(?:Ch)?\d+\s+group\s+(\d+)(?:\s*\||\s*$)",
+        str(channel).strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return {
+        1: "Optimized Method",
+        2: "Manual Method",
+    }.get(int(match.group(1)))
+
+
 def _compact_channel_label(channel: Any) -> str:
     """Keep plot labels readable when a display channel embeds SWV settings."""
     text = str(channel).split("|", 1)[0].strip()
     match = re.fullmatch(r"(?:Ch)?(\d+)\s+group\s+(\d+)", text, re.IGNORECASE)
     if match:
-        return f"Ch{match.group(1)} · method {match.group(2)}"
-    return text if text.lower().startswith("ch") else f"Ch{text}"
+        return f"Channel {match.group(1)} · method {match.group(2)}"
+    channel_match = re.fullmatch(r"(?:Ch(?:annel)?)?\s*(\d+)", text, re.IGNORECASE)
+    return f"Channel {channel_match.group(1)}" if channel_match else text
 
 
 def _response_direction_plot_encoding(
@@ -248,7 +283,7 @@ def _cmap_fig(
 
     cmap = plt.get_cmap(colormap_name, max(n, 2))
 
-    norm = Normalize(vmin=0, vmax=max(n - 1, 1))
+    norm = Normalize(vmin=1, vmax=max(n, 2))
 
 
 
@@ -258,7 +293,7 @@ def _cmap_fig(
 
         ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
 
-    for i, r in enumerate(results):
+    for i, r in enumerate(results, start=1):
         if r.get(y_key) is None or r.get("voltage") is None:
 
             continue
@@ -416,7 +451,14 @@ def _cmap_fig(
 
     sm.set_array([])
 
-    fig.colorbar(sm, ax=ax, pad=0.02).set_label("Time order (earliest -> latest)")
+    colorbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    if n == 1:
+        colorbar.set_ticks([1])
+        colorbar.set_ticklabels(["1"])
+    else:
+        colorbar.set_ticks([1, n])
+        colorbar.set_ticklabels(["1", str(n)])
+    colorbar.set_label("SWV Measurement Number")
 
     ax.set_title(title)
 
@@ -2143,9 +2185,9 @@ def plot_grouped_overlaid_traces(
         if not usable:
             continue
         cmap = plt.get_cmap(colormap_name, max(len(usable), 2))
-        norm = Normalize(vmin=0, vmax=max(len(usable) - 1, 1))
+        norm = Normalize(vmin=1, vmax=max(len(usable), 2))
         group_trace_count = 0
-        for index, row in enumerate(usable):
+        for index, row in enumerate(usable, start=1):
             voltage = np.asarray(row["voltage"], dtype=float)
             y_plot = np.asarray(row[y_key], dtype=float)
             try:
@@ -2206,7 +2248,7 @@ def plot_grouped_overlaid_traces(
                 Line2D(
                     [0],
                     [0],
-                    color=cmap(0.65),
+                color=cmap(0.65),
                     lw=3,
                     label=f"G{group_number} · {group_label} ({group_trace_count})",
                 )
@@ -2290,12 +2332,16 @@ def plot_grouped_overlaid_traces(
             colorbar = fig.colorbar(scalar_mappable, cax=colorbar_axis)
             colorbar.ax.set_title(f"G{group_number}", fontsize=8, pad=4)
             if group_trace_count == 1:
-                colorbar.set_ticks([0])
+                colorbar.set_ticks([1])
                 colorbar.set_ticklabels(["1"])
             else:
-                colorbar.set_ticks([0, group_trace_count - 1])
+                colorbar.set_ticks([1, group_trace_count])
                 colorbar.set_ticklabels(["1", str(group_trace_count)])
-            colorbar.set_label("Iteration", fontsize=7, labelpad=2)
+            colorbar.set_label(
+                "SWV Measurement Number",
+                fontsize=7,
+                labelpad=2,
+            )
             colorbar.ax.tick_params(labelsize=7)
     if show_grid:
         ax.grid(True, alpha=0.2)
@@ -2568,12 +2614,23 @@ def plot_metric_vs_scan(
         for channel, color in (channel_colors or {}).items()
         if channel in channels
     })
+    # Displayed SWV methods use method identity—not physical channel, signal
+    # direction, or a caller palette—for color. This keeps Method 1 and Method 2
+    # recognizable in every channel plot.
+    colors.update({
+        channel: method_color
+        for channel in channels
+        if (method_color := _swv_method_blue(channel)) is not None
+    })
 
 
 
     fig, ax = plt.subplots(figsize=figsize)
 
     signal_off_ax = ax.twinx() if use_direction_axes else None
+    plotted_y_by_axis: Dict[Any, List[np.ndarray]] = {ax: []}
+    if signal_off_ax is not None:
+        plotted_y_by_axis[signal_off_ax] = []
     if use_direction_axes:
         ax._swv_response_direction = "signal-on"
         signal_off_ax._swv_response_direction = "signal-off"
@@ -2651,56 +2708,68 @@ def plot_metric_vs_scan(
             if use_direction_axes and normalized_directions[ch] == "signal-off"
             else ax
         )
+        method_trace_label = _swv_method_trace_label(ch)
         direction_suffix = (
-            f" ({normalized_directions[ch]})" if use_direction_colors else ""
+            f" ({normalized_directions[ch]})"
+            if use_direction_colors and method_trace_label is None
+            else ""
         )
 
         line_style, marker = trace_style_by_channel[ch]
-        plot_axis.plot(x, y, marker=marker, linestyle=line_style, ms=3, lw=1.6,
+        line, = plot_axis.plot(x, y, marker=marker, linestyle=line_style, ms=3, lw=1.6,
 
                 color=colors[ch],
 
                 alpha=0.15 if dimmed else 0.9,
 
-                label=f"{_compact_channel_label(ch)}{direction_suffix}")
+                label=(
+                    method_trace_label
+                    or f"{_compact_channel_label(ch)}{direction_suffix}"
+                ))
+        line._swv_preserve_color = _swv_method_blue(ch) is not None
+        plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
 
 
 
     ax.set_xlabel(xlabel)
+    ax._swv_force_black_y_axis = True
+    if signal_off_ax is not None:
+        signal_off_ax._swv_force_black_y_axis = True
 
     if use_direction_axes:
-        signal_on_color = colors[signal_on_channels[0]]
-        signal_off_color = colors[signal_off_channels[0]]
         axis_label = ylabel or metric
-        ax.set_ylabel(f"{axis_label} (signal-on)", color=signal_on_color)
+        ax.set_ylabel(f"{axis_label} (signal-on)", color="black")
         signal_off_ax.set_ylabel(
             f"{axis_label} (signal-off)",
-            color=signal_off_color,
+            color="black",
         )
-        ax.tick_params(axis="y", colors=signal_on_color)
-        signal_off_ax.tick_params(axis="y", colors=signal_off_color)
-        ax.spines["left"].set_color(signal_on_color)
-        signal_off_ax.spines["right"].set_color(signal_off_color)
-        # With independent unpadded scales, low signal-on responses sit at the
-        # bottom while high signal-off buffer responses sit at the top.
-        ax.margins(y=0)
-        signal_off_ax.margins(y=0)
+        ax.tick_params(axis="y", colors="black")
+        signal_off_ax.tick_params(axis="y", colors="black")
+        ax.spines["left"].set_color("black")
+        signal_off_ax.spines["right"].set_color("black")
     elif use_direction_colors and not response_direction_colors_only:
         axis_label = ylabel or metric
-        if offset_to_response_baseline and len(plotted_response_directions) > 1:
-            ax.set_ylabel(axis_label)
-        else:
-            response_direction = next(iter(plotted_response_directions))
-            axis_color = colors[channels[0]]
-            ax.set_ylabel(
-                f"{axis_label} ({response_direction})",
-                color=axis_color,
-            )
-            ax.tick_params(axis="y", colors=axis_color)
-            ax.spines["left"].set_color(axis_color)
-        ax.margins(y=0)
+        ax.set_ylabel(axis_label, color="black")
+        ax.tick_params(axis="y", colors="black")
+        ax.spines["left"].set_color("black")
     else:
         ax.set_ylabel(ylabel or metric)
+
+    # Pad each active metric axis by exactly 10% of its plotted data span.
+    # Twin response-direction axes are intentionally calculated independently.
+    for plot_axis, value_groups in plotted_y_by_axis.items():
+        finite_groups = [values for values in value_groups if values.size]
+        if not finite_groups:
+            continue
+        finite_values = np.concatenate(finite_groups)
+        data_min = float(np.min(finite_values))
+        data_max = float(np.max(finite_values))
+        data_span = data_max - data_min
+        if np.isclose(data_span, 0.0):
+            padding = max(abs(data_min) * 0.1, 0.1)
+        else:
+            padding = data_span * 0.1
+        plot_axis.set_ylim(data_min - padding, data_max + padding)
 
     ax.set_title(title or f"{metric} vs Scan")
 
@@ -2720,14 +2789,17 @@ def plot_metric_vs_scan(
         ax.legend(
             left_handles + right_handles,
             left_labels + right_labels,
-            title="Channel and response direction",
             loc="best",
             fontsize=8,
         )
     elif use_direction_colors:
+        legend_location = (
+            "center left"
+            if plotted_response_directions == {"signal-on"}
+            else "best"
+        )
         ax.legend(
-            title="Channel and response direction",
-            loc="best",
+            loc=legend_location,
             fontsize=8,
         )
     else:
@@ -3020,7 +3092,7 @@ def plot_titration_plateaus(
 
             label=(
                 f"{_compact_channel_label(ch)} ({normalized_directions[ch]})"
-                if use_direction_colors else f"Ch{ch}"
+                if use_direction_colors else f"Channel {ch}"
             ),
 
             zorder=3,
@@ -3134,8 +3206,10 @@ def plot_titration_langmuir(
     show_legend: bool = True,
     included_step_labels: Optional[List[str]] = None,
     remove_extreme_outliers: bool = False,
-    show_uloq: bool = True,
-    show_lod: bool = True,
+    show_uloq: bool = False,
+    show_lod: bool = False,
+    show_fit_details: bool = False,
+    show_errorbar_legend: bool = False,
     response_directions: Optional[Dict[Any, str]] = None,
     channel_colors: Optional[Dict[Any, Any]] = None,
 ) -> Optional[plt.Figure]:
@@ -3236,24 +3310,30 @@ def plot_titration_langmuir(
 
         finite_spread = np.isfinite(raw_y_spread) & (raw_y_spread >= 0)
         if finite_spread.any():
-            ax.errorbar(
+            spread_errorbar = ax.errorbar(
                 raw_x[finite_spread],
                 raw_y[finite_spread],
                 yerr=raw_y_spread[finite_spread],
                 fmt="none",
                 ecolor=color,
                 elinewidth=1.1,
-                capsize=3.0,
-                capthick=1.1,
+                capsize=7.0,
+                capthick=1.4,
                 alpha=0.2 if dimmed else 0.8,
                 label=(
                     "Within-plateau ±1 SD"
-                    if not spread_legend_added else "_nolegend_"
+                    if show_errorbar_legend and not spread_legend_added
+                    else "_nolegend_"
                 ),
                 zorder=2.8,
             )
-            spread_legend_added = True
+            _data_line, cap_lines, _bar_line_collections = spread_errorbar.lines
+            for cap_line in cap_lines:
+                cap_line._swv_langmuir_errorbar_cap = True
+            if show_errorbar_legend:
+                spread_legend_added = True
 
+        method_trace_label = _swv_method_trace_label(ch)
         ax.scatter(
             raw_x,
             raw_y,
@@ -3262,21 +3342,26 @@ def plot_titration_langmuir(
             marker=marker,
             alpha=0.25 if dimmed else 0.95,
             label=(
-                f"{_compact_channel_label(ch)} ({plotted_directions[ch]})"
-                if ch in plotted_directions else _compact_channel_label(ch)
+                method_trace_label
+                or (
+                    f"{_compact_channel_label(ch)} ({plotted_directions[ch]})"
+                    if ch in plotted_directions
+                    else _compact_channel_label(ch)
+                )
             ),
             zorder=3,
         )
 
         if x.size >= 2:
-            ax.plot(
-                x,
-                y,
-                color=color,
-                lw=1.2,
-                linestyle=line_style,
-                alpha=0.15 if dimmed else 0.45,
-            )
+            if show_fit_details:
+                ax.plot(
+                    x,
+                    y,
+                    color=color,
+                    lw=1.2,
+                    linestyle=line_style,
+                    alpha=0.15 if dimmed else 0.45,
+                )
 
             should_fit_channel = fit_langmuir and (
                 fit_channel_set is None or ch in fit_channel_set
@@ -3361,7 +3446,10 @@ def plot_titration_langmuir(
                             )
                         if fit_axis_kind == "concentration":
                             kd_x = float(langmuir_params[2])
-                            if np.nanmin(x) <= kd_x <= np.nanmax(x):
+                            if (
+                                show_fit_details
+                                and np.nanmin(x) <= kd_x <= np.nanmax(x)
+                            ):
                                 kd_y = float(_langmuir_isotherm(kd_x, *langmuir_params))
                                 ax.axvline(
                                     kd_x,
@@ -3396,7 +3484,10 @@ def plot_titration_langmuir(
                                     limit_of_detection,
                                     *langmuir_params,
                                 ))
-                                channel_label = _compact_channel_label(ch)
+                                channel_label = (
+                                    _swv_method_trace_label(ch)
+                                    or _compact_channel_label(ch)
+                                )
                                 unit_suffix = f" {concentration_unit}" if concentration_unit else ""
                                 ax.axvline(
                                     limit_of_detection,
@@ -3421,7 +3512,10 @@ def plot_titration_langmuir(
                                     upper_limit_of_quantification,
                                     *langmuir_params,
                                 ))
-                                channel_label = _compact_channel_label(ch)
+                                channel_label = (
+                                    _swv_method_trace_label(ch)
+                                    or _compact_channel_label(ch)
+                                )
                                 unit_suffix = f" {concentration_unit}" if concentration_unit else ""
                                 ax.axvline(
                                     upper_limit_of_quantification,
@@ -3450,7 +3544,7 @@ def plot_titration_langmuir(
                                     if langmuir_xmax is None
                                     else max(langmuir_xmax, upper_limit_of_quantification)
                                 )
-                    elif saturation_idx >= 1:
+                    elif show_fit_details and saturation_idx >= 1:
                         ax.plot(
                             x[:saturation_idx + 1],
                             y[:saturation_idx + 1],
@@ -3461,7 +3555,10 @@ def plot_titration_langmuir(
 
                     pre_sat_label = "Langmuir <= sat" if langmuir_params is not None else "guide <= sat"
                     sat_step_index = int(fit_steps[saturation_idx]["step_index"])
-                    channel_label = _compact_channel_label(ch)
+                    channel_label = (
+                        _swv_method_trace_label(ch)
+                        or _compact_channel_label(ch)
+                    )
                     if fit_axis_kind == "concentration":
                         unit_suffix = f" {concentration_unit}" if concentration_unit else ""
                         fit_note = f"{channel_label}: {pre_sat_label}; saturation {saturation_x:.3g}{unit_suffix}"
@@ -3492,32 +3589,33 @@ def plot_titration_langmuir(
                                 fit_note += " (projected)"
                     elif langmuir_params is not None:
                         fit_note += ", no Kd (missing concentration axis)"
-                    fit_notes.append(fit_note)
-                    ax.axvline(
-                        saturation_x,
-                        color=color,
-                        lw=1.0,
-                        linestyle=":",
-                        alpha=0.18 if dimmed else 0.5,
-                    )
-                    ax.scatter(
-                        saturation_x,
-                        saturation_y,
-                        s=88,
-                        facecolors="white",
-                        edgecolors=color,
-                        linewidths=1.5,
-                        zorder=5,
-                    )
-                    ax.annotate(
-                        f"Sat. step {sat_step_index}",
-                        xy=(saturation_x, saturation_y),
-                        xytext=(8, -16),
-                        textcoords="offset points",
-                        color=color,
-                        fontsize=8,
-                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.65, pad=1.5),
-                    )
+                    if show_fit_details:
+                        fit_notes.append(fit_note)
+                        ax.axvline(
+                            saturation_x,
+                            color=color,
+                            lw=1.0,
+                            linestyle=":",
+                            alpha=0.18 if dimmed else 0.5,
+                        )
+                        ax.scatter(
+                            saturation_x,
+                            saturation_y,
+                            s=88,
+                            facecolors="white",
+                            edgecolors=color,
+                            linewidths=1.5,
+                            zorder=5,
+                        )
+                        ax.annotate(
+                            f"Sat. step {sat_step_index}",
+                            xy=(saturation_x, saturation_y),
+                            xytext=(8, -16),
+                            textcoords="offset points",
+                            color=color,
+                            fontsize=8,
+                            bbox=dict(facecolor="white", edgecolor="none", alpha=0.65, pad=1.5),
+                        )
 
         plotted_any = True
 
@@ -3527,7 +3625,7 @@ def plot_titration_langmuir(
 
     if x_axis_kind == "concentration":
         unit_suffix = f" ({concentration_unit})" if concentration_unit else ""
-        ax.set_xlabel(f"Ligand concentration{unit_suffix}")
+        ax.set_xlabel(f"Ligand Concentration{unit_suffix}")
         finite_xmax_candidates = [
             float(value)
             for value in (langmuir_xmax, concentration_xmax)
@@ -3539,14 +3637,17 @@ def plot_titration_langmuir(
             ax.set_xlim(left=0, right=xmax * 1.05)
     else:
         ax.set_xlabel("Titration step index")
-    plotted_ylabel = ylabel or metric
-    if baseline_mode == "preceding_buffer":
-        plotted_ylabel = f"Drift-corrected {plotted_ylabel} (B = anchor buffer)"
+    plotted_ylabel = ylabel or (
+        "Peak Height (uA)"
+        if metric == "peak_current_selected"
+        else metric
+    )
     ax.set_ylabel(plotted_ylabel)
+    ax.set_ylim(bottom=0.0)
     ax.set_title(title or f"{metric} titration isotherm")
     ax.grid(False)
     if show_legend:
-        ax.legend(title="Channel", loc="best", fontsize=8)
+        ax.legend(loc="best", fontsize=8)
     if xticks:
         ax.set_xticks(sorted(xticks))
     if fit_notes:
@@ -3813,9 +3914,9 @@ def plot_titration_snr(
 
 def plot_titration_concentration_accuracy(
     accuracy_rows: List[dict],
-    title: str = "Predicted versus known concentration",
+    title: str = "Predicted vs. Known",
     concentration_unit: str = "",
-    figsize: Tuple[int, int] = (6, 5),
+    figsize: Tuple[float, float] = (9, 4.5),
     show_uloq: bool = True,
     show_lod: bool = True,
     percent_error_bound: float = 20.0,
@@ -3863,6 +3964,8 @@ def plot_titration_concentration_accuracy(
     fig, ax = plt.subplots(figsize=figsize)
     lod_legend_added = False
     uloq_legend_added = False
+    log_errors_by_trace: Dict[str, List[float]] = {}
+    annotation_color_by_trace: Dict[str, Any] = {}
     for index, channel in enumerate(channels):
         channel_rows = [
             row for row in usable_rows if row["channel"] == channel
@@ -3877,6 +3980,17 @@ def plot_titration_concentration_accuracy(
         )
         color = colors[channel]
         _line_style, marker = styles[channel]
+        method_trace_label = _swv_method_trace_label(channel)
+        annotation_label = method_trace_label or _compact_channel_label(channel)
+        annotation_color_by_trace.setdefault(annotation_label, color)
+        for row in channel_rows:
+            known_value = float(row["known_concentration"])
+            predicted_value = float(row["predicted_concentration"])
+            log_error = float(np.log10(predicted_value / known_value))
+            if np.isfinite(log_error):
+                log_errors_by_trace.setdefault(annotation_label, []).append(
+                    log_error
+                )
         uloq = next(
             (
                 row.get("upper_limit_of_quantification")
@@ -3933,20 +4047,25 @@ def plot_titration_concentration_accuracy(
                 alpha=0.55,
                 label="_nolegend_",
             )
-        ax.scatter(
+        prediction_points = ax.scatter(
             known,
             predicted,
             s=34,
-            alpha=0.75,
+            alpha=0.30,
             color=color,
             marker=marker,
             label=(
-                f"{_compact_channel_label(channel)} "
-                f"({response_directions[channel]})"
-                if channel in response_directions
-                else _compact_channel_label(channel)
+                method_trace_label
+                or (
+                    f"{_compact_channel_label(channel)} "
+                    f"({response_directions[channel]})"
+                    if channel in response_directions
+                    else _compact_channel_label(channel)
+                )
             ),
+            zorder=3,
         )
+        prediction_points._swv_preserve_alpha = True
 
     if np.isfinite(percent_error_bound) and 0 < percent_error_bound < 100:
         bound_fraction = float(percent_error_bound) / 100.0
@@ -3991,41 +4110,39 @@ def plot_titration_concentration_accuracy(
         linestyle="--",
         label="1:1",
     )
-    absolute_percent_errors = np.asarray(
-        [
-            row["absolute_percent_error"]
-            for row in usable_rows
-            if row.get("absolute_percent_error") is not None
-            and np.isfinite(row.get("absolute_percent_error", np.nan))
-        ],
-        dtype=float,
-    )
-    if absolute_percent_errors.size:
-        median_error = float(np.median(absolute_percent_errors))
-        within_20 = float(np.mean(absolute_percent_errors <= 20.0) * 100.0)
-        concentration_errors = np.asarray(
-            [
-                float(row["predicted_concentration"])
-                - float(row["known_concentration"])
-                for row in usable_rows
-            ],
+    annotation_order = {
+        "Optimized Method": 0,
+        "Manual Method": 1,
+    }
+    for annotation_index, annotation_label in enumerate(sorted(
+        log_errors_by_trace,
+        key=lambda label: (annotation_order.get(label, 2), label),
+    )):
+        trace_log_errors = np.asarray(
+            log_errors_by_trace[annotation_label],
             dtype=float,
         )
-        rmse = float(np.sqrt(np.mean(np.square(concentration_errors))))
-        rmse_unit = f" {concentration_unit}" if concentration_unit else ""
+        if trace_log_errors.size:
+            log_rmse = float(
+                np.sqrt(np.mean(np.square(trace_log_errors)))
+            )
+            rms_fold_error = float(10.0 ** log_rmse)
+        else:
+            continue
+        compact_annotation_label = annotation_label.removesuffix(" Method")
         ax.text(
             0.03,
-            0.97,
+            0.97 - (0.075 * annotation_index),
             (
-                f"Median |error|: {median_error:.2f}%\n"
-                f"Within ±20%: {within_20:.1f}%\n"
-                f"RMSE: {rmse:.4g}{rmse_unit}"
+                f"{compact_annotation_label} RMS Fold Error: "
+                f"{rms_fold_error:.2f}×"
             ),
             transform=ax.transAxes,
             va="top",
             ha="left",
             fontsize=9,
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=4),
+            color=annotation_color_by_trace[annotation_label],
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=2),
         )
     unit_suffix = f" ({concentration_unit})" if concentration_unit else ""
     ax.set_xlabel(f"Known concentration{unit_suffix}")
@@ -4038,28 +4155,29 @@ def plot_titration_concentration_accuracy(
     ax.set_aspect("equal", adjustable="box")
     ax.grid(False)
     handles, labels = ax.get_legend_handles_labels()
-    legend_columns = min(4, max(1, len(handles)))
-    legend_rows = int(np.ceil(len(handles) / legend_columns))
-    legend = ax.legend(
-        handles,
-        labels,
-        title="Channel / method and limits",
+    allowed_legend_labels = {
+        f"Within ±{percent_error_bound:g}%",
+        "1:1",
+    }
+    limit_handles_and_labels = [
+        (handle, label)
+        for handle, label in zip(handles, labels)
+        if label in allowed_legend_labels
+    ]
+    ax.legend(
+        [item[0] for item in limit_handles_and_labels],
+        [item[1] for item in limit_handles_and_labels],
         fontsize=8,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-        ncol=legend_columns,
-        borderaxespad=0.0,
+        loc="lower right",
     )
-    legend.get_title().set_fontsize(8)
-    bottom_margin = min(0.48, 0.22 + (0.055 * max(0, legend_rows - 1)))
-    fig.tight_layout(rect=(0, bottom_margin, 1, 1))
+    fig.tight_layout()
     return fig
 
 
 def plot_titration_concentration_vs_measurement(
     accuracy_rows: List[dict],
     title: str = "Langmuir-predicted concentration by measurement",
-    concentration_unit: str = "",
+    concentration_unit: str = "uM",
     figsize: Tuple[int, int] = (9, 4.5),
     percent_error_bound: float = 20.0,
     acceptance_region_alpha: float = 0.10,
@@ -4094,7 +4212,10 @@ def plot_titration_concentration_vs_measurement(
     if not usable_rows:
         return None
 
-    x_key = "source_scan_number"
+    # Each displayed SWV method has its own remapped measurement sequence.
+    # The source axis interleaves methods and is therefore 2× too large for a
+    # two-method experiment.
+    x_key = "scan_number"
     selected_known_concentrations = np.asarray(
         [
             float(row["known_concentration"])
@@ -4120,9 +4241,6 @@ def plot_titration_concentration_vs_measurement(
             if positive_predictions.size else 1.0
         )
 
-    if not all(row.get(x_key) is not None for row in usable_rows):
-        x_key = "scan_number"
-
     usable_rows = sorted(usable_rows, key=lambda row: row.get(x_key))
     reference_by_x: Dict[Any, List[float]] = {}
     for row in usable_rows:
@@ -4142,27 +4260,6 @@ def plot_titration_concentration_vs_measurement(
     plotted_level_values = list(reference_levels)
 
     fig, ax = plt.subplots(figsize=figsize)
-    if np.isfinite(percent_error_bound) and 0 < percent_error_bound < 100:
-        bound_fraction = float(percent_error_bound) / 100.0
-        lower_reference_levels = _concentration_to_doubling_level(
-            (1.0 - bound_fraction) * reference_y,
-            minimum_nonzero_concentration,
-        )
-        upper_reference_levels = _concentration_to_doubling_level(
-            (1.0 + bound_fraction) * reference_y,
-            minimum_nonzero_concentration,
-        )
-        acceptance_region = ax.fill_between(
-            reference_x,
-            lower_reference_levels,
-            upper_reference_levels,
-            step="mid",
-            color="tab:green",
-            alpha=float(np.clip(acceptance_region_alpha, 0.0, 1.0)),
-            label=f"Known concentration ±{percent_error_bound:g}%",
-            zorder=0,
-        )
-        acceptance_region._swv_preserve_alpha = True
     ax.step(
         reference_x,
         reference_levels,
@@ -4170,8 +4267,8 @@ def plot_titration_concentration_vs_measurement(
         color="black",
         lw=1.8,
         linestyle="--",
-        label="Known concentration",
-        zorder=2,
+        label="Known Concentration",
+        zorder=10,
     )
 
     channels = sorted(
@@ -4287,6 +4384,7 @@ def plot_titration_concentration_vs_measurement(
             label="_nolegend_",
             zorder=3,
         )
+        method_trace_label = _swv_method_trace_label(channel)
         ax.scatter(
             x_values,
             predicted_levels,
@@ -4295,54 +4393,17 @@ def plot_titration_concentration_vs_measurement(
             marker=marker,
             alpha=0.8,
             label=(
-                f"{_compact_channel_label(channel)} "
-                f"({response_directions[channel]})"
-                if channel in response_directions
-                else _compact_channel_label(channel)
+                method_trace_label
+                or (
+                    f"{_compact_channel_label(channel)} "
+                    f"({response_directions[channel]})"
+                    if channel in response_directions
+                    else _compact_channel_label(channel)
+                )
             ),
             zorder=4,
         )
 
-    errors = np.asarray(
-        [
-            float(row["_plot_predicted_concentration"])
-            - float(row["known_concentration"])
-            for row in usable_rows
-        ],
-        dtype=float,
-    )
-    rmse = float(np.sqrt(np.mean(np.square(errors))))
-    known_values = np.asarray(
-        [float(row["known_concentration"]) for row in usable_rows],
-        dtype=float,
-    )
-    nonzero_target_mask = known_values > 0
-    within = (
-        float(
-            100.0 * np.mean(
-                np.abs(errors[nonzero_target_mask])
-                <= (float(percent_error_bound) / 100.0)
-                * known_values[nonzero_target_mask]
-            )
-        )
-        if nonzero_target_mask.any() else np.nan
-    )
-    unit_suffix = f" {concentration_unit}" if concentration_unit else ""
-    within_text = f"{within:.1f}%" if np.isfinite(within) else "n/a"
-    prediction_summary = ax.text(
-        0.5,
-        1.015,
-        (
-            f"All displayed predictions vs known: RMSE = {rmse:.4g}{unit_suffix}"
-            f"  |  Nonzero targets within ±{percent_error_bound:g}%: {within_text}"
-        ),
-        transform=ax.transAxes,
-        va="bottom",
-        ha="center",
-        fontsize=8,
-        color="dimgray",
-    )
-    prediction_summary._swv_preserve_fontsize = True
     if suppressed_uncertainty_count or any(
         row.get("predicted_concentration_std") is not None
         and np.isfinite(row.get("predicted_concentration_std", np.nan))
@@ -4354,36 +4415,34 @@ def plot_titration_concentration_vs_measurement(
                 f"; omitted above ULOQ (n={suppressed_uncertainty_count})"
             )
         ax._swv_uncertainty_note = uncertainty_note
-    ax.set_xlabel("Measurement number")
+    ax.set_xlabel("SWV Measurement Number")
     concentration_label = (
-        f"Concentration ({concentration_unit})"
-        if concentration_unit else "Concentration"
+        f"Predicted Concentration ({concentration_unit})"
+        if concentration_unit else "Predicted Concentration"
     )
     ax.set_ylabel(concentration_label)
-    ax.set_title(title, pad=30)
+    ax.set_title(title, pad=12)
     ax.set_yscale("linear")
     displayed_known_concentrations = (
         selected_known_concentrations
         if selected_known_concentrations.size
         else np.asarray([minimum_nonzero_concentration], dtype=float)
     )
-    maximum_selected_concentration = float(
-        np.nanmax(displayed_known_concentrations)
-    )
-    default_y_max = float(_concentration_to_doubling_level(
-        [1.3 * maximum_selected_concentration],
-        minimum_nonzero_concentration,
-    )[0])
     finite_plotted_levels = np.asarray([
         value for value in plotted_level_values if np.isfinite(value)
     ])
-    minimum_plotted_level = (
-        float(np.nanmin(finite_plotted_levels))
-        if finite_plotted_levels.size else 0.0
-    )
-    level_span = max(default_y_max - minimum_plotted_level, 1.0)
-    default_y_min = min(-0.15, minimum_plotted_level - (0.04 * level_span))
-    ax.set_ylim(default_y_min, default_y_max)
+    if finite_plotted_levels.size:
+        minimum_plotted_level = float(np.nanmin(finite_plotted_levels))
+        maximum_plotted_level = float(np.nanmax(finite_plotted_levels))
+        level_span = maximum_plotted_level - minimum_plotted_level
+        if np.isclose(level_span, 0.0):
+            padding = max(abs(minimum_plotted_level) * 0.1, 0.1)
+        else:
+            padding = level_span * 0.1
+        ax.set_ylim(
+            minimum_plotted_level - padding,
+            maximum_plotted_level + padding,
+        )
     tick_concentrations = np.concatenate((
         [0.0],
         np.unique(displayed_known_concentrations),
@@ -4434,24 +4493,19 @@ def plot_titration_concentration_vs_measurement(
         ax,
         filtered_vlines,
         max(float(vline_y_frac), 0.92),
-        fontsize=7,
-        fontweight="normal",
-        bbox_alpha=0.35,
     )
     ax.grid(False)
     handles, labels = ax.get_legend_handles_labels()
-    legend_columns = min(4, max(1, len(handles)))
     ax.legend(
         handles,
         labels,
-        title="Reference and channel / method",
         fontsize=8,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.18),
-        ncol=legend_columns,
-        borderaxespad=0.0,
+        loc="upper left",
+        bbox_to_anchor=(0.0, 0.80),
+        ncol=1,
+        borderaxespad=0.5,
     )
-    fig.tight_layout(rect=(0, 0.22, 1, 1))
+    fig.tight_layout()
     return fig
 
 
@@ -4556,7 +4610,7 @@ def plot_drift_vs_scan(
 
                 alpha=0.15 if dimmed else 0.9,
 
-                label=f"Ch{ch}")
+                label=f"Channel {ch}")
 
 
 

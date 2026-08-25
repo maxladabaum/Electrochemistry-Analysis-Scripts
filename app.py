@@ -207,33 +207,89 @@ def _parse_text_list(text: str) -> List[str]:
     ]
 
 
+_SWV_METRICS_STYLE_SUFFIXES = frozenset({
+    "width_px",
+    "height_px",
+    "text_size_points",
+    "line_width_scale",
+    "line_color_override",
+    "margin_px",
+    "perimeter_width",
+    "perimeter_color",
+    "marker_size",
+    "marker_opacity",
+    "show_legend",
+    "show_grid",
+})
+_SWV_OVERLAY_WIDTH_SCALE = 0.67
+_SWV_OVERLAY_TEXT_SCALE = 1.0 / _SWV_OVERLAY_WIDTH_SCALE
+
+
+def _resolve_swv_plot_setting(
+    settings_prefix: str,
+    suffix: str,
+    default: Any,
+    *,
+    inherit_metrics_style: bool = False,
+) -> Any:
+    """Resolve shared plot styling, optionally preferring Metrics-wide values."""
+    if inherit_metrics_style and suffix in _SWV_METRICS_STYLE_SUFFIXES:
+        metrics_key = f"swv_metrics_all_{suffix}"
+        if metrics_key in st.session_state:
+            return st.session_state[metrics_key]
+    scoped_key = f"{settings_prefix}_{suffix}"
+    if scoped_key in st.session_state:
+        return st.session_state[scoped_key]
+    return st.session_state.get(f"swv_plot_{suffix}", default)
+
+
+def _sync_shared_swv_style_to_metrics(suffix: str) -> None:
+    """Keep the sidebar style control and Metrics-wide default in agreement."""
+    source_key = f"swv_plot_{suffix}"
+    if source_key in st.session_state:
+        st.session_state[f"swv_metrics_all_{suffix}"] = st.session_state[source_key]
+
+
 def _apply_swv_plot_formatting(
     fig: plt.Figure,
     dpi: int,
     plot_kind: Optional[str] = None,
+    settings_prefix: str = "swv_plot",
 ) -> None:
-    width_px = int(st.session_state.get("swv_plot_width_px", 1200))
-    height_px = int(st.session_state.get("swv_plot_height_px", 600))
-    text_size = float(st.session_state.get("swv_plot_text_size_points", 10.0))
-    line_scale = float(st.session_state.get("swv_plot_line_width_scale", 1.0))
-    perimeter_width = float(st.session_state.get("swv_plot_perimeter_width", 0.8))
+    def plot_setting(suffix: str, default: Any) -> Any:
+        return _resolve_swv_plot_setting(
+            settings_prefix,
+            suffix,
+            default,
+            inherit_metrics_style=plot_kind == "swv_trace",
+        )
+
+    width_px = int(plot_setting("width_px", 1200))
+    if plot_kind == "swv_trace":
+        width_px = max(1, int(round(width_px * _SWV_OVERLAY_WIDTH_SCALE)))
+    height_px = int(plot_setting("height_px", 600))
+    text_size = float(plot_setting("text_size_points", 10.0))
+    if plot_kind == "swv_trace":
+        text_size *= _SWV_OVERLAY_TEXT_SCALE
+    line_scale = float(plot_setting("line_width_scale", 1.0))
+    perimeter_width = float(plot_setting("perimeter_width", 0.8))
     perimeter_color = str(
-        st.session_state.get("swv_plot_perimeter_color", "#222222") or "#222222"
+        plot_setting("perimeter_color", "#222222") or "#222222"
     ).strip()
     if not is_color_like(perimeter_color):
         perimeter_color = "#222222"
-    marker_size = float(st.session_state.get("swv_plot_marker_size", 6.0))
-    marker_opacity = float(st.session_state.get("swv_plot_marker_opacity", 0.85))
-    show_legend = bool(st.session_state.get("swv_plot_show_legend", True))
-    show_grid = bool(st.session_state.get("swv_plot_show_grid", False))
-    line_color = str(st.session_state.get("swv_plot_line_color_override", "") or "").strip()
+    marker_size = float(plot_setting("marker_size", 6.0))
+    marker_opacity = float(plot_setting("marker_opacity", 0.85))
+    show_legend = bool(plot_setting("show_legend", True))
+    show_grid = bool(plot_setting("show_grid", False))
+    line_color = str(plot_setting("line_color_override", "") or "").strip()
     if line_color and not is_color_like(line_color):
         line_color = ""
 
     fig.set_size_inches(width_px / float(dpi), height_px / float(dpi), forward=True)
-    title_override = str(st.session_state.get("swv_plot_title_override", "") or "").strip()
-    x_label_override = str(st.session_state.get("swv_plot_x_label_override", "") or "").strip()
-    y_label_override = str(st.session_state.get("swv_plot_y_label_override", "") or "").strip()
+    title_override = str(plot_setting("title_override", "") or "").strip()
+    x_label_override = str(plot_setting("x_label_override", "") or "").strip()
+    y_label_override = str(plot_setting("y_label_override", "") or "").strip()
     colorbar_label_override = str(
         st.session_state.get("swv_plot_colorbar_label_override", "") or ""
     ).strip()
@@ -263,6 +319,11 @@ def _apply_swv_plot_formatting(
             spine.set_visible(perimeter_width > 0)
             spine.set_linewidth(perimeter_width)
             spine.set_edgecolor(perimeter_color)
+        if bool(getattr(axis, "_swv_force_black_y_axis", False)):
+            axis.yaxis.label.set_color("black")
+            axis.tick_params(axis="y", colors="black")
+            axis.spines["left"].set_edgecolor("black")
+            axis.spines["right"].set_edgecolor("black")
         legend = axis.get_legend()
         if legend is not None:
             legend.set_visible(show_legend)
@@ -271,7 +332,7 @@ def _apply_swv_plot_formatting(
             legend.get_title().set_fontsize(text_size * 0.9)
         for line in axis.lines:
             line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
-            if line_color:
+            if line_color and not bool(getattr(line, "_swv_preserve_color", False)):
                 line.set_color(line_color)
         for collection in axis.collections:
             if hasattr(collection, "get_sizes") and hasattr(collection, "set_sizes"):
@@ -300,12 +361,12 @@ def _apply_swv_plot_formatting(
 
         for axis_key, matplotlib_axis in (("x", axis.xaxis), ("y", axis.yaxis)):
             labels = _parse_text_list(
-                st.session_state.get(f"swv_plot_{axis_key}_tick_labels", "")
+                plot_setting(f"{axis_key}_tick_labels", "")
             )
             if not labels:
                 continue
             positions = _parse_numeric_list(
-                st.session_state.get(f"swv_plot_{axis_key}_tick_positions", "")
+                plot_setting(f"{axis_key}_tick_positions", "")
             )
             if not positions:
                 positions = list(matplotlib_axis.get_ticklocs())
@@ -320,11 +381,11 @@ def _apply_swv_plot_formatting(
         st.session_state.get("swv_plot_colorbar_tick_positions", "")
     )
     for axis in colorbar_axes:
-        axis.tick_params(labelsize=text_size * 0.8)
-        axis.title.set_fontsize(text_size * 0.9)
+        axis.tick_params(labelsize=text_size * 0.9)
+        axis.title.set_fontsize(text_size)
         if colorbar_label_override:
             axis.set_ylabel(colorbar_label_override)
-        axis.yaxis.label.set_fontsize(text_size * 0.8)
+        axis.yaxis.label.set_fontsize(text_size)
         if colorbar_tick_labels:
             positions = colorbar_tick_positions or list(axis.yaxis.get_ticklocs())
             count = min(len(positions), len(colorbar_tick_labels))
@@ -375,6 +436,301 @@ def _position_swv_colorbars(fig: plt.Figure) -> None:
         ])
 
 
+def _apply_all_metrics_plot_settings() -> None:
+    """Copy the Metrics-wide form values into the shared SWV plot settings."""
+    setting_map = {
+        "swv_plot_width_px": "swv_metrics_all_width_px",
+        "swv_plot_height_px": "swv_metrics_all_height_px",
+        "swv_plot_text_size_points": "swv_metrics_all_text_size_points",
+        "swv_plot_line_width_scale": "swv_metrics_all_line_width_scale",
+        "swv_plot_line_color_override": "swv_metrics_all_line_color_override",
+        "swv_plot_margin_px": "swv_metrics_all_margin_px",
+        "swv_plot_perimeter_width": "swv_metrics_all_perimeter_width",
+        "swv_plot_perimeter_color": "swv_metrics_all_perimeter_color",
+        "swv_plot_show_legend": "swv_metrics_all_show_legend",
+        "swv_plot_show_grid": "swv_metrics_all_show_grid",
+        "swv_plot_marker_size": "swv_metrics_all_marker_size",
+        "swv_plot_marker_opacity": "swv_metrics_all_marker_opacity",
+        "swv_plot_title_override": "swv_metrics_all_title_override",
+        "swv_plot_x_label_override": "swv_metrics_all_x_label_override",
+        "swv_plot_y_label_override": "swv_metrics_all_y_label_override",
+    }
+    for target_key, source_key in setting_map.items():
+        if source_key in st.session_state:
+            st.session_state[target_key] = st.session_state[source_key]
+
+    # Saved plot-specific widget state otherwise supersedes the shared values.
+    plot_override_suffixes = (
+        "_override_plot_text",
+        "_custom_title",
+        "_custom_xlabel",
+        "_custom_ylabel",
+        "_show_legend",
+        "_custom_legend_title",
+        "_custom_legend_labels",
+        "_override_series_colors",
+        "_custom_series_colors",
+    )
+    protected_keys = {*setting_map, *setting_map.values()}
+    rendered_plot_keys = tuple(
+        str(key)
+        for key in st.session_state.get("_swv_rendered_plot_keys", [])
+    )
+    for state_key in list(st.session_state):
+        if (
+            isinstance(state_key, str)
+            and state_key not in protected_keys
+            and any(
+                state_key.startswith(f"{plot_key}_")
+                for plot_key in rendered_plot_keys
+            )
+            and state_key.endswith(plot_override_suffixes)
+        ):
+            del st.session_state[state_key]
+    st.session_state["_swv_metrics_all_settings_applied"] = True
+
+
+def _render_all_metrics_plot_settings() -> None:
+    """Render one form that controls the shared formatting of all Metrics plots."""
+    with st.expander("All plot settings", expanded=False):
+        st.caption(
+            "These settings apply to every Metrics plot. Applying them clears "
+            "conflicting changes saved in individual Plot settings popups."
+        )
+        with st.form("swv_metrics_all_plot_settings_form"):
+            canvas_columns = st.columns(2)
+            canvas_columns[0].number_input(
+                "Plot width (px)", min_value=600, max_value=2200,
+                value=int(st.session_state.get("swv_plot_width_px", 1200)),
+                step=20, key="swv_metrics_all_width_px",
+            )
+            canvas_columns[1].number_input(
+                "Plot height (px)", min_value=300, max_value=1200,
+                value=int(st.session_state.get("swv_plot_height_px", 600)),
+                step=20, key="swv_metrics_all_height_px",
+            )
+
+            style_columns = st.columns(2)
+            style_columns[0].slider(
+                "Plot text size", min_value=6.0, max_value=36.0,
+                value=float(st.session_state.get("swv_plot_text_size_points", 10.0)),
+                step=0.5, format="%.1f pt",
+                key="swv_metrics_all_text_size_points",
+            )
+            style_columns[1].slider(
+                "Line thickness", min_value=0.25, max_value=5.0,
+                value=float(st.session_state.get("swv_plot_line_width_scale", 1.0)),
+                step=0.25, format="%.2fx",
+                key="swv_metrics_all_line_width_scale",
+            )
+            st.text_input(
+                "Line color override",
+                value=str(st.session_state.get("swv_plot_line_color_override", "")),
+                key="swv_metrics_all_line_color_override",
+                help="Leave blank to retain each plot's assigned series colors.",
+            )
+
+            frame_columns = st.columns(3)
+            frame_columns[0].slider(
+                "Outer margin", min_value=0, max_value=200,
+                value=int(st.session_state.get("swv_plot_margin_px", 40)),
+                step=5, format="%d px", key="swv_metrics_all_margin_px",
+            )
+            frame_columns[1].number_input(
+                "Perimeter width", min_value=0.0, max_value=5.0,
+                value=float(st.session_state.get("swv_plot_perimeter_width", 0.8)),
+                step=0.2, key="swv_metrics_all_perimeter_width",
+            )
+            frame_columns[2].text_input(
+                "Perimeter color",
+                value=str(st.session_state.get("swv_plot_perimeter_color", "#222222")),
+                key="swv_metrics_all_perimeter_color",
+            )
+
+            marker_columns = st.columns(2)
+            marker_columns[0].slider(
+                "Marker size", min_value=2.0, max_value=20.0,
+                value=float(st.session_state.get("swv_plot_marker_size", 6.0)),
+                step=1.0, key="swv_metrics_all_marker_size",
+            )
+            marker_columns[1].slider(
+                "Marker opacity", min_value=0.05, max_value=1.0,
+                value=float(st.session_state.get("swv_plot_marker_opacity", 0.85)),
+                step=0.05, key="swv_metrics_all_marker_opacity",
+            )
+            visibility_columns = st.columns(2)
+            visibility_columns[0].checkbox(
+                "Show legends",
+                value=bool(st.session_state.get("swv_plot_show_legend", True)),
+                key="swv_metrics_all_show_legend",
+            )
+            visibility_columns[1].checkbox(
+                "Show background grid",
+                value=bool(st.session_state.get("swv_plot_show_grid", False)),
+                key="swv_metrics_all_show_grid",
+            )
+
+            st.markdown("**Text overrides (optional)**")
+            st.text_input(
+                "Title override",
+                value=str(st.session_state.get("swv_plot_title_override", "")),
+                key="swv_metrics_all_title_override",
+                help="Leave blank to retain each plot's own title.",
+            )
+            label_columns = st.columns(2)
+            label_columns[0].text_input(
+                "X-axis label override",
+                value=str(st.session_state.get("swv_plot_x_label_override", "")),
+                key="swv_metrics_all_x_label_override",
+            )
+            label_columns[1].text_input(
+                "Y-axis label override",
+                value=str(st.session_state.get("swv_plot_y_label_override", "")),
+                key="swv_metrics_all_y_label_override",
+            )
+            st.form_submit_button(
+                "Apply to all plots", type="primary", use_container_width=True,
+                on_click=_apply_all_metrics_plot_settings,
+            )
+        if st.session_state.pop("_swv_metrics_all_settings_applied", False):
+            st.success("Applied these settings to all Metrics plots.")
+
+
+def _apply_all_langmuir_plot_settings() -> None:
+    """Apply the Langmuir-only form without changing other Metrics plots."""
+    suffixes = (
+        "width_px", "height_px", "text_size_points", "line_width_scale",
+        "line_color_override", "margin_px", "perimeter_width",
+        "perimeter_color", "show_legend", "show_grid", "marker_size",
+        "marker_opacity", "title_override", "x_label_override",
+        "y_label_override",
+    )
+    for suffix in suffixes:
+        source_key = f"swv_langmuir_all_{suffix}"
+        if source_key in st.session_state:
+            st.session_state[f"swv_langmuir_plot_{suffix}"] = (
+                st.session_state[source_key]
+            )
+
+    plot_override_suffixes = (
+        "_override_plot_text", "_custom_title", "_custom_xlabel",
+        "_custom_ylabel", "_show_legend", "_custom_legend_title",
+        "_custom_legend_labels", "_override_series_colors",
+        "_custom_series_colors",
+    )
+    for plot_key in st.session_state.get("_swv_rendered_plot_keys", []):
+        if not str(plot_key).startswith("titration_langmuir_"):
+            continue
+        for state_key in list(st.session_state):
+            if (
+                isinstance(state_key, str)
+                and state_key.startswith(f"{plot_key}_")
+                and state_key.endswith(plot_override_suffixes)
+            ):
+                del st.session_state[state_key]
+    st.session_state["_swv_langmuir_all_settings_applied"] = True
+
+
+def _render_all_langmuir_plot_settings() -> None:
+    """Render shared controls scoped only to Langmuir fit plots."""
+    with st.expander("Langmuir plot settings", expanded=True):
+        st.caption(
+            "These values affect every Langmuir fit plot and leave the other "
+            "Metrics plots unchanged."
+        )
+        with st.form("swv_langmuir_all_plot_settings_form"):
+            size_columns = st.columns(2)
+            size_columns[0].number_input(
+                "Plot width (px)", min_value=600, max_value=2200,
+                value=int(st.session_state.get("swv_langmuir_plot_width_px", 1200)),
+                step=20, key="swv_langmuir_all_width_px",
+            )
+            size_columns[1].number_input(
+                "Plot height (px)", min_value=300, max_value=1200,
+                value=int(st.session_state.get("swv_langmuir_plot_height_px", 600)),
+                step=20, key="swv_langmuir_all_height_px",
+            )
+            style_columns = st.columns(2)
+            style_columns[0].slider(
+                "Text size", min_value=6.0, max_value=36.0,
+                value=float(st.session_state.get("swv_langmuir_plot_text_size_points", 10.0)),
+                step=0.5, format="%.1f pt", key="swv_langmuir_all_text_size_points",
+            )
+            style_columns[1].slider(
+                "Line thickness", min_value=0.25, max_value=5.0,
+                value=float(st.session_state.get("swv_langmuir_plot_line_width_scale", 1.0)),
+                step=0.25, format="%.2fx", key="swv_langmuir_all_line_width_scale",
+            )
+            st.text_input(
+                "Line color override",
+                value=str(st.session_state.get("swv_langmuir_plot_line_color_override", "")),
+                key="swv_langmuir_all_line_color_override",
+                help="Leave blank to retain the Optimized and Manual method blues.",
+            )
+            frame_columns = st.columns(3)
+            frame_columns[0].slider(
+                "Outer margin", min_value=0, max_value=200,
+                value=int(st.session_state.get("swv_langmuir_plot_margin_px", 40)),
+                step=5, format="%d px", key="swv_langmuir_all_margin_px",
+            )
+            frame_columns[1].number_input(
+                "Perimeter width", min_value=0.0, max_value=5.0,
+                value=float(st.session_state.get("swv_langmuir_plot_perimeter_width", 0.8)),
+                step=0.2, key="swv_langmuir_all_perimeter_width",
+            )
+            frame_columns[2].text_input(
+                "Perimeter color",
+                value=str(st.session_state.get("swv_langmuir_plot_perimeter_color", "#222222")),
+                key="swv_langmuir_all_perimeter_color",
+            )
+            marker_columns = st.columns(2)
+            marker_columns[0].slider(
+                "Marker size", min_value=2.0, max_value=20.0,
+                value=float(st.session_state.get("swv_langmuir_plot_marker_size", 6.0)),
+                step=1.0, key="swv_langmuir_all_marker_size",
+            )
+            marker_columns[1].slider(
+                "Marker opacity", min_value=0.05, max_value=1.0,
+                value=float(st.session_state.get("swv_langmuir_plot_marker_opacity", 0.85)),
+                step=0.05, key="swv_langmuir_all_marker_opacity",
+            )
+            visibility_columns = st.columns(2)
+            visibility_columns[0].checkbox(
+                "Show legends",
+                value=bool(st.session_state.get("swv_langmuir_plot_show_legend", True)),
+                key="swv_langmuir_all_show_legend",
+            )
+            visibility_columns[1].checkbox(
+                "Show grid",
+                value=bool(st.session_state.get("swv_langmuir_plot_show_grid", False)),
+                key="swv_langmuir_all_show_grid",
+            )
+            st.markdown("**Text overrides (optional)**")
+            st.text_input(
+                "Title override",
+                value=str(st.session_state.get("swv_langmuir_plot_title_override", "")),
+                key="swv_langmuir_all_title_override",
+            )
+            label_columns = st.columns(2)
+            label_columns[0].text_input(
+                "X-axis label override",
+                value=str(st.session_state.get("swv_langmuir_plot_x_label_override", "")),
+                key="swv_langmuir_all_x_label_override",
+            )
+            label_columns[1].text_input(
+                "Y-axis label override",
+                value=str(st.session_state.get("swv_langmuir_plot_y_label_override", "")),
+                key="swv_langmuir_all_y_label_override",
+            )
+            st.form_submit_button(
+                "Apply to all Langmuir plots", type="primary",
+                use_container_width=True,
+                on_click=_apply_all_langmuir_plot_settings,
+            )
+        if st.session_state.pop("_swv_langmuir_all_settings_applied", False):
+            st.success("Applied these settings to all Langmuir fit plots.")
+
+
 def render_downloadable_pyplot(
     container,
     fig: plt.Figure,
@@ -384,8 +740,30 @@ def render_downloadable_pyplot(
     dpi: int = 150,
     plot_kind: Optional[str] = None,
 ) -> None:
+    settings_prefix = (
+        "swv_langmuir_plot" if plot_kind == "langmuir_fit" else "swv_plot"
+    )
+
+    def active_plot_setting(suffix: str, default: Any) -> Any:
+        return _resolve_swv_plot_setting(
+            settings_prefix,
+            suffix,
+            default,
+            inherit_metrics_style=plot_kind == "swv_trace",
+        )
+
     if globals().get("analysis_mode") == "SWV":
-        _apply_swv_plot_formatting(fig, dpi, plot_kind=plot_kind)
+        rendered_plot_keys = set(
+            st.session_state.get("_swv_rendered_plot_keys", [])
+        )
+        rendered_plot_keys.add(key)
+        st.session_state["_swv_rendered_plot_keys"] = sorted(rendered_plot_keys)
+        _apply_swv_plot_formatting(
+            fig,
+            dpi,
+            plot_kind=plot_kind,
+            settings_prefix=settings_prefix,
+        )
     plot_slot = container.empty()
     download_col, settings_col = container.columns([1, 1])
 
@@ -439,7 +817,12 @@ def render_downloadable_pyplot(
         if primary_axis is not None else []
     )
     output_dpi = int(dpi)
-    display_width_px = int(st.session_state.get("swv_plot_width_px", 1200))
+    display_width_px = int(active_plot_setting("width_px", 1200))
+    if plot_kind == "swv_trace":
+        display_width_px = max(
+            1,
+            int(round(display_width_px * _SWV_OVERLAY_WIDTH_SCALE)),
+        )
     reconstruction_width_px = display_width_px
     reconstruction_height_px = int(st.session_state.get("swv_plot_height_px", 600))
     reconstruction_text_size = float(
@@ -1081,7 +1464,7 @@ def render_downloadable_pyplot(
                 margin_px = (
                     reconstruction_margin_px
                     if plot_kind == "concentration_reconstruction"
-                    else int(st.session_state.get("swv_plot_margin_px", 40))
+                    else int(active_plot_setting("margin_px", 40))
                 )
                 fig.tight_layout(pad=max(0.5, margin_px / 30.0))
             except (RuntimeError, ValueError):
@@ -1095,7 +1478,14 @@ def render_downloadable_pyplot(
         format="png",
         dpi=output_dpi,
         bbox_inches=(
-            None if plot_kind == "concentration_reconstruction" else "tight"
+            None
+            if plot_kind in {
+                "concentration_accuracy",
+                "concentration_measurement",
+                "concentration_reconstruction",
+                "swv_trace",
+            }
+            else "tight"
         ),
     )
     if globals().get("analysis_mode") == "SWV":
@@ -2683,6 +3073,20 @@ def _high_contrast_response_shades(count: int) -> np.ndarray:
     ])
 
 
+def _swv_method_blue(channel: Any) -> Optional[Any]:
+    """Use one stable blue shade for each displayed SWV method number."""
+    match = re.match(
+        r"(?:Ch)?\d+\s+group\s+(\d+)(?:\s*\||\s*$)",
+        str(channel).strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    method_shades = {1: 0.90, 2: 0.40}
+    shade = method_shades.get(int(match.group(1)))
+    return plt.get_cmap("Blues")(shade) if shade is not None else None
+
+
 def _channel_option_value(option: str) -> Any:
     text = option.removeprefix("Ch")
     try:
@@ -2695,8 +3099,9 @@ def _compact_titration_channel_label(channel: Any) -> str:
     text = str(channel).split("|", 1)[0].strip()
     match = re.fullmatch(r"(?:Ch)?(\d+)\s+group\s+(\d+)", text, re.IGNORECASE)
     if match:
-        return f"Ch{match.group(1)} · method {match.group(2)}"
-    return text if text.lower().startswith("ch") else f"Ch{text}"
+        return f"Channel {match.group(1)} · method {match.group(2)}"
+    channel_match = re.fullmatch(r"(?:Ch(?:annel)?)?\s*(\d+)", text, re.IGNORECASE)
+    return f"Channel {channel_match.group(1)}" if channel_match else text
 
 
 def _titration_diagnostic_row_groups(
@@ -2772,6 +3177,54 @@ def format_swv_settings_label(row: dict) -> str:
     if amplitude is not None:
         parts.append(f"amplitude {amplitude:g} V")
     return "; ".join(parts) if parts else "SWV settings unavailable"
+
+
+def format_swv_overlay_title(channel: Any, rows: List[dict]) -> str:
+    """Return a concise method/channel title for an SWV overlay plot."""
+    original_channel = next(
+        (
+            row.get("original_channel")
+            for row in rows
+            if row.get("original_channel") is not None
+        ),
+        channel,
+    )
+    channel_match = re.search(r"\d+", str(original_channel))
+    channel_label = (
+        f"Channel {channel_match.group(0)}"
+        if channel_match
+        else f"Channel {original_channel}"
+    )
+
+    method_names = []
+    for row in rows:
+        try:
+            group_index = int(row.get("display_group_index"))
+        except (TypeError, ValueError):
+            continue
+        method_name = {
+            1: "Optimized Method",
+            2: "Manual Method",
+        }.get(group_index)
+        if method_name and method_name not in method_names:
+            method_names.append(method_name)
+
+    if not method_names:
+        display_match = re.search(
+            r"\bgroup\s+(\d+)\b",
+            str(channel),
+            re.IGNORECASE,
+        )
+        if display_match:
+            method_name = {
+                1: "Optimized Method",
+                2: "Manual Method",
+            }.get(int(display_match.group(1)))
+            if method_name:
+                method_names.append(method_name)
+
+    method_label = " and ".join(method_names)
+    return f"{method_label} | {channel_label}" if method_label else channel_label
 
 
 def apply_swv_settings_split_for_display(results: List[dict]) -> List[dict]:
@@ -3083,14 +3536,21 @@ for k, v in dict(
     swv_enable_titration_analysis=False,
     swv_titration_edge_trim_fraction=0.15,
     swv_remove_extreme_titration_outliers=False,
-    swv_show_titration_uloq=True,
-    swv_show_titration_lod=True,
+    swv_show_titration_uloq=False,
+    swv_show_titration_lod=False,
+    swv_show_titration_fit_details=False,
     swv_fit_titration_langmuir=True,
     swv_titration_concentration_unit="uM",
     mat_conversion_report=None,
 ).items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if not st.session_state.get("_swv_clean_langmuir_plot_defaults_v1", False):
+    st.session_state["swv_show_titration_uloq"] = False
+    st.session_state["swv_show_titration_lod"] = False
+    st.session_state["swv_show_titration_fit_details"] = False
+    st.session_state["_swv_clean_langmuir_plot_defaults_v1"] = True
 
 
 # 
@@ -3498,6 +3958,8 @@ with st.sidebar:
                 step=20,
                 format="%d px",
                 key="swv_plot_width_px",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("width_px",),
                 help="Exact width used for browser plots and downloaded PNGs.",
             )
             st.slider(
@@ -3508,6 +3970,8 @@ with st.sidebar:
                 step=20,
                 format="%d px",
                 key="swv_plot_height_px",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("height_px",),
                 help="Exact height used for browser plots and downloaded PNGs.",
             )
             st.slider(
@@ -3518,6 +3982,8 @@ with st.sidebar:
                 step=0.5,
                 format="%.1f pt",
                 key="swv_plot_text_size_points",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("text_size_points",),
             )
             st.slider(
                 "Line thickness",
@@ -3527,10 +3993,14 @@ with st.sidebar:
                 step=0.25,
                 format="%.2fx",
                 key="swv_plot_line_width_scale",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("line_width_scale",),
             )
             line_color_override = st.text_input(
                 "Line color override",
                 key="swv_plot_line_color_override",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("line_color_override",),
                 help=(
                     "Optional Matplotlib/CSS color. Leave blank to preserve the "
                     "selected colormaps."
@@ -3546,6 +4016,8 @@ with st.sidebar:
                 step=5,
                 format="%d px",
                 key="swv_plot_margin_px",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("margin_px",),
             )
             st.slider(
                 "Plot perimeter thickness",
@@ -3554,11 +4026,15 @@ with st.sidebar:
                 value=0.8,
                 step=0.2,
                 key="swv_plot_perimeter_width",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("perimeter_width",),
             )
             swv_perimeter_color = st.text_input(
                 "Plot perimeter color",
                 value="#222222",
                 key="swv_plot_perimeter_color",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("perimeter_color",),
                 help="Use a Matplotlib/CSS color name or hex value.",
             )
             if (
@@ -3572,11 +4048,15 @@ with st.sidebar:
                 "Show plot legends",
                 value=True,
                 key="swv_plot_show_legend",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("show_legend",),
             )
             swv_plot_show_grid = st.checkbox(
                 "Show background grid",
                 value=False,
                 key="swv_plot_show_grid",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("show_grid",),
             )
             marker_columns = st.columns(2)
             marker_columns[0].slider(
@@ -3586,6 +4066,8 @@ with st.sidebar:
                 value=6.0,
                 step=1.0,
                 key="swv_plot_marker_size",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("marker_size",),
             )
             marker_columns[1].slider(
                 "Marker opacity",
@@ -3594,6 +4076,8 @@ with st.sidebar:
                 value=0.85,
                 step=0.05,
                 key="swv_plot_marker_opacity",
+                on_change=_sync_shared_swv_style_to_metrics,
+                args=("marker_opacity",),
             )
 
             st.markdown("**Displayed axis limits**")
@@ -4195,18 +4679,18 @@ if analysis_mode == "CV":
 selected_peak_height_source = "peak_current"
 selected_peak_height_source_label = "Corrected"
 selected_peak_height_metric_label = "Peak current (corrected)"
-selected_peak_height_ylabel = "Corrected Peak Height (uA)"
+selected_peak_height_ylabel = "Change in Peak Height (uA)"
 if analysis_mode == "SWV":
     peak_height_source_options = {
         "Corrected": (
             "peak_current",
             "Peak current (corrected)",
-            "Corrected Peak Height (uA)",
+            "Change in Peak Height (uA)",
         ),
         "Corrected + smoothed": (
             "peak_current_smoothed_corrected",
             "Peak current (corrected + smoothed)",
-            "Corrected + Smoothed Peak Height (uA)",
+            "Change in Peak Height (uA)",
         ),
     }
     peak_source_label = st.radio(
@@ -4330,8 +4814,9 @@ titration_concentration_unit = "uM"
 titration_baseline_mode = "none"
 titration_included_step_labels: Optional[List[str]] = None
 remove_extreme_titration_outliers = False
-show_titration_uloq = True
-show_titration_lod = True
+show_titration_uloq = False
+show_titration_lod = False
+show_titration_fit_details = False
 swv_method_filter_enabled = False
 swv_method_filter_applied = False
 selected_swv_method_groups: List[str] = []
@@ -4505,6 +4990,14 @@ if analysis_mode == "SWV":
                     key="swv_fit_titration_langmuir",
                     help="Only reports Kd when titration vline labels include concentrations.",
                 )
+                show_titration_fit_details = st.checkbox(
+                    "Show Kd and fit details on Langmuir plots",
+                    key="swv_show_titration_fit_details",
+                    help=(
+                        "Adds Kd and saturation annotations plus the detailed fit note. "
+                        "By default Langmuir plots show only fits, points, and error bars."
+                    ),
+                )
                 show_titration_uloq = st.checkbox(
                     "Show ULOQ on plots",
                     key="swv_show_titration_uloq",
@@ -4643,7 +5136,9 @@ channels_display = channels_to_plot if channels_to_plot else all_channels
 
 plot_results = results
 plot_active_vlines = active_vlines
-plot_x_axis_label = x_axis_label
+plot_x_axis_label = (
+    "SWV Measurement Number" if analysis_mode == "SWV" else x_axis_label
+)
 plot_display_scan_range = plot_scan_range
 plot_channel_indexes = channel_indexes
 plot_results_by_channel = results_by_channel
@@ -4658,13 +5153,11 @@ use_swv_display_grouping = (
 if use_swv_display_grouping:
     if use_swv_settings_grouping:
         plot_results = apply_swv_settings_split_for_display(results)
-        plot_x_axis_label = "SWV setting iteration"
     else:
         plot_results = apply_swv_modulo_split_for_display(
             results,
             swv_modulo_split_count,
         )
-        plot_x_axis_label = "Modulo group iteration"
     compute_drift_fields(plot_results)
     plot_active_vlines = active_vlines
     plot_display_scan_range = None
@@ -4943,6 +5436,14 @@ for response_direction, colormap_name in (
         for index, channel in enumerate(direction_channels)
     })
 
+# Method identity takes precedence over response direction in SWV metric plots:
+# Method 1 is the same blue in every physical channel, as is Method 2.
+consistent_channel_colors.update({
+    channel: method_color
+    for channel in response_palette_channels
+    if (method_color := _swv_method_blue(channel)) is not None
+})
+
 # A physical channel can be the selector option while its titration fits are
 # automatically split into SWV methods. Reuse the selector option's exact shade
 # whenever a child did not receive a direct palette assignment.
@@ -5197,7 +5698,6 @@ if view == "Overlays":
             key="cv_overlay_line_alpha",
             help="Lower values make overlaid trace lines more transparent.",
         )
-
         key_map = {
             "Raw": "raw_current",
             "Smoothed": "smoothed_current",
@@ -5282,6 +5782,30 @@ if view == "Overlays":
             key="swv_overlay_line_alpha",
             help="Lower values make overlaid trace lines more transparent.",
         )
+        overlay_show_legend = bool(_resolve_swv_plot_setting(
+            "swv_plot",
+            "show_legend",
+            True,
+            inherit_metrics_style=True,
+        ))
+        overlay_show_grid = bool(_resolve_swv_plot_setting(
+            "swv_plot",
+            "show_grid",
+            False,
+            inherit_metrics_style=True,
+        ))
+        overlay_margin_px = float(_resolve_swv_plot_setting(
+            "swv_plot",
+            "margin_px",
+            40,
+            inherit_metrics_style=True,
+        ))
+        overlay_width_px = float(_resolve_swv_plot_setting(
+            "swv_plot",
+            "width_px",
+            1200,
+            inherit_metrics_style=True,
+        )) * _SWV_OVERLAY_WIDTH_SCALE
 
         key_map = {
             "Corrected": "corrected_current",
@@ -5340,7 +5864,14 @@ if view == "Overlays":
                     fig = plot_grouped_overlaid_traces(
                         grouped_trace_sets,
                         y_key=y_key,
-                        title=f"{trace_type}  Ch{original_ch}",
+                        title=format_swv_overlay_title(
+                            original_ch,
+                            [
+                                row
+                                for _, group_rows, _ in grouped_trace_sets
+                                for row in group_rows
+                            ],
+                        ),
                         ylabel=overlay_ylabel,
                         alpha=overlay_line_alpha,
                         show_anchors=show_anchors,
@@ -5358,14 +5889,10 @@ if view == "Overlays":
                         offset_to_baseline=offset_to_baseline,
                         colorbar_height_fraction=swv_colorbar_height_fraction,
                         colorbar_side=swv_colorbar_side,
-                        show_legend=swv_plot_show_legend,
-                        show_grid=swv_plot_show_grid,
+                        show_legend=overlay_show_legend,
+                        show_grid=overlay_show_grid,
                         outer_margin_fraction=(
-                            float(st.session_state.get("swv_plot_margin_px", 40))
-                            / max(
-                                float(st.session_state.get("swv_plot_width_px", 1200)),
-                                1.0,
-                            )
+                            overlay_margin_px / max(overlay_width_px, 1.0)
                         ),
                     )
                     if fig:
@@ -5391,7 +5918,7 @@ if view == "Overlays":
                 with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
                     fig = plot_overlaid_traces(
                         ch_res, y_key=y_key,
-                        title=f"{trace_type}  Ch{ch}",
+                        title=format_swv_overlay_title(ch, ch_res),
                         ylabel=overlay_ylabel,
                         colormap_name=cmap_name,
                         alpha=overlay_line_alpha,
@@ -5427,6 +5954,18 @@ if view == "Overlays":
 # 
 if view == "Metrics":
     st.subheader("Metrics")
+    if analysis_mode == "SWV":
+        if enable_titration_analysis and fit_titration_langmuir:
+            metrics_settings_tab, langmuir_settings_tab = st.tabs([
+                "All Metrics plot settings",
+                "All Langmuir plot settings",
+            ])
+            with metrics_settings_tab:
+                _render_all_metrics_plot_settings()
+            with langmuir_settings_tab:
+                _render_all_langmuir_plot_settings()
+        else:
+            _render_all_metrics_plot_settings()
 
     individual_method_view = "Individual channels per method"
     metric_view_options = ["Combined", "Individual channels"]
@@ -5534,12 +6073,29 @@ if view == "Metrics":
 
     metric_columns = st.columns([3, 1, 1]) if analysis_mode == "SWV" else st.columns([3, 1])
     m_c1, m_c2 = metric_columns[:2]
+    default_metric_selection = (
+        [selected_peak_height_metric_label]
+        if (
+            analysis_mode == "SWV"
+            and selected_peak_height_metric_label in metric_options
+        )
+        else ([] if analysis_mode == "SWV" else metric_options)
+    )
     selected_metrics = m_c1.multiselect(
         "Metrics to display",
         options=metric_options,
-        default=metric_options,
+        default=default_metric_selection,
         key="metrics_to_display",
     )
+    selected_fitted_langmuir_metric_labels = [
+        label
+        for label in fitted_langmuir_metric_labels
+        if label in selected_metrics
+    ]
+    selected_diagnostic_metric_cfg = {
+        label: display_metric_cfg[label]
+        for label in selected_fitted_langmuir_metric_labels
+    }
     if enable_titration_analysis and fit_titration_langmuir:
         if fitted_langmuir_metric_labels:
             st.caption(
@@ -5674,6 +6230,40 @@ if view == "Metrics":
                 "against their shared group-local iteration axis."
             )
 
+    # Langmuir plots always group displayed SWV methods by physical channel so
+    # the Optimized and Manual fits can be compared directly on one axis.
+    langmuir_channels_by_original: Dict[Any, List[Any]] = {}
+    langmuir_source_channels = (
+        combined_titration_channels
+        if view_mode == "Combined"
+        else titration_channels
+    )
+    for display_channel in langmuir_source_channels:
+        channel_rows = [
+            row for row in titration_results
+            if row.get("channel") == display_channel
+        ]
+        original_channel = (
+            channel_rows[0].get("original_channel")
+            if channel_rows else None
+        )
+        if original_channel is None:
+            channel_match = re.match(
+                r"(?:Ch(?:annel)?)?\s*(\d+)",
+                str(display_channel),
+                re.IGNORECASE,
+            )
+            original_channel = (
+                int(channel_match.group(1))
+                if channel_match else display_channel
+            )
+        channel_group = langmuir_channels_by_original.setdefault(
+            original_channel,
+            [],
+        )
+        if display_channel not in channel_group:
+            channel_group.append(display_channel)
+
     if enable_titration_analysis:
         if not titration_ready:
             st.warning("Titration analysis needs at least two vertical lines inside the active scan range.")
@@ -5709,8 +6299,8 @@ if view == "Metrics":
                 )
             if fit_titration_langmuir:
                 st.caption(
-                    f"Langmuir fits are shown for {selected_peak_height_metric_label} and "
-                    "Wavelet energy; "
+                    "Langmuir fits and concentration diagnostics are shown only for "
+                    "the selected Metrics to display; "
                     "Kd requires concentrations in the vline labels. LOD uses 3σ of "
                     "the buffer plateau divided by the fitted initial slope."
                 )
@@ -5741,8 +6331,8 @@ if view == "Metrics":
                 )
             )
         buffer_offset_metric_labels = {
-            "peak_current_selected": "Peak Current Change from Buffer (uA)",
-            "peak_current_raw": "Peak Current Change from Buffer (uA)",
+            "peak_current_selected": "Change in Peak Height (uA)",
+            "peak_current_raw": "Change in Peak Height (uA)",
             "wavelet_energy": "Wavelet Energy Change from Buffer (a.u.)",
         }
         metric_direction_colors_only = metric not in {
@@ -5844,7 +6434,7 @@ if view == "Metrics":
                     xlabel=(
                         metric_x_label
                         if metric_x_key == "measurement_time"
-                        else "SWV setting iteration"
+                        else "SWV Measurement Number"
                     ),
                     x_key=metric_x_key,
                     normalize_per_channel=normalize_per_channel,
@@ -5871,7 +6461,7 @@ if view == "Metrics":
             for i, ch in enumerate(plot_channels_display):
                 fig = plot_metric_vs_scan(
                     metric_plot_results, metric=metric, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel,
+                    title=f"Channel {ch}", ylabel=ylabel,
                     vlines=(
                         plot_vlines_by_channel.get(ch, plot_active_vlines)
                         if use_swv_display_grouping
@@ -5914,7 +6504,7 @@ if view == "Metrics":
                     original_channel_results,
                     metric=metric,
                     channels=display_groups,
-                    title=f"Ch{original_ch}",
+                    title=f"Channel {original_ch}",
                     ylabel=(
                         buffer_offset_metric_labels[metric]
                         if offset_group_metric_to_buffer else ylabel
@@ -5998,7 +6588,7 @@ if view == "Metrics":
                         titration_results,
                         metric=metric,
                         channels=[ch],
-                        title=f"Ch{ch} | plateau fit",
+                        title=f"Channel {ch} | plateau fit",
                         ylabel=ylabel,
                         vlines=titration_active_vlines,
                         vlines_by_channel=titration_vlines_by_channel,
@@ -6022,58 +6612,28 @@ if view == "Metrics":
                             )
 
             if fit_titration_langmuir and supports_langmuir(metric):
-                fit_caption = "Langmuir-style fit of plateau midpoints"
-                if view_mode == "Combined" and highlight_ch is not None:
-                    fit_caption += f" (fitting Ch{highlight_ch} only)"
-                st.caption(fit_caption)
-                if view_mode == "Combined":
-                    fig = (
-                        plot_titration_langmuir(
+                st.caption(
+                    "Langmuir-style fits of plateau midpoints; both methods are "
+                    "overlaid within each physical channel."
+                )
+                langmuir_column_count = max(
+                    1,
+                    min(len(langmuir_channels_by_original), 2),
+                )
+                cols = st.columns(langmuir_column_count)
+                for i, (original_ch, method_channels) in enumerate(
+                    langmuir_channels_by_original.items()
+                ):
+                    fig = plot_titration_langmuir(
                             titration_results,
                             metric=metric,
-                            channels=combined_titration_channels,
-                            title=f"{label} | Langmuir-style fit",
-                            ylabel=ylabel,
-                            vlines=combined_titration_active_vlines,
-                            vlines_by_channel=titration_vlines_by_channel,
-                            scan_windows=None,
-                            scan_range=titration_scan_range,
-                            edge_trim_fraction=titration_edge_trim_fraction,
-                            highlight_channel=(
-                                highlight_ch
-                                if not use_swv_display_grouping and not auto_split_titration_by_settings
-                                else None
+                            channels=method_channels,
+                            title=f"Channel {original_ch} | Langmuir Fit",
+                            ylabel=(
+                                "Peak Height (uA)"
+                                if metric == "peak_current_selected"
+                                else ylabel
                             ),
-                            fit_langmuir=True,
-                            fit_channels=highlight_titration_channels,
-                            concentration_unit=titration_concentration_unit,
-                            baseline_mode=titration_baseline_mode,
-                            included_step_labels=titration_included_step_labels,
-                            remove_extreme_outliers=remove_extreme_titration_outliers,
-                            show_uloq=show_titration_uloq,
-                            show_lod=show_titration_lod,
-                            response_directions=metric_response_directions,
-                            channel_colors=consistent_channel_colors,
-                        )
-                        if combined_titration_channels else None
-                    )
-                    if fig:
-                        render_downloadable_pyplot(
-                            st,
-                            fig,
-                            key=f"titration_langmuir_combined_{metric}_{highlight_ch or 'all'}",
-                            file_stem=f"titration_langmuir_{label}_combined",
-                        )
-                else:
-                    langmuir_column_count = min(len(titration_channels), 2)
-                    cols = st.columns(langmuir_column_count)
-                    for i, ch in enumerate(titration_channels):
-                        fig = plot_titration_langmuir(
-                            titration_results,
-                            metric=metric,
-                            channels=[ch],
-                            title=f"{_compact_titration_channel_label(ch)} | Langmuir fit",
-                            ylabel=ylabel,
                             vlines=titration_active_vlines,
                             vlines_by_channel=titration_vlines_by_channel,
                             scan_windows=None,
@@ -6087,22 +6647,34 @@ if view == "Metrics":
                             remove_extreme_outliers=remove_extreme_titration_outliers,
                             show_uloq=show_titration_uloq,
                             show_lod=show_titration_lod,
-                            show_legend=False,
+                            show_fit_details=show_titration_fit_details,
+                            show_legend=True,
                             response_directions=metric_response_directions,
                             channel_colors=consistent_channel_colors,
                         )
-                        if fig:
-                            with cols[i % langmuir_column_count]:
-                                render_downloadable_pyplot(
-                                    st,
-                                    fig,
-                                    key=f"titration_langmuir_ch{ch}_{metric}",
-                                    file_stem=f"titration_langmuir_{label}_ch{ch}",
-                                )
+                    if fig:
+                        with cols[i % langmuir_column_count]:
+                            render_downloadable_pyplot(
+                                st,
+                                fig,
+                                key=(
+                                    f"titration_langmuir_channel_"
+                                    f"{original_ch}_{metric}"
+                                ),
+                                file_stem=(
+                                    f"titration_langmuir_{label}_"
+                                    f"channel_{original_ch}"
+                                ),
+                                plot_kind="langmuir_fit",
+                            )
 
         st.divider()
 
-    if titration_ready and fit_titration_langmuir and fitted_langmuir_metric_labels:
+    if (
+        titration_ready
+        and fit_titration_langmuir
+        and selected_fitted_langmuir_metric_labels
+    ):
         st.markdown("### Titration SNR and concentration accuracy")
         st.caption(
             "SNR uses the median standard deviation of selected buffer plateaus. "
@@ -6124,7 +6696,7 @@ if view == "Metrics":
         metrics_snr_rows = []
         snr_plot_rows_by_metric: Dict[str, List[dict]] = {}
         snr_fit_rows_by_metric: Dict[str, List[dict]] = {}
-        for metric_label in fitted_langmuir_metric_labels:
+        for metric_label in selected_fitted_langmuir_metric_labels:
             metric_key, _ylabel = metric_cfg[metric_label]
             metric_step_rows = build_titration_step_table(
                 titration_results,
@@ -6233,7 +6805,7 @@ if view == "Metrics":
 
         metrics_accuracy_rows = collect_titration_measurement_accuracy_rows(
             titration_results,
-            metric_cfg=display_metric_cfg,
+            metric_cfg=selected_diagnostic_metric_cfg,
             channels=titration_channels,
             vlines=titration_active_vlines,
             vlines_by_channel=titration_vlines_by_channel,
@@ -6247,7 +6819,7 @@ if view == "Metrics":
         metrics_measurement_concentration_rows = (
             collect_titration_measurement_accuracy_rows(
                 titration_results,
-                metric_cfg=display_metric_cfg,
+                metric_cfg=selected_diagnostic_metric_cfg,
                 channels=titration_channels,
                 vlines=titration_active_vlines,
                 vlines_by_channel=titration_vlines_by_channel,
@@ -6352,7 +6924,7 @@ if view == "Metrics":
                 use_container_width=True,
                 key="metrics_titration_accuracy_download",
             )
-            for metric_label in fitted_langmuir_metric_labels:
+            for metric_label in selected_fitted_langmuir_metric_labels:
                 metric_accuracy_rows = [
                     row for row in metrics_measurement_concentration_rows
                     if row["metric_label"] == metric_label
@@ -6368,11 +6940,20 @@ if view == "Metrics":
                 for group_index, (group_key, group_label, group_rows) in enumerate(
                     diagnostic_groups
                 ):
+                    group_channels = {
+                        row.get("channel") for row in group_rows
+                    }
+                    group_measurement_vlines = (
+                        merge_group_vlines([
+                            titration_vlines_by_channel.get(channel, [])
+                            for channel in group_channels
+                        ])
+                        if titration_vlines_by_channel
+                        else titration_active_vlines
+                    )
                     accuracy_figure = plot_titration_concentration_accuracy(
                         group_rows,
-                        title=(
-                            f"{metric_label} | {group_label} | predicted vs known concentration"
-                        ),
+                        title="Predicted vs. Known",
                         concentration_unit=titration_concentration_unit,
                         show_uloq=show_titration_uloq,
                         show_lod=show_titration_lod,
@@ -6391,23 +6972,17 @@ if view == "Metrics":
                             file_stem=(
                                 f"titration_accuracy_{metric_label}_{group_label}"
                             ),
+                            plot_kind="concentration_accuracy",
                         )
                     measurement_figure = plot_titration_concentration_vs_measurement(
                         group_rows,
                         title=(
-                            f"{metric_label} | {group_label} | concentration by measurement"
+                            f"{group_label} | Concentration by Measurement"
                         ),
                         concentration_unit=titration_concentration_unit,
                         channel_colors=consistent_channel_colors,
                         response_directions=consistent_response_directions,
-                        vlines=(
-                            active_vlines
-                            if all(
-                                row.get("source_scan_number") is not None
-                                for row in group_rows
-                            )
-                            else titration_active_vlines
-                        ),
+                        vlines=group_measurement_vlines,
                     )
                     if measurement_figure is not None:
                         render_downloadable_pyplot(
@@ -6422,7 +6997,7 @@ if view == "Metrics":
                                 f"titration_concentration_measurement_"
                                 f"{metric_label}_{group_label}"
                             ),
-                            plot_kind="concentration_reconstruction",
+                            plot_kind="concentration_measurement",
                         )
         else:
             st.info(
@@ -7257,7 +7832,7 @@ if view == "Export":
                         channels=combined_plot_channels,
                         title=title,
                         ylabel=(
-                            "Peak Current Change from Buffer (uA)"
+                            "Change in Peak Height (uA)"
                             if offset_export_metric_to_buffer else ylabel
                         ),
                         vlines=combined_plot_active_vlines,
@@ -7297,8 +7872,8 @@ if view == "Export":
                         )
                     )
                     export_plateau_ylabel = {
-                        "peak_current_selected": "Peak Current Change from Buffer (uA)",
-                        "peak_current_raw": "Peak Current Change from Buffer (uA)",
+                        "peak_current_selected": "Change in Peak Height (uA)",
+                        "peak_current_raw": "Change in Peak Height (uA)",
                         "wavelet_energy": "Wavelet Energy Change from Buffer (a.u.)",
                     }.get(metric, ylabel)
                     fig = (
@@ -7337,8 +7912,12 @@ if view == "Export":
                                 titration_results,
                                 metric=metric,
                                 channels=combined_titration_channels,
-                                title=f"{title} | Langmuir-style fit",
-                                ylabel=ylabel,
+                                title=f"{title} | Langmuir Fit",
+                                ylabel=(
+                                    "Peak Height (uA)"
+                                    if metric == "peak_current_selected"
+                                    else ylabel
+                                ),
                                 vlines=combined_titration_active_vlines,
                                 vlines_by_channel=titration_vlines_by_channel,
                                 scan_windows=None,
@@ -7351,6 +7930,7 @@ if view == "Export":
                                 remove_extreme_outliers=remove_extreme_titration_outliers,
                                 show_uloq=show_titration_uloq,
                                 show_lod=show_titration_lod,
+                                show_fit_details=show_titration_fit_details,
                                 response_directions=(
                                     consistent_response_directions
                                 ),

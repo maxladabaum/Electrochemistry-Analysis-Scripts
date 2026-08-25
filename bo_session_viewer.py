@@ -3392,6 +3392,61 @@ def _hyperparameter_response_grouped(
     )
 
 
+def _offset_hyperparameter_response_channels(
+    response: pd.DataFrame,
+    *,
+    group_axes: Sequence[str],
+    aggregate: str,
+) -> pd.DataFrame:
+    """Shift each channel so its aggregated response-surface minimum is zero."""
+    required_columns = {"ground_truth_channel", "metric_value", *group_axes}
+    if response.empty or not required_columns.issubset(response.columns):
+        return response.copy()
+    aggregate_func = {
+        "Mean": "mean",
+        "Median": "median",
+        "Maximum": "max",
+        "Minimum": "min",
+    }[aggregate]
+    work = response.copy()
+    work["metric_value"] = pd.to_numeric(
+        work["metric_value"],
+        errors="coerce",
+    )
+    valid_axes = list(dict.fromkeys(str(axis) for axis in group_axes))
+    grouped = (
+        work.groupby(
+            ["ground_truth_channel", *valid_axes],
+            as_index=False,
+            dropna=False,
+        )["metric_value"]
+        .agg(aggregate_func)
+    )
+    channel_baselines = (
+        grouped.groupby("ground_truth_channel", dropna=False)["metric_value"]
+        .min()
+    )
+    work["metric_value_unoffset"] = work["metric_value"]
+    work["channel_q_baseline"] = work["ground_truth_channel"].map(
+        channel_baselines
+    )
+    finite_baseline = pd.to_numeric(
+        work["channel_q_baseline"],
+        errors="coerce",
+    )
+    work["metric_value"] = work["metric_value"] - finite_baseline
+    return work
+
+
+def _is_hyperparameter_q_response_metric(metric: str) -> bool:
+    """Return whether a Hyperparameter Response metric represents a Q score."""
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(metric).lower()).strip("_")
+    return bool(re.search(r"(?:^|_)q(?:_|$)", normalized)) or normalized in {
+        "best_so_far",
+        "observed_value",
+    }
+
+
 def _starting_point_metric_columns(frame: pd.DataFrame) -> list[str]:
     """Return saved numeric outcomes that can be mapped against a run's start."""
     if frame.empty:
@@ -7394,6 +7449,8 @@ def _plot_real_channel_iteration_heatmap(
     value_range: tuple[float, float] | None = None,
     value_colorscale: str = "Viridis",
     metadata_hierarchy: Sequence[str] | None = None,
+    group_runs_by_channel: bool = False,
+    max_display_rows: int | None = 1_000,
 ) -> go.Figure:
     color_value_label = color_value_label or metric_label
     required_columns = {"channel", "iteration", "value", color_value_column}
@@ -7636,22 +7693,49 @@ def _plot_real_channel_iteration_heatmap(
 
     def row_sort_key(channel_label: str) -> tuple:
         metadata = row_metadata_by_label.get(str(channel_label), {})
+        channel_sort_value = _channel_sort_key(
+            str(metadata.get("channel") or channel_label)
+        )
         sort_values = []
         for metadata_key in ordered_metadata_keys:
             if metadata_key == "gp_falloff":
                 sort_values.append(str(metadata.get("gp_parameter") or ""))
             sort_values.append(numeric_sort_value(metadata.get(metadata_key)))
-        return (
+        run_sort_values = (
             *sort_values,
             numeric_sort_value(metadata.get("repeat")),
-            _channel_sort_key(str(metadata.get("channel") or channel_label)),
             str(channel_label),
+        )
+        return (
+            (channel_sort_value, *run_sort_values)
+            if group_runs_by_channel
+            else (*run_sort_values[:-1], channel_sort_value, run_sort_values[-1])
         )
 
     channel_labels = sorted(
         work["__channel_label"].dropna().unique().tolist(),
-        key=row_sort_key if sweep_metadata_present else _channel_sort_key,
+        key=(
+            row_sort_key
+            if sweep_metadata_present or group_runs_by_channel
+            else _channel_sort_key
+        ),
     )
+    total_channel_rows = len(channel_labels)
+    if (
+        max_display_rows is not None
+        and int(max_display_rows) > 0
+        and total_channel_rows > int(max_display_rows)
+    ):
+        sampled_indexes = np.linspace(
+            0,
+            total_channel_rows - 1,
+            num=int(max_display_rows),
+            dtype=int,
+        )
+        channel_labels = [channel_labels[index] for index in sampled_indexes]
+        selected_labels = set(channel_labels)
+        work = work.loc[work["__channel_label"].isin(selected_labels)].copy()
+    displayed_channel_rows = len(channel_labels)
     iteration_values = sorted(
         float(value)
         for value in pd.to_numeric(work["iteration"], errors="coerce")
@@ -7680,43 +7764,24 @@ def _plot_real_channel_iteration_heatmap(
         )
         .reset_index()
     )
-    value_lookup = {
-        (str(row["__channel_label"]), float(row["iteration"])): float(
-            row["color_value"]
+    grid_index = pd.Index(channel_labels, name="__channel_label")
+    grid_columns = pd.Index(iteration_values, name="iteration")
+
+    def aggregated_grid(column: str, *, fill_value: float) -> np.ndarray:
+        return (
+            aggregated.pivot(
+                index="__channel_label",
+                columns="iteration",
+                values=column,
+            )
+            .reindex(index=grid_index, columns=grid_columns)
+            .fillna(fill_value)
+            .to_numpy(dtype=float)
         )
-        for _, row in aggregated.iterrows()
-    }
-    metric_lookup = {
-        (str(row["__channel_label"]), float(row["iteration"])): float(
-            row["metric_value"]
-        )
-        for _, row in aggregated.iterrows()
-    }
-    count_lookup = {
-        (str(row["__channel_label"]), float(row["iteration"])): int(row["observations"])
-        for _, row in aggregated.iterrows()
-    }
-    z_values = [
-        [
-            value_lookup.get((channel_label, iteration_value), np.nan)
-            for iteration_value in iteration_values
-        ]
-        for channel_label in channel_labels
-    ]
-    metric_values_grid = [
-        [
-            metric_lookup.get((channel_label, iteration_value), np.nan)
-            for iteration_value in iteration_values
-        ]
-        for channel_label in channel_labels
-    ]
-    count_values = [
-        [
-            count_lookup.get((channel_label, iteration_value), 0)
-            for iteration_value in iteration_values
-        ]
-        for channel_label in channel_labels
-    ]
+
+    z_values = aggregated_grid("color_value", fill_value=np.nan)
+    metric_values_grid = aggregated_grid("metric_value", fill_value=np.nan)
+    count_values = aggregated_grid("observations", fill_value=0.0)
 
     finite_values = pd.to_numeric(work["__color_value"], errors="coerce")
     finite_values = finite_values[np.isfinite(finite_values)]
@@ -7762,6 +7827,24 @@ def _plot_real_channel_iteration_heatmap(
         for label in channel_labels
     ]
 
+    # Keep row descriptions on the y coordinate so Plotly serializes each long
+    # simulation label once. Previously the label and three metadata strings
+    # were duplicated into every iteration cell through customdata, producing
+    # enormous browser payloads for multi-thousand-run heatmaps.
+    hover_channels = []
+    for channel_label in channel_labels:
+        metadata = row_metadata_by_label.get(str(channel_label), {})
+        hover_parts = [str(metadata.get("label") or channel_label)]
+        for key, label in (
+            ("exploration", "Exploration"),
+            ("gp_falloff", "GP falloff"),
+            ("initial", "Initial points"),
+        ):
+            value_label = metadata_value_label(metadata.get(key))
+            if value_label is not None:
+                hover_parts.append(f"{label}: {value_label}")
+        hover_channels.append("<br>".join(hover_parts))
+
     def metadata_group_key(channel_label: str, fields: Sequence[str]) -> tuple:
         metadata = row_metadata_by_label.get(str(channel_label), {})
         return tuple(
@@ -7770,6 +7853,17 @@ def _plot_real_channel_iteration_heatmap(
         )
 
     separator_specs: list[tuple[float, str, float]] = []
+    if group_runs_by_channel:
+        channel_keys = [
+            str(
+                row_metadata_by_label.get(str(label), {}).get("channel")
+                or label
+            )
+            for label in channel_labels
+        ]
+        for index in range(1, len(channel_keys)):
+            if channel_keys[index - 1] != channel_keys[index]:
+                separator_specs.append((index - 0.5, "rgba(35,35,35,0.98)", 3.2))
     if sweep_metadata_present:
         separator_fields: list[str] = []
         separator_levels = []
@@ -7792,24 +7886,9 @@ def _plot_real_channel_iteration_heatmap(
                 if keys[index - 1] != keys[index]:
                     separator_specs.append((index - 0.5, color, width))
     y_positions = list(range(len(display_channels)))
-    custom_values = np.empty(
-        (len(channel_labels), len(iteration_values), 6),
-        dtype=object,
-    )
-    for row_index, display_channel in enumerate(display_channels):
-        metadata = row_metadata_by_label.get(str(channel_labels[row_index]), {})
-        for column_index, _iteration_value in enumerate(iteration_values):
-            custom_values[row_index, column_index, 0] = count_values[row_index][column_index]
-            custom_values[row_index, column_index, 1] = metric_values_grid[row_index][column_index]
-            custom_values[row_index, column_index, 2] = metadata.get("label", display_channel)
-            custom_values[row_index, column_index, 3] = metadata_value_label(metadata.get("exploration")) or ""
-            custom_values[row_index, column_index, 4] = metadata_value_label(metadata.get("gp_falloff")) or ""
-            custom_values[row_index, column_index, 5] = metadata_value_label(metadata.get("initial")) or ""
+    custom_values = np.stack((count_values, metric_values_grid), axis=-1)
     hovertemplate = (
-        "Condition: %{customdata[2]}<br>"
-        "Exploration: %{customdata[3]}<br>"
-        "GP falloff: %{customdata[4]}<br>"
-        "Initial points: %{customdata[5]}<br>"
+        "%{y}<br>"
         "Iteration: %{x}<br>"
         f"{color_value_label}: " + "%{z:.4g}<br>"
     )
@@ -7852,7 +7931,7 @@ def _plot_real_channel_iteration_heatmap(
             fig.add_trace(
                 go.Heatmap(
                     x=[label],
-                    y=y_positions,
+                    y=hover_channels,
                     z=metadata_strip_values(metadata_key),
                     customdata=metadata_strip_customdata(metadata_key, label),
                     colorscale=strip_colorscale,
@@ -7869,7 +7948,7 @@ def _plot_real_channel_iteration_heatmap(
         fig.add_trace(
             go.Heatmap(
                 x=display_iterations,
-                y=y_positions,
+                y=hover_channels,
                 z=z_values,
                 customdata=custom_values,
                 colorscale=value_colorscale,
@@ -7890,7 +7969,7 @@ def _plot_real_channel_iteration_heatmap(
     else:
         fig = go.Figure(data=[go.Heatmap(
             x=display_iterations,
-            y=y_positions,
+            y=hover_channels,
             z=z_values,
             customdata=custom_values,
             colorscale=value_colorscale,
@@ -7918,10 +7997,16 @@ def _plot_real_channel_iteration_heatmap(
             "autorange": "reversed",
         },
         plot_bgcolor="white",
+        meta={
+            "bo_heatmap_total_rows": total_channel_rows,
+            "bo_heatmap_displayed_rows": displayed_channel_rows,
+        },
     )
     if sweep_metadata_present:
         fig.update_layout(
             meta={
+                "bo_heatmap_total_rows": total_channel_rows,
+                "bo_heatmap_displayed_rows": displayed_channel_rows,
                 "bo_metadata_strip_axes": [
                     "xaxis",
                     "xaxis2",
@@ -7954,7 +8039,7 @@ def _plot_real_channel_iteration_heatmap(
         )
         fig.update_yaxes(
             tickmode="array",
-            tickvals=y_positions,
+            tickvals=hover_channels,
             ticktext=[""] * len(y_positions),
             row=1,
             col=1,
@@ -7964,18 +8049,57 @@ def _plot_real_channel_iteration_heatmap(
     else:
         fig.update_yaxes(
             tickmode="array",
-            tickvals=y_positions,
+            tickvals=hover_channels,
             ticktext=display_channels,
         )
     if sweep_metadata_present:
         fig.update_layout(margin={"l": 70, "r": 120, "t": 60, "b": 65})
-    for boundary, color, width in sorted(separator_specs, key=lambda item: item[2]):
-        fig.add_hline(
-            y=boundary,
-            line_color=color,
-            line_width=width,
-        )
+    # Adding hundreds of hlines one at a time makes Plotly repeatedly validate
+    # and traverse the entire multi-axis figure. Collapse coincident hierarchy
+    # boundaries to the strongest line and install every shape in one update.
+    strongest_separator_by_boundary: dict[float, tuple[str, float]] = {}
+    for boundary, color, width in separator_specs:
+        existing = strongest_separator_by_boundary.get(float(boundary))
+        if existing is None or float(width) > existing[1]:
+            strongest_separator_by_boundary[float(boundary)] = (
+                color,
+                float(width),
+            )
+    if strongest_separator_by_boundary:
+        existing_shapes = list(fig.layout.shapes or ())
+        separator_shapes = [
+            {
+                "type": "line",
+                "x0": 0,
+                "x1": 1,
+                "xref": "paper",
+                "y0": boundary,
+                "y1": boundary,
+                "yref": "y",
+                "layer": "above",
+                "line": {"color": color, "width": width},
+            }
+            for boundary, (color, width) in sorted(
+                strongest_separator_by_boundary.items()
+            )
+        ]
+        fig.update_layout(shapes=[*existing_shapes, *separator_shapes])
     return _apply_plotly_colorbar_height(fig)
+
+
+def _real_heatmap_full_export_height(
+    row_count: int,
+    pixels_per_row: int,
+    base_height: int,
+    *,
+    export_scale: float = 2.0,
+) -> int:
+    """Return an uncapped Plotly canvas height that preserves every heatmap row."""
+    safe_scale = max(float(export_scale), 0.1)
+    row_height = math.ceil(
+        max(int(row_count), 0) * max(int(pixels_per_row), 1) / safe_scale
+    )
+    return max(int(base_height), 240 + row_height)
 
 
 REAL_HEATMAP_METADATA_FILTER_COLUMNS = {
@@ -31284,6 +31408,43 @@ def render_bo_session_app() -> None:
                                 hp_slice_filters[hp_2d_slice_column] = float(hp_2d_slice_value)
                             elif hp_view == "2D heatmap":
                                 hp_slice_tokens.append("all_unplotted=average")
+                            hp_channel_q_offset_enabled = bool(
+                                hp_channel_plot_mode
+                                == "Average selected channels"
+                                and len(hp_selected_ground_truth_channels) > 1
+                                and hp_at_best_q_parameter is None
+                                and hp_summary != "Iterations to Q target"
+                                and _is_hyperparameter_q_response_metric(
+                                    hp_metric_name
+                                )
+                            )
+                            hp_response_group_axes = (
+                                [
+                                    column
+                                    for column in hyperparameter_columns
+                                    if column in plot_response_frame.columns
+                                ]
+                                if hp_view == "Parallel coordinates"
+                                else [
+                                    column
+                                    for column in (hp_x, hp_y, hp_z)
+                                    if column is not None
+                                    and column in plot_response_frame.columns
+                                ]
+                            )
+                            if hp_channel_q_offset_enabled:
+                                plot_response_frame = (
+                                    _offset_hyperparameter_response_channels(
+                                        plot_response_frame,
+                                        group_axes=hp_response_group_axes,
+                                        aggregate=hp_aggregate,
+                                    )
+                                )
+                                st.caption(
+                                    "Channel-offset Q is active: each selected "
+                                    "channel's minimum aggregated response is "
+                                    "subtracted before channels are averaged."
+                                )
                             if plot_response_frame.empty:
                                 st.info(
                                     "No hyperparameter response values match the selected "
@@ -31317,6 +31478,9 @@ def render_bo_session_app() -> None:
                                     hp_parallel_line_width,
                                     hp_parallel_line_opacity,
                                     hp_parallel_draw_order,
+                                    "channel_q_min_offset_v1"
+                                    if hp_channel_q_offset_enabled
+                                    else "absolute_q",
                                     tuple(hp_crop_tokens),
                                     tuple(hp_slice_tokens),
                                 )
@@ -31344,6 +31508,10 @@ def render_bo_session_app() -> None:
                                         if hp_summary == "Iterations to Q target"
                                         else hp_metric_label
                                     )
+                                    if hp_channel_q_offset_enabled:
+                                        hp_plot_metric_label = (
+                                            f"Channel-offset {hp_plot_metric_label}"
+                                        )
                                     if hp_view == "Parallel coordinates":
                                         hp_figure = _plot_hyperparameter_parallel_coordinates(
                                             plot_response_frame,
@@ -31403,6 +31571,7 @@ def render_bo_session_app() -> None:
                                         f"{hp_parallel_line_width:g}_"
                                         f"{hp_parallel_line_opacity:g}_"
                                         f"{hp_parallel_draw_order}_"
+                                        f"offset_{int(hp_channel_q_offset_enabled)}_"
                                         f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
                                         f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
                                     )
@@ -31421,6 +31590,7 @@ def render_bo_session_app() -> None:
                                         f"{hp_parallel_line_width:g}_"
                                         f"{hp_parallel_line_opacity:g}_"
                                         f"{hp_parallel_draw_order}_"
+                                        f"offset_{int(hp_channel_q_offset_enabled)}_"
                                         f"{'_'.join(hp_crop_tokens) or 'no_crop'}_"
                                         f"{'_'.join(hp_slice_tokens) or 'all_slices'}"
                                     )
@@ -31813,6 +31983,33 @@ def render_bo_session_app() -> None:
                                                         )
                                                     ]
                                                 if not frame_response.empty:
+                                                    if hp_channel_q_offset_enabled:
+                                                        frame_response = (
+                                                            _offset_hyperparameter_response_channels(
+                                                                frame_response,
+                                                                group_axes=(
+                                                                    [
+                                                                        column
+                                                                        for column in hyperparameter_columns
+                                                                        if column in frame_response.columns
+                                                                    ]
+                                                                    if hp_view
+                                                                    == "Parallel coordinates"
+                                                                    else [
+                                                                        column
+                                                                        for column in (
+                                                                            hp_x,
+                                                                            hp_y,
+                                                                            hp_z,
+                                                                        )
+                                                                        if column is not None
+                                                                        and column
+                                                                        in frame_response.columns
+                                                                    ]
+                                                                ),
+                                                                aggregate=hp_aggregate,
+                                                            )
+                                                        )
                                                     frame_rows.append(
                                                         (frame_iteration, frame_response)
                                                     )
@@ -31844,7 +32041,11 @@ def render_bo_session_app() -> None:
                                                             hyperparameter_columns=(
                                                                 hyperparameter_columns
                                                             ),
-                                                            metric_label=hp_metric_label,
+                                                            metric_label=(
+                                                                f"Channel-offset {hp_metric_label}"
+                                                                if hp_channel_q_offset_enabled
+                                                                else hp_metric_label
+                                                            ),
                                                             aggregate=hp_aggregate,
                                                             line_width=hp_parallel_line_width,
                                                             line_opacity=(
@@ -31860,7 +32061,11 @@ def render_bo_session_app() -> None:
                                                             x_axis=hp_x,
                                                             y_axis=hp_y,
                                                             z_axis=hp_z,
-                                                            metric_label=hp_metric_label,
+                                                            metric_label=(
+                                                                f"Channel-offset {hp_metric_label}"
+                                                                if hp_channel_q_offset_enabled
+                                                                else hp_metric_label
+                                                            ),
                                                             aggregate=hp_aggregate,
                                                             voxel_face_opacity=hp_voxel_face_opacity,
                                                             voxel_internal_opacity=(
@@ -31878,7 +32083,9 @@ def render_bo_session_app() -> None:
                                                         )
                                                     figure.update_layout(
                                                         title=(
-                                                            f"{hp_aggregate} {hp_metric_label} "
+                                                            f"{hp_aggregate} "
+                                                            f"{'Channel-offset ' if hp_channel_q_offset_enabled else ''}"
+                                                            f"{hp_metric_label} "
                                                             "by hyperparameters | "
                                                             f"iteration {frame_iteration}"
                                                         )
@@ -37651,6 +37858,31 @@ def render_bo_session_app() -> None:
                         )
                         return
                     if real_view == "Channel x iteration heatmap":
+                        with st.expander(
+                            "Complete heatmap image export",
+                            expanded=True,
+                        ):
+                            real_heatmap_export_pixels_per_row = int(
+                                st.select_slider(
+                                    "PNG pixels per row",
+                                    options=[2, 4, 6, 8],
+                                    value=2,
+                                    key=(
+                                        "bo_real_heatmap_export_pixels_per_row_"
+                                        f"{real_control_scope_key}_{real_metric}_"
+                                        f"{real_phase}_{real_channel_mode}"
+                                    ),
+                                    help=(
+                                        "Final vertical PNG pixels reserved for "
+                                        "each simulation row."
+                                    ),
+                                )
+                            )
+                            st.caption(
+                                "PNG rendering is on demand. Use the Standard or "
+                                "Complete button below a heatmap; ordinary plot "
+                                "display no longer waits for PNG generation."
+                            )
                         heatmap_plot_items = (
                             [
                                 (column, phase, real_points_by_phase[phase])
@@ -37677,45 +37909,219 @@ def render_bo_session_app() -> None:
                                 if series_name is not None:
                                     series_heading = real_series_heading(series_name)
                                     plot_container.markdown(f"#### {series_heading}")
-                                real_figure = _plot_real_channel_iteration_heatmap(
-                                    series_points.assign(phase=phase),
-                                    metric_label=display_real_metric,
-                                    phase=phase,
-                                    color_value_column=real_heatmap_color_value_column,
-                                    color_value_label=real_heatmap_color_value_label,
-                                    value_range=(
-                                        real_value_range
-                                        if real_heatmap_color_value_column == "value"
-                                        else None
+                                def build_channel_iteration_heatmap(
+                                    max_display_rows: int | None,
+                                ) -> go.Figure:
+                                    return _plot_real_channel_iteration_heatmap(
+                                        series_points.assign(phase=phase),
+                                        metric_label=display_real_metric,
+                                        phase=phase,
+                                        color_value_column=(
+                                            real_heatmap_color_value_column
+                                        ),
+                                        color_value_label=(
+                                            real_heatmap_color_value_label
+                                        ),
+                                        value_range=(
+                                            real_value_range
+                                            if real_heatmap_color_value_column
+                                            == "value"
+                                            else None
+                                        ),
+                                        value_colorscale=real_value_colorscale,
+                                        metadata_hierarchy=(
+                                            real_heatmap_metadata_hierarchy
+                                        ),
+                                        group_runs_by_channel=(
+                                            real_channel_mode
+                                            == "Overlay selected channels"
+                                        ),
+                                        max_display_rows=max_display_rows,
+                                    )
+
+                                real_figure = build_channel_iteration_heatmap(1_000)
+                                heatmap_trace = next(
+                                    (
+                                        trace
+                                        for trace in reversed(real_figure.data)
+                                        if str(getattr(trace, "type", ""))
+                                        == "heatmap"
+                                        and not (
+                                            isinstance(
+                                                getattr(trace, "meta", None),
+                                                Mapping,
+                                            )
+                                            and trace.meta.get("bo_trace_role")
+                                            == "metadata_strip"
+                                        )
                                     ),
-                                    value_colorscale=real_value_colorscale,
-                                    metadata_hierarchy=real_heatmap_metadata_hierarchy,
+                                    None,
+                                )
+                                heatmap_row_count = (
+                                    len(heatmap_trace.y)
+                                    if heatmap_trace is not None
+                                    and heatmap_trace.y is not None
+                                    else 0
+                                )
+                                heatmap_meta = real_figure.layout.meta
+                                total_heatmap_row_count = (
+                                    int(heatmap_meta.get("bo_heatmap_total_rows", 0))
+                                    if isinstance(heatmap_meta, Mapping)
+                                    else heatmap_row_count
+                                )
+                                heatmap_export_height = (
+                                    _real_heatmap_full_export_height(
+                                        total_heatmap_row_count,
+                                        real_heatmap_export_pixels_per_row,
+                                        int(real_figure.layout.height or 560),
+                                    )
+                                )
+                                plot_container.caption(
+                                    (
+                                        f"Interactive preview samples "
+                                        f"{heatmap_row_count:,} of "
+                                        f"{total_heatmap_row_count:,} ordered rows. "
+                                        if heatmap_row_count
+                                        < total_heatmap_row_count
+                                        else ""
+                                    )
+                                    + "Complete PNG size: "
+                                    f"{total_heatmap_row_count:,} rows at "
+                                    f"{real_heatmap_export_pixels_per_row} "
+                                    "vertical pixels per row."
                                 )
                                 series_token = (
                                     "all"
                                     if series_name is None
                                     else _safe_download_stem(str(series_name))
                                 )
+                                heatmap_plot_key = (
+                                    f"bo_real_channel_iteration_heatmap_"
+                                    f"{real_plot_state_key}_{phase}_{series_token}_"
+                                    f"{real_metric}_{real_channel_mode}_"
+                                    f"{real_scope_key}_"
+                                    f"{real_heatmap_color_value_column}_"
+                                    f"{'_'.join(real_heatmap_metadata_hierarchy)}"
+                                )
+                                heatmap_file_stem = (
+                                    f"real_data_{phase}_{series_token}_"
+                                    f"{real_metric}_channel_iteration_heatmap_"
+                                    "colored_by_"
+                                    f"{_safe_download_stem(real_heatmap_color_value_column)}_"
+                                    f"metadata_{'_'.join(real_heatmap_metadata_hierarchy)}"
+                                )
                                 _render_downloadable_plotly(
                                     plot_container,
                                     real_figure,
-                                    key=(
-                                        f"bo_real_channel_iteration_heatmap_"
-                                        f"{real_plot_state_key}_{phase}_{series_token}_"
-                                        f"{real_metric}_{real_channel_mode}_"
-                                        f"{real_scope_key}_"
-                                        f"{real_heatmap_color_value_column}_"
-                                        f"{'_'.join(real_heatmap_metadata_hierarchy)}"
-                                    ),
-                                    file_stem=(
-                                        f"real_data_{phase}_{series_token}_"
-                                        f"{real_metric}_channel_iteration_heatmap_"
-                                        "colored_by_"
-                                        f"{_safe_download_stem(real_heatmap_color_value_column)}_"
-                                        f"metadata_{'_'.join(real_heatmap_metadata_hierarchy)}"
-                                    ),
+                                    key=heatmap_plot_key,
+                                    file_stem=heatmap_file_stem,
                                     width_percent=plot_width_percent,
+                                    eager_png=False,
                                 )
+                                export_actions = plot_container.columns(2)
+                                generate_standard_png = export_actions[0].button(
+                                    "Generate standard PNG",
+                                    key=f"{heatmap_plot_key}_generate_standard_png",
+                                    use_container_width=True,
+                                )
+                                generate_complete_png = export_actions[1].button(
+                                    "Generate complete full-height PNG",
+                                    key=f"{heatmap_plot_key}_generate_complete_png",
+                                    use_container_width=True,
+                                )
+                                requested_export_mode = (
+                                    "complete"
+                                    if generate_complete_png
+                                    else "standard"
+                                    if generate_standard_png
+                                    else None
+                                )
+                                export_signature_base = (
+                                    real_plot_signature,
+                                    phase,
+                                    series_token,
+                                    real_heatmap_color_value_column,
+                                    real_heatmap_metadata_hierarchy,
+                                    total_heatmap_row_count,
+                                    real_heatmap_export_pixels_per_row,
+                                    _plot_width_px(),
+                                )
+                                export_cache_key = (
+                                    f"{heatmap_plot_key}_on_demand_png_cache"
+                                )
+                                if requested_export_mode is not None:
+                                    requested_height = (
+                                        heatmap_export_height
+                                        if requested_export_mode == "complete"
+                                        else _plot_height_px("2d")
+                                    )
+                                    try:
+                                        with plot_container:
+                                            with st.spinner(
+                                                "Generating complete full-height PNG..."
+                                                if requested_export_mode == "complete"
+                                                else "Generating standard PNG..."
+                                            ):
+                                                export_figure = (
+                                                    build_channel_iteration_heatmap(
+                                                        None
+                                                    )
+                                                    if requested_export_mode
+                                                    == "complete"
+                                                    and heatmap_row_count
+                                                    < total_heatmap_row_count
+                                                    else real_figure
+                                                )
+                                                export_bytes = _plotly_png_bytes(
+                                                    export_figure,
+                                                    width=_plot_width_px(),
+                                                    height=requested_height,
+                                                )
+                                        st.session_state[export_cache_key] = {
+                                            "signature": (
+                                                *export_signature_base,
+                                                requested_export_mode,
+                                            ),
+                                            "mode": requested_export_mode,
+                                            "data": export_bytes,
+                                        }
+                                    except RuntimeError as exc:
+                                        plot_container.error(str(exc))
+                                cached_export = st.session_state.get(
+                                    export_cache_key
+                                )
+                                if isinstance(cached_export, Mapping):
+                                    export_mode = str(
+                                        cached_export.get("mode") or "standard"
+                                    )
+                                    if cached_export.get("signature") != (
+                                        *export_signature_base,
+                                        export_mode,
+                                    ):
+                                        st.session_state.pop(export_cache_key, None)
+                                        cached_export = None
+                                if isinstance(cached_export, Mapping):
+                                    export_mode = str(
+                                        cached_export.get("mode") or "standard"
+                                    )
+                                    plot_container.download_button(
+                                        (
+                                            "Download complete full-height PNG"
+                                            if export_mode == "complete"
+                                            else "Download standard PNG"
+                                        ),
+                                        data=cached_export.get("data", b""),
+                                        file_name=(
+                                            f"{_safe_download_stem(heatmap_file_stem)}_"
+                                            f"{export_mode}.png"
+                                        ),
+                                        mime="image/png",
+                                        key=(
+                                            f"{heatmap_plot_key}_download_"
+                                            f"{export_mode}_png"
+                                        ),
+                                        use_container_width=True,
+                                    )
                     elif real_view == "Parallel coordinates":
                         parallel_plot_items = (
                             [
