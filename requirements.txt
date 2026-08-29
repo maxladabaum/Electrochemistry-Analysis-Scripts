@@ -1,0 +1,10 @@
+streamlit>=1.40
+numpy
+pandas
+scipy
+matplotlib
+plotly
+streamlit-plotly-events
+kaleido==0.2.1
+Pillow
+pywavelets
