@@ -55,7 +55,11 @@ from core.processing import (
     rotate_offset_using_bracketing_minima,
     rotate_offset_using_prominent_bracketing_minima,
 )
-from bo_session_viewer import render_bo_session_app
+from bo_session_viewer import (
+    _bo_swv_settings_key,
+    bo_swv_optimization_direction_map,
+    render_bo_session_app,
+)
 from core.mat_conversion import convert_mat_folders_to_swv_csv
 from core.io import collect_measurement_csvs_from_folders, parse_measurement_time_from_filename
 
@@ -3104,6 +3108,25 @@ def _compact_titration_channel_label(channel: Any) -> str:
     return f"Channel {channel_match.group(1)}" if channel_match else text
 
 
+def _swv_settings_channel_label(channel: Any) -> str:
+    """Label a displayed method by frequency, amplitude, and step size."""
+    label = _compact_titration_channel_label(channel)
+    channel_parts = str(channel).split("|", 1)
+    if len(channel_parts) < 2:
+        return label
+    settings_text = channel_parts[1]
+    settings_parts = []
+    for pattern, output_label in (
+        (r"(?:^|;)\s*([^;]*?\bHz)\s*(?:;|$)", ""),
+        (r"(?:^|;)\s*amplitude\s+([^;]+)", "amplitude "),
+        (r"(?:^|;)\s*step\s+([^;]+)", "step "),
+    ):
+        match = re.search(pattern, settings_text, re.IGNORECASE)
+        if match:
+            settings_parts.append(f"{output_label}{match.group(1).strip()}")
+    return f"{label} | {'; '.join(settings_parts)}" if settings_parts else label
+
+
 def _titration_diagnostic_row_groups(
     rows: List[dict],
     layout: str,
@@ -3202,10 +3225,7 @@ def format_swv_overlay_title(channel: Any, rows: List[dict]) -> str:
             group_index = int(row.get("display_group_index"))
         except (TypeError, ValueError):
             continue
-        method_name = {
-            1: "Optimized Method",
-            2: "Manual Method",
-        }.get(group_index)
+        method_name = f"SWV Method {group_index}"
         if method_name and method_name not in method_names:
             method_names.append(method_name)
 
@@ -3216,10 +3236,7 @@ def format_swv_overlay_title(channel: Any, rows: List[dict]) -> str:
             re.IGNORECASE,
         )
         if display_match:
-            method_name = {
-                1: "Optimized Method",
-                2: "Manual Method",
-            }.get(int(display_match.group(1)))
+            method_name = f"SWV Method {int(display_match.group(1))}"
             if method_name:
                 method_names.append(method_name)
 
@@ -3265,6 +3282,26 @@ def apply_swv_settings_split_for_display(results: List[dict]) -> List[dict]:
             replacements[id(row)] = updated
 
     return [replacements.get(id(row), dict(row)) for row in results]
+
+
+def has_multiple_swv_settings_per_channel(
+    results: List[dict],
+    channels: Optional[List[Any]] = None,
+) -> bool:
+    """Return whether any selected physical channel contains multiple methods."""
+    selected_channels = set(channels) if channels is not None else None
+    signatures_by_channel: Dict[Any, set] = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel is None or (
+            selected_channels is not None and channel not in selected_channels
+        ):
+            continue
+        signatures = signatures_by_channel.setdefault(channel, set())
+        signatures.add(swv_settings_signature(row))
+        if len(signatures) > 1:
+            return True
+    return False
 
 
 def apply_swv_modulo_split_for_display(
@@ -3371,6 +3408,16 @@ def remap_vlines_to_swv_display_group(
         closing_value = final_local_value + 1.0
         if closing_value > remapped[-1][0]:
             remapped.append((closing_value, ordered_vlines[-1][1]))
+    # BO and other block-saved exports can give every settings group a complete
+    # local measurement sequence while retaining disjoint source scan ranges.
+    # In that layout source-axis remapping annotates only the first group (or a
+    # small tail of a later group). Prefer the local-axis interpretation when
+    # it preserves more of the supplied annotation sequence. Interleaved
+    # methods still use the source remapping because both interpretations have
+    # equal coverage there.
+    local_axis_vlines = filter_vlines_to_results_axis(vlines, group_rows)
+    if len(local_axis_vlines) > len(remapped):
+        return local_axis_vlines
     return remapped
 
 
@@ -5150,6 +5197,20 @@ use_swv_display_grouping = (
     analysis_mode == "SWV"
     and (use_swv_settings_grouping or use_swv_modulo_split)
 )
+active_analysis_view = st.session_state.get("analysis_view", "Overlays")
+auto_split_metrics_by_swv_settings = (
+    active_analysis_view == "Metrics"
+    and analysis_mode == "SWV"
+    and not use_swv_display_grouping
+    and has_multiple_swv_settings_per_channel(results, channels_display)
+)
+if auto_split_metrics_by_swv_settings:
+    # Metrics cannot share a meaningful scan axis when measurements from
+    # multiple methods are stored sequentially or interleaved in one channel.
+    # Promote the automatic split early enough that vlines, response direction,
+    # colors, summaries, and every metric subview all use the same identities.
+    use_swv_settings_grouping = True
+    use_swv_display_grouping = True
 if use_swv_display_grouping:
     if use_swv_settings_grouping:
         plot_results = apply_swv_settings_split_for_display(results)
@@ -5465,6 +5526,26 @@ for palette_channel in response_palette_channels:
     if len(parent_colors) == 1:
         consistent_channel_colors[palette_channel] = next(iter(parent_colors))
 
+# Resolve optimization provenance only from saved BO observations/configuration.
+# Response behavior is kept as separate metadata and is never used to guess BO
+# direction. Missing or conflicting BO matches remain unresolved.
+bo_settings_directions = bo_swv_optimization_direction_map(folders)
+for direction_rows in (plot_results, titration_results):
+    for row in direction_rows:
+        channel = row.get("channel")
+        response_direction = consistent_response_directions.get(channel)
+        if response_direction is not None:
+            row["swv_response_direction"] = response_direction
+        settings_key = _bo_swv_settings_key(row)
+        original_channel = row.get("original_channel", channel)
+        optimization_direction = (
+            bo_settings_directions.get((str(original_channel), settings_key))
+            or bo_settings_directions.get((None, settings_key))
+            if settings_key is not None else None
+        )
+        if optimization_direction is not None:
+            row["swv_optimization_direction"] = optimization_direction
+
 display_metric_cfg = (
     {
         label: metric_cfg[label]
@@ -5511,6 +5592,13 @@ if use_swv_display_grouping:
         setting_summary.append({
             "Channel": first_row.get("original_channel"),
             "Group": first_row.get("display_group_index"),
+            "Optimization direction": (
+                str(first_row.get("swv_optimization_direction") or "Unresolved")
+                .title()
+            ),
+            "Response direction": (
+                str(first_row.get("swv_response_direction") or "Unresolved")
+            ),
             "SWV settings": settings_label,
             "Frequency (Hz)": first_row.get("swv_frequency_hz") if settings_are_consistent else None,
             "Sweep start (V)": first_row.get("swv_sweep_start_V") if settings_are_consistent else None,
@@ -5651,7 +5739,12 @@ if analysis_mode == "SWV":
 # 
 view_options = ["Overlays", "Metrics", "Drift", "Data Table", "Export"]
 view_options.insert(3, "Failures")
-view = st.radio("View", view_options, horizontal=True)
+view = st.radio(
+    "View",
+    view_options,
+    horizontal=True,
+    key="analysis_view",
+)
 
 
 
@@ -5954,6 +6047,12 @@ if view == "Overlays":
 # 
 if view == "Metrics":
     st.subheader("Metrics")
+    if auto_split_metrics_by_swv_settings:
+        st.info(
+            "Multiple SWV settings were detected within at least one selected "
+            "channel. Metrics are split by complete SWV settings and use an "
+            "independent measurement axis for each method."
+        )
     if analysis_mode == "SWV":
         if enable_titration_analysis and fit_titration_langmuir:
             metrics_settings_tab, langmuir_settings_tab = st.tabs([
@@ -6015,7 +6114,7 @@ if view == "Metrics":
         combined_plot_channels = st.multiselect(
             "Channels to combine",
             options=plot_channels_display,
-            format_func=_compact_titration_channel_label,
+            format_func=_swv_settings_channel_label,
             key="metric_combined_channels",
             help="Only these channels are overlaid in Combined metric and titration plots.",
         )
@@ -6426,7 +6525,7 @@ if view == "Metrics":
                     method_metric_plot_results,
                     metric=metric,
                     channels=[ch],
-                    title=_compact_titration_channel_label(ch),
+                    title=_swv_settings_channel_label(ch),
                     ylabel=ylabel,
                     vlines=method_view_vlines_by_channel.get(ch, []),
                     scan_range=None,
@@ -6461,7 +6560,7 @@ if view == "Metrics":
             for i, ch in enumerate(plot_channels_display):
                 fig = plot_metric_vs_scan(
                     metric_plot_results, metric=metric, channels=[ch],
-                    title=f"Channel {ch}", ylabel=ylabel,
+                    title=_swv_settings_channel_label(ch), ylabel=ylabel,
                     vlines=(
                         plot_vlines_by_channel.get(ch, plot_active_vlines)
                         if use_swv_display_grouping

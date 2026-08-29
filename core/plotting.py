@@ -71,7 +71,7 @@ def _swv_method_blue(channel: Any) -> Optional[Any]:
 
 
 def _swv_method_trace_label(channel: Any) -> Optional[str]:
-    """Return the concise legend label for a displayed two-method SWV trace."""
+    """Return a neutral method label without assuming optimization provenance."""
     match = re.match(
         r"(?:Ch)?\d+\s+group\s+(\d+)(?:\s*\||\s*$)",
         str(channel).strip(),
@@ -79,10 +79,39 @@ def _swv_method_trace_label(channel: Any) -> Optional[str]:
     )
     if not match:
         return None
-    return {
-        1: "Optimized Method",
-        2: "Manual Method",
-    }.get(int(match.group(1)))
+    return f"SWV Method {int(match.group(1))}"
+
+
+def _swv_direction_trace_label(
+    channel: Any,
+    response_directions: Optional[Dict[Any, str]] = None,
+) -> str:
+    method_label = _swv_method_trace_label(channel)
+    if method_label is not None:
+        channel_parts = str(channel).split("|", 1)
+        if len(channel_parts) < 2:
+            return method_label
+        settings_text = channel_parts[1]
+        settings_parts = []
+        for pattern, output_label in (
+            (r"(?:^|;)\s*([^;]*?\bHz)\s*(?:;|$)", ""),
+            (r"(?:^|;)\s*amplitude\s+([^;]+)", "amplitude "),
+            (r"(?:^|;)\s*step\s+([^;]+)", "step "),
+        ):
+            match = re.search(pattern, settings_text, re.IGNORECASE)
+            if match:
+                settings_parts.append(f"{output_label}{match.group(1).strip()}")
+        return (
+            f"{method_label} · {'; '.join(settings_parts)}"
+            if settings_parts else method_label
+        )
+    base_label = _compact_channel_label(channel)
+    direction = str((response_directions or {}).get(channel, "")).strip().lower()
+    if direction == "signal-on":
+        return f"{base_label} (signal-on)"
+    if direction == "signal-off":
+        return f"{base_label} (signal-off)"
+    return base_label
 
 
 def _compact_channel_label(channel: Any) -> str:
@@ -2708,11 +2737,9 @@ def plot_metric_vs_scan(
             if use_direction_axes and normalized_directions[ch] == "signal-off"
             else ax
         )
-        method_trace_label = _swv_method_trace_label(ch)
-        direction_suffix = (
-            f" ({normalized_directions[ch]})"
-            if use_direction_colors and method_trace_label is None
-            else ""
+        trace_label = _swv_direction_trace_label(
+            ch,
+            normalized_directions if use_direction_colors else None,
         )
 
         line_style, marker = trace_style_by_channel[ch]
@@ -2722,10 +2749,7 @@ def plot_metric_vs_scan(
 
                 alpha=0.15 if dimmed else 0.9,
 
-                label=(
-                    method_trace_label
-                    or f"{_compact_channel_label(ch)}{direction_suffix}"
-                ))
+                label=trace_label)
         line._swv_preserve_color = _swv_method_blue(ch) is not None
         plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
 
@@ -3333,7 +3357,7 @@ def plot_titration_langmuir(
             if show_errorbar_legend:
                 spread_legend_added = True
 
-        method_trace_label = _swv_method_trace_label(ch)
+        method_trace_label = _swv_direction_trace_label(ch, plotted_directions)
         ax.scatter(
             raw_x,
             raw_y,
@@ -3343,11 +3367,6 @@ def plot_titration_langmuir(
             alpha=0.25 if dimmed else 0.95,
             label=(
                 method_trace_label
-                or (
-                    f"{_compact_channel_label(ch)} ({plotted_directions[ch]})"
-                    if ch in plotted_directions
-                    else _compact_channel_label(ch)
-                )
             ),
             zorder=3,
         )
@@ -4111,8 +4130,8 @@ def plot_titration_concentration_accuracy(
         label="1:1",
     )
     annotation_order = {
-        "Optimized Method": 0,
-        "Manual Method": 1,
+        f"SWV Method {method_index}": method_index
+        for method_index in range(1, 100)
     }
     for annotation_index, annotation_label in enumerate(sorted(
         log_errors_by_trace,

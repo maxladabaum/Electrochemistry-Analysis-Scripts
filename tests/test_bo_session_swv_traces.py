@@ -660,6 +660,175 @@ def test_trace_paths_preserves_all_same_channel_phase_replicates(tmp_path):
     assert {trace["channel"] for trace in traces} == {"1"}
 
 
+def test_trace_paths_preserve_per_channel_settings_and_saved_bo_directions(tmp_path):
+    rows = []
+    for channel, frequency, amplitude, step in (
+        (1, 36.0, 0.11, 0.005),
+        (2, 322.0, 0.06, 0.004),
+    ):
+        trace_path = tmp_path / f"buffer_ch{channel}.csv"
+        trace_path.write_text("voltage,current\n0,0\n", encoding="utf-8")
+        rows.append({
+            "file_path": str(trace_path),
+            "channel": channel,
+            "frequency_hz": frequency,
+            "swv_amplitude_V": amplitude,
+            "swv_step_size_V": step,
+        })
+    results_path = tmp_path / "buffer_results.csv"
+    pd.DataFrame(rows).to_csv(results_path, index=False)
+    record_path = tmp_path / "buffer_analysis_record.json"
+    record_path.write_text(
+        json.dumps({"results_csv": str(results_path)}),
+        encoding="utf-8",
+    )
+    current = {
+        "group_id": 1,
+        "iteration": 5,
+        "objective": "paired_response",
+        "buffer_analysis_record": str(record_path),
+        "params": {
+            "frequency": 36.0,
+            "amplitude": 0.11,
+            "step_potential": 0.005,
+        },
+    }
+    maximize_observation = {
+        "group_id": 2,
+        "iteration": 5,
+        "params": {
+            "frequency": 322.0,
+            "amplitude": 0.06,
+            "step_potential": 0.004,
+        },
+    }
+    session = {
+        "root": tmp_path,
+        "config": {
+            "acquisition": {"optimization_direction": "maximize"},
+            "channel_groups": [
+                {"id": 1, "optimization_direction": "minimize"},
+                {"id": 2, "optimization_direction": "maximize"},
+            ],
+        },
+        "state": {},
+        "observations": [current, maximize_observation],
+    }
+
+    traces = _trace_paths(session, current)
+
+    assert [trace["frequency_hz"] for trace in traces] == [36.0, 322.0]
+    assert [trace["optimization_direction"] for trace in traces] == [
+        "minimize",
+        "maximize",
+    ]
+
+
+def test_trace_direction_prefers_own_saved_observation_over_global_default():
+    params = {
+        "frequency": 86.0,
+        "amplitude": 0.1,
+        "step_potential": 0.005,
+    }
+    minimize_observation = {
+        "group_id": 1,
+        "iteration": 41,
+        "params": params,
+        "quality": {"optimization_direction": "minimize"},
+    }
+    maximize_observation = {
+        "group_id": 1,
+        "iteration": 41,
+        "params": params,
+        "quality": {"optimization_direction": "maximize"},
+    }
+    session = {
+        "config": {"acquisition": {"optimization_direction": "maximize"}},
+        "state": {},
+        "observations": [minimize_observation, maximize_observation],
+    }
+    trace = {
+        "channel": "2",
+        "frequency_hz": 86.0,
+        "swv_amplitude_V": 0.1,
+        "swv_step_size_V": 0.005,
+    }
+
+    assert viewer._saved_trace_optimization_direction(
+        session,
+        minimize_observation,
+        trace,
+    ) == "minimize"
+    assert viewer._saved_trace_optimization_direction(
+        session,
+        maximize_observation,
+        trace,
+    ) == "maximize"
+
+
+def test_swv_trace_title_and_legend_show_each_method_and_direction(monkeypatch):
+    monkeypatch.setattr(
+        viewer,
+        "_swv_trace_arrays",
+        lambda *_args, **_kwargs: (
+            pd.Series([-0.5, -0.4, -0.3]).to_numpy(),
+            pd.Series([0.0, 1.0, 0.0]).to_numpy(),
+            1,
+            0,
+            2,
+        ),
+    )
+    observation = {"iteration": 5, "params": {}}
+    traces = [
+        {
+            "phase": phase,
+            "channel": channel,
+            "path": Path(f"{phase}_ch{channel}.csv"),
+            "frequency_hz": frequency,
+            "swv_amplitude_V": amplitude,
+            "swv_step_size_V": step,
+            "optimization_direction": direction,
+        }
+        for phase in ("buffer", "target")
+        for channel, frequency, amplitude, step, direction in (
+            ("1", 36.0, 0.11, 0.005, "minimize"),
+            ("2", 322.0, 0.06, 0.004, "maximize"),
+        )
+    ]
+
+    figure, errors = _plot_traces(
+        {"root": Path(".")},
+        observation,
+        False,
+        ["1", "2"],
+        {},
+        "session settings",
+        True,
+        traces,
+    )
+
+    assert not errors
+    title = figure.axes[0].get_title()
+    assert "Ch 1 · Minimize: 36 Hz, step 0.005 V, amplitude 0.11 V" in title
+    assert "Ch 2 · Maximize: 322 Hz, step 0.004 V, amplitude 0.06 V" in title
+    legend_labels = [
+        text.get_text() for text in figure.axes[0].get_legend().get_texts()
+    ]
+    assert legend_labels == [
+        "Buffer Ch 1 · Minimize",
+        "Buffer Ch 2 · Maximize",
+        "Target Ch 1 · Minimize",
+        "Target Ch 2 · Maximize",
+    ]
+    assert [line.get_linestyle() for line in figure.axes[0].lines] == [
+        "--",
+        "-",
+        "--",
+        "-",
+    ]
+    plt.close(figure)
+
+
 def test_pair_buffer_target_traces_preserves_every_replicate():
     traces = [
         {"phase": phase, "channel": "1", "path": Path(f"{phase}_{index}.csv")}

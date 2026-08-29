@@ -293,8 +293,14 @@ def test_mixed_response_plot_uses_shades_not_styles_for_swv_settings():
 
 
 def test_same_direction_swv_settings_use_distinct_same_family_shades():
-    method_1 = "1 group 1 | optimized"
-    method_2 = "1 group 2 | standard"
+    method_1 = (
+        "1 group 1 | 200 Hz; sweep -0.6→0 V; "
+        "step 0.002 V; amplitude 0.036 V"
+    )
+    method_2 = (
+        "1 group 2 | 36 Hz; sweep -0.6→0 V; "
+        "step 0.005 V; amplitude 0.11 V"
+    )
     rows = [
         {
             "channel": channel,
@@ -321,8 +327,8 @@ def test_same_direction_swv_settings_use_distinct_same_family_shades():
     assert len(figure.axes) == 1
     lines = figure.axes[0].lines
     assert [line.get_label() for line in lines] == [
-        "Optimized Method",
-        "Manual Method",
+        "SWV Method 1 · 200 Hz; amplitude 0.036 V; step 0.002 V",
+        "SWV Method 2 · 36 Hz; amplitude 0.11 V; step 0.005 V",
     ]
     assert figure.axes[0].get_legend().get_title().get_text() == ""
     assert figure.axes[0].get_ylabel() == "Change in Peak Height (uA)"
@@ -701,14 +707,14 @@ def test_accuracy_plot_reports_color_coded_rms_fold_error_by_method():
         for text in axis.texts
         if " RMS Fold Error:" in text.get_text()
     }
-    assert annotation_by_label["Optimized"].get_text() == (
-        "Optimized RMS Fold Error: 1.20×"
+    assert annotation_by_label["SWV Method 1"].get_text() == (
+        "SWV Method 1 RMS Fold Error: 1.20×"
     )
-    assert annotation_by_label["Manual"].get_text() == (
-        "Manual RMS Fold Error: 1.08×"
+    assert annotation_by_label["SWV Method 2"].get_text() == (
+        "SWV Method 2 RMS Fold Error: 1.08×"
     )
     for compact_method_label, annotation in annotation_by_label.items():
-        method_label = f"{compact_method_label} Method"
+        method_label = compact_method_label
         method_points = next(
             collection for collection in axis.collections
             if collection.get_label() == method_label
@@ -862,7 +868,7 @@ def test_channel_specific_vlines_keep_swv_groups_independent():
     legend = figure.axes[0].get_legend()
     assert legend.get_title().get_text() == ""
     legend_labels = [text.get_text() for text in legend.get_texts()]
-    assert legend_labels == ["Optimized Method", "Manual Method"]
+    assert legend_labels == ["SWV Method 1", "SWV Method 2"]
 
 
 def test_langmuir_axis_keeps_highest_concentration_after_earlier_saturation():

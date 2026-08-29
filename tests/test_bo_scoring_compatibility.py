@@ -29,6 +29,7 @@ from bo_session_viewer import (
     _load_rescore_profiles,
     _metric_impacts_q,
     _next_rescore_label,
+    _optimized_parameters_by_group_frame,
     _permanent_rescore_profiles_path,
     _persist_rescore_profile,
     _observation_table,
@@ -40,11 +41,260 @@ from bo_session_viewer import (
     _rescore_profile_id,
     _reanalyze_observations,
     _resolved_rescore_label,
+    _session_channel_groups,
     _session_with_rescore_profile,
     _simulation_resume_rescore_error,
     _simulation_rescore_token,
     _store_rescore_profiles,
 )
+
+
+def test_optimized_parameters_use_saved_direction_for_each_group():
+    session = {
+        "config": {
+            "acquisition": {"optimization_direction": "maximize"},
+            "parameters": {
+                "frequency": {"label": "Frequency", "unit": "Hz"},
+                "amplitude": {"label": "Amplitude", "unit": "V"},
+            },
+            "channel_groups": [
+                {"id": 1, "optimization_direction": "maximize"},
+                {"id": 2, "optimization_direction": "minimize"},
+            ],
+        },
+        "state": {
+            "channel_groups": [
+                {"id": 1, "optimization_direction": "minimize"},
+                {"id": 2, "optimization_direction": "maximize"},
+            ],
+        },
+        "observations": [
+            {
+                "group_id": 1,
+                "iteration": 1,
+                "Q_run": 4.0,
+                "params": {"frequency": 200.0, "amplitude": 0.04},
+            },
+            {
+                "group_id": 1,
+                "iteration": 2,
+                "Q_run": -3.0,
+                "params": {"frequency": 36.0, "amplitude": 0.11},
+            },
+            {
+                "group_id": 2,
+                "iteration": 1,
+                "quality": {"Q_run": 2.0},
+                "params": {"frequency": 53.0, "amplitude": 0.13},
+            },
+            {
+                "group_id": 2,
+                "iteration": 2,
+                "quality": {"Q_run": 7.0},
+                "params": {"frequency": 322.0, "amplitude": 0.06},
+            },
+        ],
+    }
+    groups = [
+        {"id": 1, "name": "Channel 2 min", "channels": [2]},
+        {"id": 2, "name": "Channel 2 max", "channels": [2]},
+    ]
+
+    frame = _optimized_parameters_by_group_frame(session, groups)
+
+    assert frame["Optimization direction"].tolist() == ["Maximize", "Minimize"]
+    assert frame["Optimized iteration"].tolist() == [2, 2]
+    assert frame["Optimized objective (Q_run)"].tolist() == [7.0, -3.0]
+    assert frame["Optimized Frequency (Hz)"].tolist() == [322.0, 36.0]
+    assert frame["Optimized Amplitude (V)"].tolist() == [0.06, 0.11]
+
+
+def test_optimized_parameters_prefer_paired_run_objective_records():
+    session = {
+        "config": {
+            "acquisition": {"optimization_direction": "maximize"},
+        },
+        "observations": [
+            {
+                "group_id": 1,
+                "iteration": 1,
+                "objective": "buffer",
+                "Q_run": 100.0,
+                "params": {"frequency": 10.0},
+            },
+            {
+                "group_id": 1,
+                "iteration": 1,
+                "objective": "paired_response",
+                "Q_run": 3.0,
+                "params": {"frequency": 200.0},
+            },
+        ],
+    }
+
+    frame = _optimized_parameters_by_group_frame(
+        session,
+        [{"id": 1, "name": "Channel 1", "channels": [1]}],
+    )
+
+    assert frame.loc[0, "Optimized objective (Q_run)"] == 3.0
+    assert frame.loc[0, "Optimized Frequency"] == 200.0
+
+
+def test_optimized_parameters_show_both_saved_directions_within_one_group():
+    session = {
+        "config": {
+            "acquisition": {"optimization_direction": "maximize"},
+        },
+        "observations": [
+            {
+                "group_id": 1,
+                "iteration": 1,
+                "optimization_direction": "minimize",
+                "Q_run": -2.0,
+                "params": {"frequency": 40.0},
+            },
+            {
+                "group_id": 1,
+                "iteration": 2,
+                "optimization_direction": "minimize",
+                "Q_run": -5.0,
+                "params": {"frequency": 60.0},
+            },
+            {
+                "group_id": 1,
+                "iteration": 3,
+                "optimization_direction": "maximize",
+                "Q_run": 4.0,
+                "params": {"frequency": 200.0},
+            },
+            {
+                "group_id": 1,
+                "iteration": 4,
+                "optimization_direction": "maximize",
+                "Q_run": 9.0,
+                "params": {"frequency": 300.0},
+            },
+        ],
+    }
+
+    frame = _optimized_parameters_by_group_frame(
+        session,
+        [{"id": 1, "name": "Channel 1", "channels": [1]}],
+    )
+
+    assert frame["Optimization direction"].tolist() == ["Maximize", "Minimize"]
+    assert frame["Optimized iteration"].tolist() == [4, 2]
+    assert frame["Optimized objective (Q_run)"].tolist() == [9.0, -5.0]
+    assert frame["Optimized Frequency"].tolist() == [300.0, 60.0]
+
+
+def test_optimized_parameters_read_per_iteration_directions_from_history():
+    session = {
+        "config": {"acquisition": {"optimization_direction": "maximize"}},
+        "history": pd.DataFrame([
+            {"group_id": 1, "iteration": 1, "optimization_direction": "minimize"},
+            {"group_id": 1, "iteration": 2, "optimization_direction": "maximize"},
+        ]),
+        "observations": [
+            {
+                "group_id": 1,
+                "iteration": 1,
+                "Q_run": -3.0,
+                "params": {"frequency": 50.0},
+            },
+            {
+                "group_id": 1,
+                "iteration": 2,
+                "Q_run": 8.0,
+                "params": {"frequency": 250.0},
+            },
+        ],
+    }
+
+    frame = _optimized_parameters_by_group_frame(
+        session,
+        [{"id": 1, "name": "Channel 1", "channels": [1]}],
+    )
+
+    assert set(frame["Optimization direction"]) == {"Minimize", "Maximize"}
+
+
+def test_session_groups_use_expanded_saved_min_max_channels():
+    session = {
+        "state": {"channel_groups": [{
+            "id": 1,
+            "name": "Dual direction",
+            "channels": [1, 2],
+        }]},
+        "config": {},
+        "observations": [{
+            "group_id": 1,
+            "channels": [1, 2],
+            "channel_metrics": {
+                "1": {"peak_prominence": 1.0},
+                "2": {"peak_prominence": 2.0},
+                "3": {"peak_prominence": 3.0},
+                "4": {"peak_prominence": 4.0},
+            },
+        }],
+    }
+
+    assert _session_channel_groups(session) == [{
+        "id": 1,
+        "name": "Dual direction",
+        "channels": ["1", "2", "3", "4"],
+    }]
+
+
+def test_swv_optimization_directions_come_from_saved_bo_groups(tmp_path):
+    session_root = tmp_path / "bo_sessions" / "bo_session_direction_test"
+    session_root.mkdir(parents=True)
+    observations = [
+        {
+            "iteration": 1,
+            "group_id": 1,
+            "channels": [2],
+            "params": {
+                "frequency": 36.0,
+                "amplitude": 0.11,
+                "step_potential": 0.005,
+            },
+        },
+        {
+            "iteration": 1,
+            "group_id": 2,
+            "channels": [2],
+            "params": {
+                "frequency": 322.0,
+                "amplitude": 0.06,
+                "step_potential": 0.004,
+            },
+        },
+    ]
+    (session_root / "bo_state.json").write_text(json.dumps({
+        "observations": observations,
+        "channel_groups": [
+            {"id": 1, "channels": [2], "optimization_direction": "minimize"},
+            {"id": 2, "channels": [2], "optimization_direction": "maximize"},
+        ],
+    }))
+    (session_root / "bo_config_snapshot.json").write_text(json.dumps({
+        "acquisition": {"optimization_direction": "maximize"},
+        "channel_groups": [
+            {"id": 1, "channels": [2], "optimization_direction": "minimize"},
+            {"id": 2, "channels": [2], "optimization_direction": "maximize"},
+        ],
+    }))
+
+    directions = viewer.bo_swv_optimization_direction_map([tmp_path])
+
+    minimize_key = viewer._bo_swv_settings_key(observations[0]["params"])
+    maximize_key = viewer._bo_swv_settings_key(observations[1]["params"])
+    assert directions[("2", minimize_key)] == "minimize"
+    assert directions[("2", maximize_key)] == "maximize"
+    assert directions[(None, minimize_key)] == "minimize"
+    assert directions[(None, maximize_key)] == "maximize"
 
 
 def test_headless_worker_enforces_automation_minima_voltage_ranges():

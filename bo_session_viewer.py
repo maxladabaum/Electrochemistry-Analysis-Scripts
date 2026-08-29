@@ -1026,6 +1026,164 @@ def load_bo_session(folder: str | Path) -> dict:
     }
 
 
+def _bo_swv_settings_key(values: Mapping[str, Any]) -> tuple[float, float, float] | None:
+    """Return the BO/SWV-comparable frequency, amplitude, and step signature."""
+    try:
+        frequency = float(values.get(
+            "frequency",
+            values.get("swv_frequency_hz", values.get("frequency_hz")),
+        ))
+        amplitude = float(values.get(
+            "amplitude",
+            values.get("swv_amplitude_V", values.get("amplitude_V")),
+        ))
+        step = float(values.get(
+            "step_potential",
+            values.get("swv_step_size_V", values.get("step_size_V")),
+        ))
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in (frequency, amplitude, step)):
+        return None
+    return tuple(round(value, 10) for value in (frequency, amplitude, step))
+
+
+def bo_swv_optimization_direction_map(
+    search_folders: Sequence[str | Path],
+) -> dict[tuple[str | None, tuple[float, float, float]], str]:
+    """Map saved BO settings to authoritative maximize/minimize directions.
+
+    Channel-specific matches are retained. A channel-independent fallback is
+    emitted only when every matching BO observation agrees on direction.
+    """
+    session_roots: set[Path] = set()
+    for raw_folder in search_folders:
+        folder = Path(raw_folder).expanduser()
+        candidates = [folder]
+        if folder.parent != folder:
+            candidates.append(folder.parent)
+        for candidate in candidates:
+            if not candidate.is_dir():
+                continue
+            try:
+                session_roots.update(discover_bo_session_folders(candidate))
+            except (OSError, ValueError):
+                continue
+
+    directions_by_key: dict[
+        tuple[str | None, tuple[float, float, float]], set[str]
+    ] = {}
+
+    def normalized_direction(value: Any) -> str | None:
+        text = str(value or "").strip().lower()
+        if text in {"maximize", "max", "more_positive", "positive"}:
+            return "maximize"
+        if text in {"minimize", "min", "more_negative", "negative"}:
+            return "minimize"
+        return None
+
+    for session_root in sorted(session_roots):
+        try:
+            session = load_bo_session(session_root)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        config = session.get("config") or {}
+        state = session.get("state") or {}
+        acquisition_direction = normalized_direction(
+            (config.get("acquisition") or {}).get("optimization_direction")
+        )
+        group_directions: dict[int, str] = {}
+        group_channels: dict[int, list[Any]] = {}
+        for source_groups in (
+            config.get("channel_groups") or [],
+            state.get("channel_groups") or [],
+        ):
+            for group in source_groups:
+                if not isinstance(group, Mapping):
+                    continue
+                try:
+                    group_id = int(group.get("id", 1))
+                except (TypeError, ValueError):
+                    continue
+                direction = normalized_direction(group.get("optimization_direction"))
+                if direction is not None:
+                    group_directions[group_id] = direction
+                channels = group.get("channels")
+                if isinstance(channels, (list, tuple, set)) and channels:
+                    group_channels[group_id] = list(channels)
+
+        observations = list(session.get("observations") or [])
+        best_observation = state.get("best_observation")
+        if isinstance(best_observation, Mapping):
+            observations.append(best_observation)
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                continue
+            settings_key = _bo_swv_settings_key(observation.get("params") or {})
+            if settings_key is None:
+                continue
+            try:
+                group_id = int(observation.get("group_id", 1))
+            except (TypeError, ValueError):
+                group_id = 1
+            direction = (
+                normalized_direction(observation.get("optimization_direction"))
+                or group_directions.get(group_id)
+                or acquisition_direction
+            )
+            if direction is None:
+                continue
+            channels = observation.get("channels")
+            if not isinstance(channels, (list, tuple, set)) or not channels:
+                channels = group_channels.get(group_id) or _saved_observation_channels(
+                    [observation]
+                )
+            for channel in channels or []:
+                directions_by_key.setdefault(
+                    (str(channel), settings_key), set()
+                ).add(direction)
+            directions_by_key.setdefault((None, settings_key), set()).add(direction)
+
+    return {
+        key: next(iter(directions))
+        for key, directions in directions_by_key.items()
+        if len(directions) == 1
+    }
+
+
+def _saved_observation_channels(
+    observations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Return the analysis-channel identities actually stored in observations.
+
+    Some acquisition modes save more analysis channels than the configured
+    physical-channel list (for example, one minimize and one maximize result
+    for every physical channel). The metric dictionaries expose those expanded
+    identities using the same layout as the saved history and landscapes.
+    """
+    channels: set[str] = set()
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            continue
+        for source_name in (
+            "buffer_channel_metrics",
+            "target_channel_metrics",
+            "channel_metrics",
+        ):
+            source = observation.get(source_name) or {}
+            if isinstance(source, Mapping):
+                channels.update(str(key) for key in source)
+        quality = observation.get("quality") or {}
+        components = (
+            quality.get("channel_components") or {}
+            if isinstance(quality, Mapping)
+            else {}
+        )
+        if isinstance(components, Mapping):
+            channels.update(str(key) for key in components)
+    return sorted(channels, key=_channel_sort_key)
+
+
 def _session_channel_groups(session: dict) -> list[dict]:
     """Return the persisted groups that have observations in this session."""
     def as_list(value) -> list:
@@ -1050,6 +1208,25 @@ def _session_channel_groups(session: dict) -> list[dict]:
         or session["config"].get("channel_groups")
         or []
     )
+    observed_channels_by_group: dict[int, set[str]] = {}
+    for observation in observations:
+        try:
+            group_id = int(observation.get("group_id", 1))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        observed_channels_by_group.setdefault(group_id, set()).update(
+            _saved_observation_channels([observation])
+        )
+
+    def group_channels(group_id: int, fallback: Any) -> list:
+        saved_channels = observed_channels_by_group.get(group_id) or set()
+        if saved_channels:
+            return sorted(
+                saved_channels.union(str(channel) for channel in as_list(fallback)),
+                key=_channel_sort_key,
+            )
+        return as_list(fallback)
+
     groups = []
     for raw in configured:
         try:
@@ -1061,7 +1238,7 @@ def _session_channel_groups(session: dict) -> list[dict]:
         groups.append({
             "id": group_id,
             "name": str(raw.get("name") or f"Group {group_id}"),
-            "channels": as_list(raw.get("channels")),
+            "channels": group_channels(group_id, raw.get("channels")),
         })
     known_ids = {group["id"] for group in groups}
     for obs in observations:
@@ -1070,7 +1247,7 @@ def _session_channel_groups(session: dict) -> list[dict]:
             groups.append({
                 "id": group_id,
                 "name": str(obs.get("group_name") or f"Group {group_id}"),
-                "channels": as_list(obs.get("channels")),
+                "channels": group_channels(group_id, obs.get("channels")),
             })
             known_ids.add(group_id)
     return sorted(groups, key=lambda group: group["id"])
@@ -1137,6 +1314,7 @@ def _channel_group_optimization_metadata(
     ):
         metadata_columns = {
             "exploration",
+            "optimization_direction",
             "initial_random_points",
             "candidate_pool_size",
             "local_candidate_pool_size",
@@ -1227,6 +1405,7 @@ def _channel_group_optimization_metadata(
         except (TypeError, ValueError):
             continue
         settings = {
+            "optimization_direction": acquisition.get("optimization_direction"),
             "exploration": acquisition.get(
                 "exploration", config.get("exploration")
             ),
@@ -1271,6 +1450,11 @@ def _channel_group_optimization_metadata(
             "id": group_id,
             "name": str(settings.get("name") or group.get("name") or f"Group {group_id}"),
             "channels": as_list(settings.get("channels") or group.get("channels")),
+            "optimization_direction": (
+                _rescore_direction(settings["optimization_direction"])
+                if settings.get("optimization_direction") is not None
+                else None
+            ),
             "exploration": exploration,
             "exploitation": exploitation,
             "n_initial_points": settings.get("n_initial_points"),
@@ -1292,6 +1476,188 @@ def _channel_group_optimization_metadata(
             "simulated_session": bool(settings.get("simulated_session", False)),
         })
     return metadata
+
+
+def _saved_observation_optimization_direction(
+    session: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> str | None:
+    """Return an observation's explicitly persisted BO direction, if unique."""
+    quality = observation.get("quality") or {}
+    simulation_truth = observation.get("simulation_truth") or {}
+    raw_direction = (
+        observation.get("optimization_direction")
+        or quality.get("optimization_direction")
+        or simulation_truth.get("optimization_direction")
+    )
+    if raw_direction is not None and str(raw_direction).strip():
+        return _rescore_direction(raw_direction)
+
+    history = session.get("history")
+    if (
+        not isinstance(history, pd.DataFrame)
+        or history.empty
+        or not {"group_id", "iteration", "optimization_direction"}.issubset(
+            history.columns
+        )
+    ):
+        return None
+    try:
+        group_id = int(observation.get("group_id", 1) or 1)
+        iteration = int(observation.get("iteration", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    group_values = pd.to_numeric(history["group_id"], errors="coerce")
+    iteration_values = pd.to_numeric(history["iteration"], errors="coerce")
+    matches = history.loc[
+        (group_values == group_id) & (iteration_values == iteration)
+    ]
+    method_id = observation.get("method_id")
+    if method_id is not None and "method_id" in matches.columns:
+        method_matches = matches.loc[
+            matches["method_id"].astype(str) == str(method_id)
+        ]
+        if not method_matches.empty:
+            matches = method_matches
+    directions = {
+        _rescore_direction(value)
+        for value in matches["optimization_direction"].dropna()
+        if str(value).strip()
+    }
+    return next(iter(directions)) if len(directions) == 1 else None
+
+
+def _optimized_parameters_by_group_frame(
+    session: dict,
+    groups: list[dict],
+) -> pd.DataFrame:
+    """Return each group's direction-aware optimum from saved BO observations."""
+    metadata = _channel_group_optimization_metadata(session, groups)
+    parameter_config = (session.get("config") or {}).get("parameters") or {}
+    observations = [
+        observation
+        for observation in session.get("observations") or []
+        if isinstance(observation, Mapping)
+    ]
+
+    parameter_names = list(PARAMETERS)
+    extra_parameter_names = sorted({
+        str(name)
+        for observation in observations
+        for name in (observation.get("params") or {})
+        if str(name) not in PARAMETERS
+    })
+    parameter_names.extend(extra_parameter_names)
+
+    def observation_direction(
+        observation: Mapping[str, Any],
+        fallback: str | None,
+    ) -> str | None:
+        return (
+            _saved_observation_optimization_direction(session, observation)
+            or fallback
+        )
+
+    def parameter_column(name: str) -> str:
+        definition = parameter_config.get(name) or {}
+        label = str(definition.get("label") or name.replace("_", " ").title())
+        unit = str(definition.get("unit") or "").strip()
+        suffix = f" ({unit})" if unit else ""
+        return f"Optimized {label}{suffix}"
+
+    rows = []
+    for group_order, item in enumerate(metadata):
+        group_id = int(item["id"])
+        group_observations = []
+        for observation in observations:
+            try:
+                observation_group_id = int(
+                    observation.get("group_id", 1) or 1
+                )
+            except (TypeError, ValueError):
+                continue
+            if observation_group_id == group_id:
+                group_observations.append(observation)
+        fallback_direction = item.get("optimization_direction")
+        direction_buckets: dict[str | None, list[Mapping[str, Any]]] = {}
+        for observation in group_observations:
+            direction = observation_direction(observation, fallback_direction)
+            direction_buckets.setdefault(direction, []).append(observation)
+        if not direction_buckets:
+            direction_buckets[fallback_direction] = []
+
+        for direction, directional_observations in direction_buckets.items():
+            candidates = _q_summary_observations(directional_observations)
+            scored_candidates = []
+            for candidate in candidates:
+                quality = candidate.get("quality") or {}
+                q_run = _finite_float(
+                    candidate.get("Q_run", quality.get("Q_run"))
+                )
+                if q_run is not None:
+                    scored_candidates.append((q_run, candidate))
+
+            selected = None
+            selected_q = None
+            if scored_candidates and direction is not None:
+                if direction == "minimize":
+                    selected_q, selected = min(
+                        scored_candidates,
+                        key=lambda pair: pair[0],
+                    )
+                elif direction == "survey":
+                    selected_q, selected = max(
+                        scored_candidates,
+                        key=lambda pair: abs(pair[0]),
+                    )
+                else:
+                    selected_q, selected = max(
+                        scored_candidates,
+                        key=lambda pair: pair[0],
+                    )
+
+            row = {
+                "__group_order": group_order,
+                "Group": item["name"],
+                "Channels": ", ".join(map(str, item["channels"])),
+                "Optimization direction": (
+                    str(direction).capitalize()
+                    if direction is not None
+                    else "Not saved"
+                ),
+                "Optimized iteration": (
+                    selected.get("iteration") if selected is not None else None
+                ),
+                "Optimized objective (Q_run)": selected_q,
+            }
+            selected_params = (
+                selected.get("params") or {} if selected is not None else {}
+            )
+            for name in parameter_names:
+                if any(
+                    name in (observation.get("params") or {})
+                    for observation in observations
+                ):
+                    row[parameter_column(name)] = selected_params.get(name)
+            rows.append(row)
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    direction_order = {
+        "Maximize": 0,
+        "Minimize": 1,
+        "Survey": 2,
+        "Not saved": 3,
+    }
+    frame["__direction_order"] = frame["Optimization direction"].map(
+        direction_order
+    ).fillna(4)
+    return frame.sort_values(
+        ["__direction_order", "__group_order"],
+        kind="stable",
+    ).drop(
+        columns=["__direction_order", "__group_order"],
+    ).reset_index(drop=True)
 
 
 def _metadata_family_value_token(value: Any) -> str:
@@ -6024,16 +6390,7 @@ def _plot_chronological(
 
 
 def _real_data_channels(observations: list[dict]) -> list[str]:
-    channels = set()
-    for observation in observations:
-        channels.update(str(key) for key in (observation.get("buffer_channel_metrics") or {}))
-        channels.update(str(key) for key in (observation.get("target_channel_metrics") or {}))
-        channels.update(str(key) for key in (observation.get("channel_metrics") or {}))
-        channels.update(
-            str(key)
-            for key in ((observation.get("quality") or {}).get("channel_components") or {})
-        )
-    return sorted(channels, key=_channel_sort_key)
+    return _saved_observation_channels(observations)
 
 
 def _paired_pairwise_repeat_snr(
@@ -16808,6 +17165,7 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
         phase: str | None = None,
         channel: Any = None,
         source_rank: int = 0,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         path = _resolve_recorded_path(root, raw_path)
         if not path or not path.is_file() or path.suffix.lower() != ".csv":
@@ -16828,13 +17186,20 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
                 int(existing.get("source_rank", 0)),
                 int(source_rank),
             )
+            for key, value in (metadata or {}).items():
+                if value is not None and not pd.isna(value):
+                    existing[key] = value
             return
-        paths.append({
+        trace_item = {
             "phase": resolved_phase,
             "path": path,
             "channel": resolved_channel,
             "source_rank": int(source_rank),
-        })
+        }
+        for key, value in (metadata or {}).items():
+            if value is not None and not pd.isna(value):
+                trace_item[key] = value
+        paths.append(trace_item)
 
     # Paired records explicitly identify buffer versus target. Standard BO
     # stores one analysis_record for the measurement.
@@ -16868,6 +17233,17 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
                         phase=phase,
                         channel=row.get("channel"),
                         source_rank=30,
+                        metadata={
+                            key: row.get(key)
+                            for key in (
+                                "swv_frequency_hz",
+                                "frequency_hz",
+                                "swv_step_size_V",
+                                "swv_amplitude_V",
+                                "optimization_direction",
+                            )
+                            if key in row.index
+                        },
                     )
             except Exception:
                 pass
@@ -16887,12 +17263,122 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
     # that key silently discarded every replicate except one.
     cleaned = []
     for item in paths:
-        cleaned.append({
+        cleaned_item = {
             "phase": item["phase"],
             "path": item["path"],
             "channel": item["channel"],
+        }
+        cleaned_item.update({
+            key: value
+            for key, value in item.items()
+            if key not in {"phase", "path", "channel", "source_rank"}
         })
+        direction = _saved_trace_optimization_direction(
+            session,
+            observation,
+            cleaned_item,
+        )
+        if direction is not None:
+            cleaned_item["optimization_direction"] = direction
+        cleaned.append(cleaned_item)
     return cleaned
+
+
+def _saved_trace_optimization_direction(
+    session: dict,
+    observation: Mapping[str, Any],
+    trace: Mapping[str, Any],
+) -> str | None:
+    """Resolve a trace direction only from explicit saved BO metadata."""
+    explicit = trace.get("optimization_direction")
+    if explicit is not None and str(explicit).strip():
+        return _rescore_direction(explicit)
+
+    trace_settings = _bo_swv_settings_key(trace)
+    observation_settings = _bo_swv_settings_key(observation.get("params") or {})
+    observation_direction = _saved_observation_optimization_direction(
+        session,
+        observation,
+    )
+    if observation_direction is not None and (
+        trace_settings is None
+        or observation_settings is None
+        or trace_settings == observation_settings
+    ):
+        return observation_direction
+
+    config = session.get("config") or {}
+    state = session.get("state") or {}
+    global_direction = (config.get("acquisition") or {}).get(
+        "optimization_direction"
+    )
+    group_directions: dict[int, str] = {}
+    group_channels: dict[int, set[str]] = {}
+    for source_groups in (
+        config.get("channel_groups") or [],
+        state.get("channel_groups") or [],
+    ):
+        for group in source_groups:
+            if not isinstance(group, Mapping):
+                continue
+            try:
+                group_id = int(group.get("id", 1))
+            except (TypeError, ValueError):
+                continue
+            raw_direction = group.get("optimization_direction")
+            if raw_direction is not None and str(raw_direction).strip():
+                group_directions[group_id] = _rescore_direction(raw_direction)
+            channels = group.get("channels")
+            if isinstance(channels, (list, tuple, set)):
+                group_channels[group_id] = {str(channel) for channel in channels}
+
+    matching_directions: set[str] = set()
+    if trace_settings is not None:
+        for saved_observation in session.get("observations") or []:
+            if not isinstance(saved_observation, Mapping):
+                continue
+            if _bo_swv_settings_key(saved_observation.get("params") or {}) != trace_settings:
+                continue
+            try:
+                group_id = int(saved_observation.get("group_id", 1))
+            except (TypeError, ValueError):
+                continue
+            saved_direction = (
+                _saved_observation_optimization_direction(
+                    session,
+                    saved_observation,
+                )
+                or group_directions.get(group_id)
+                or global_direction
+            )
+            if saved_direction is not None and str(saved_direction).strip():
+                matching_directions.add(_rescore_direction(saved_direction))
+        if len(matching_directions) == 1:
+            return next(iter(matching_directions))
+        if len(matching_directions) > 1:
+            return None
+
+    trace_channel = str(trace.get("channel", ""))
+    channel_directions = {
+        direction
+        for group_id, direction in group_directions.items()
+        if trace_channel in group_channels.get(group_id, set())
+    }
+    if len(channel_directions) == 1:
+        return next(iter(channel_directions))
+
+    if trace_settings is None or trace_settings == observation_settings:
+        try:
+            observation_group_id = int(observation.get("group_id", 1))
+        except (TypeError, ValueError):
+            observation_group_id = 1
+        saved_direction = (
+            group_directions.get(observation_group_id)
+            or global_direction
+        )
+        if saved_direction is not None and str(saved_direction).strip():
+            return _rescore_direction(saved_direction)
+    return None
 
 
 def _pair_buffer_target_traces(traces: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -17263,6 +17749,17 @@ def _swv_phase_linestyle(phase: Any) -> str:
     return ":" if str(phase).lower() == "unknown" else "-"
 
 
+def _swv_trace_linestyle(trace: Mapping[str, Any]) -> str:
+    """Encode a saved BO direction without replacing phase colors."""
+    if str(trace.get("phase") or "").strip().lower() == "unknown":
+        return ":"
+    raw_direction = trace.get("optimization_direction")
+    if raw_direction is None or not str(raw_direction).strip():
+        return "-"
+    direction = _rescore_direction(raw_direction)
+    return {"maximize": "-", "minimize": "--", "survey": "-."}[direction]
+
+
 def _swv_phase_color(phase: Any) -> str | None:
     return SWV_PHASE_COLORS.get(str(phase).strip().lower())
 
@@ -17311,13 +17808,151 @@ def _swv_phase_replicate_labels(phases: Sequence[Any]) -> list[str]:
     return labels
 
 
+def _swv_trace_legend_labels(traces: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Label directed traces by phase, channel, and saved BO direction."""
+    if not any(trace.get("optimization_direction") for trace in traces):
+        return _swv_phase_replicate_labels([
+            trace.get("phase") for trace in traces
+        ])
+    totals: dict[tuple[str, str, str], int] = {}
+    for trace in traces:
+        key = (
+            str(trace.get("phase") or "").strip().lower(),
+            _trace_channel_key(dict(trace)),
+            str(trace.get("optimization_direction") or "not saved").strip().lower(),
+        )
+        totals[key] = totals.get(key, 0) + 1
+    indexes: dict[tuple[str, str, str], int] = {}
+    labels = []
+    for trace in traces:
+        phase = str(trace.get("phase") or "").strip().lower()
+        channel = _trace_channel_key(dict(trace))
+        direction = str(
+            trace.get("optimization_direction") or "direction not saved"
+        ).strip()
+        key = (phase, channel, direction.lower())
+        indexes[key] = indexes.get(key, 0) + 1
+        replicate = (
+            f" · replicate {indexes[key]}" if totals.get(key, 0) > 1 else ""
+        )
+        labels.append(
+            f"{phase.title() if phase else 'Trace'} "
+            f"{_trace_channel_label(channel)} · {direction.capitalize()}"
+            f"{replicate}"
+        )
+    return labels
+
+
+def _swv_trace_parameter_lines(
+    traces: Sequence[Mapping[str, Any]],
+    observation: Mapping[str, Any],
+) -> list[str]:
+    """Format every distinct per-trace SWV method represented in a plot."""
+    grouped: dict[tuple[str | None, tuple[float, float, float]], list[str]] = {}
+    for trace in traces:
+        settings = _bo_swv_settings_key(trace)
+        if settings is None:
+            continue
+        raw_direction = trace.get("optimization_direction")
+        direction = (
+            _rescore_direction(raw_direction)
+            if raw_direction is not None and str(raw_direction).strip()
+            else None
+        )
+        key = (direction, settings)
+        channel = _trace_channel_key(dict(trace))
+        if channel not in grouped.setdefault(key, []):
+            grouped[key].append(channel)
+
+    if not grouped:
+        settings = _bo_swv_settings_key(observation.get("params") or {})
+        if settings is None:
+            return ["SWV settings unavailable"]
+        raw_direction = observation.get("optimization_direction")
+        direction = (
+            _rescore_direction(raw_direction)
+            if raw_direction is not None and str(raw_direction).strip()
+            else None
+        )
+        grouped[(direction, settings)] = []
+
+    segments = []
+    for (direction, settings), channels in sorted(
+        grouped.items(),
+        key=lambda item: (
+            _channel_sort_key(item[1][0]) if item[1] else (2, ()),
+            item[0][0] or "",
+            item[0][1],
+        ),
+    ):
+        frequency, amplitude, step = settings
+        identity = []
+        if channels:
+            identity.append(", ".join(
+                _trace_channel_label(channel) for channel in channels
+            ))
+        if direction is not None:
+            identity.append(direction.capitalize())
+        prefix = f"{' · '.join(identity)}: " if identity else ""
+        segments.append(
+            f"{prefix}{frequency:g} Hz, step {step:g} V, amplitude {amplitude:g} V"
+        )
+
+    lines: list[str] = []
+    current = ""
+    for segment in segments:
+        candidate = f"{current}; {segment}" if current else segment
+        if current and len(candidate) > 105:
+            lines.append(current)
+            current = segment
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _swv_direction_legend_handles(
+    traces: Sequence[Mapping[str, Any]],
+) -> list[Line2D]:
+    """Create a compact phase/direction key for dense SWV overlays."""
+    handles = []
+    seen: set[tuple[str, str]] = set()
+    for trace in traces:
+        raw_direction = trace.get("optimization_direction")
+        if raw_direction is None or not str(raw_direction).strip():
+            continue
+        phase = str(trace.get("phase") or "trace").strip().lower()
+        direction = _rescore_direction(raw_direction)
+        key = (phase, direction)
+        if key in seen:
+            continue
+        seen.add(key)
+        handles.append(Line2D(
+            [0],
+            [0],
+            color=SWV_PHASE_COLORS.get(phase, "#444444"),
+            linewidth=2,
+            linestyle=_swv_trace_linestyle(trace),
+            label=f"{phase.title()} · {direction.capitalize()}",
+        ))
+    return handles
+
+
 def _ordered_swv_replicate_legend_lines(lines: Sequence[Any]) -> list[Any]:
     """Group SWV replicate legend handles by phase without reordering curves."""
     phase_order = {"Buffer": 0, "Target": 1}
     return sorted(
         lines,
         key=lambda line: phase_order.get(
-            str(line.get_label()).rsplit(" ", 1)[0],
+            next(
+                (
+                    phase
+                    for phase in phase_order
+                    if str(line.get_label()).startswith(phase)
+                ),
+                "",
+            ),
             2,
         ),
     )
@@ -18103,9 +18738,7 @@ def _plot_traces(
     phase_trace_colors = _swv_phase_trace_colors(
         [trace.get("phase") for trace in traces]
     )
-    phase_trace_labels = _swv_phase_replicate_labels(
-        [trace.get("phase") for trace in traces]
-    )
+    phase_trace_labels = _swv_trace_legend_labels(traces)
     for trace_index, item in enumerate(traces):
         phase, path, channel = item["phase"], item["path"], item["channel"]
         try:
@@ -18142,7 +18775,7 @@ def _plot_traces(
                     if use_phase_colors
                     else trace_colors[trace_index]
                 ),
-                linestyle=_swv_phase_linestyle(phase),
+                linestyle=_swv_trace_linestyle(item),
                 label=phase_trace_labels[trace_index],
             )
         except Exception as exc:
@@ -18179,19 +18812,8 @@ def _plot_traces(
                 if q_value is not None
                 else " | Q=unknown"
             )
-        params = observation.get("params") or {}
-        parameter_text = (
-            f"Frequency={float(params['frequency']):g} Hz"
-            if params.get("frequency") is not None else "Frequency=unknown"
-        )
-        parameter_text += (
-            f" | Step size={float(params['step_potential']):g} V"
-            if params.get("step_potential") is not None else " | Step size=unknown"
-        )
-        parameter_text += (
-            f" | Amplitude={float(params['amplitude']):g} V"
-            if params.get("amplitude") is not None else " | Amplitude=unknown"
-        )
+        parameter_lines = _swv_trace_parameter_lines(traces, observation)
+        parameter_text = "\n".join(parameter_lines)
         ax.set(
             xlabel="Voltage (V)",
             ylabel="Normalized current (peak = 1)" if normalize_to_peak else "Current (uA)",
@@ -18212,10 +18834,25 @@ def _plot_traces(
                 handles=_ordered_swv_replicate_legend_lines(ax.lines),
                 fontsize=7,
             )
+        else:
+            direction_handles = _swv_direction_legend_handles(traces)
+            if direction_handles:
+                ax.legend(
+                    handles=direction_handles,
+                    title="Phase and BO direction",
+                    fontsize=7,
+                    title_fontsize=8,
+                )
     # Keep raw and corrected plots geometrically identical. ``tight_layout``
     # otherwise assigns different axes sizes when their titles or tick labels
     # require different amounts of space.
-    fig.subplots_adjust(left=.12, right=.97, bottom=.16, top=.76)
+    title_line_count = 2 + len(_swv_trace_parameter_lines(traces, observation))
+    fig.subplots_adjust(
+        left=.12,
+        right=.97,
+        bottom=.16,
+        top=max(.48, .82 - .055 * title_line_count),
+    )
     return fig, errors
 
 
@@ -18258,9 +18895,9 @@ def _plot_iteration_trace_overlay(
     phase_trace_colors = _swv_phase_trace_colors(
         [item.get("phase") for _observation, item in entries]
     )
-    phase_trace_labels = _swv_phase_replicate_labels(
-        [item.get("phase") for _observation, item in entries]
-    )
+    phase_trace_labels = _swv_trace_legend_labels([
+        item for _observation, item in entries
+    ])
     single_channel = len(plotted_channels) <= 1
     if single_channel:
         iteration_minimum = min(iterations, default=0)
@@ -18331,7 +18968,7 @@ def _plot_iteration_trace_overlay(
                         else channel_colors[channel]
                     )
                 ),
-                linestyle=_swv_phase_linestyle(phase),
+                linestyle=_swv_trace_linestyle(item),
                 label=phase_trace_labels[entry_index],
             )
         except Exception as exc:
@@ -18351,6 +18988,11 @@ def _plot_iteration_trace_overlay(
             _trace_channel_label(channel)
             for channel in selected_channels
         )
+        parameter_lines = _swv_trace_parameter_lines(
+            [item for _observation, item in entries],
+            entries[-1][0],
+        )
+        parameter_text = "\n".join(parameter_lines)
         ax.set(
             xlabel="Voltage (V)",
             ylabel="Normalized current (peak = 1)" if normalize_to_peak else "Current (µA)",
@@ -18359,6 +19001,7 @@ def _plot_iteration_trace_overlay(
                 f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline).capitalize()} SWV traces"
                 f"{f' ({correction_label})' if corrected else ''}"
                 f" | {channel_text}"
+                f"\n{parameter_text}"
             ),
         )
         if normalize_to_peak:
@@ -18395,7 +19038,9 @@ def _plot_iteration_trace_overlay(
                 fontsize=7,
             )
         elif use_phase_colors:
-            phase_handles = [
+            phase_handles = _swv_direction_legend_handles([
+                item for _observation, item in entries
+            ]) or [
                 Line2D(
                     [0],
                     [0],
@@ -18409,7 +19054,11 @@ def _plot_iteration_trace_overlay(
             ]
             ax.legend(
                 handles=phase_handles,
-                title="Phase color",
+                title=(
+                    "Phase and BO direction"
+                    if any(item.get("optimization_direction") for _obs, item in entries)
+                    else "Phase color"
+                ),
                 fontsize=7,
                 title_fontsize=8,
             )
@@ -18436,7 +19085,15 @@ def _plot_iteration_trace_overlay(
             )
         elif len(entries) <= 16:
             ax.legend(fontsize=7)
-    fig.subplots_adjust(left=.12, right=.97, bottom=.14, top=.78)
+    title_line_count = 2 + (
+        len(parameter_lines) if entries else 0
+    )
+    fig.subplots_adjust(
+        left=.12,
+        right=.97,
+        bottom=.14,
+        top=max(.48, .84 - .055 * title_line_count),
+    )
     return fig, errors
 
 
@@ -18563,6 +19220,7 @@ def _chronological_swv_stack_entries(
                 "stack_index": stack_index,
                 "phase": str(phase),
                 "channel": channel,
+                "trace": dict(item),
                 "voltage": voltage,
                 "current": current,
             })
@@ -18752,7 +19410,9 @@ def _plot_chronological_swv_stack(
                 if use_phase_colors
                 else None
             ) or channel_colors.get(row["channel"], "#155e63"),
-            linestyle=_swv_phase_linestyle(row["phase"]),
+            linestyle=_swv_trace_linestyle(
+                row.get("trace") or {"phase": row.get("phase")}
+            ),
             linewidth=1.05 + 0.45 * age,
             alpha=alpha,
         )
@@ -18804,7 +19464,17 @@ def _plot_chronological_swv_stack(
         oldest_edge[0] + 1.04 * axis_dx + normal_x * side_gap,
         oldest_edge[1] + 1.04 * axis_dy + normal_y * side_gap,
     )
-    fig.subplots_adjust(left=.03, right=.96, bottom=.08, top=.84)
+    parameter_lines = _swv_trace_parameter_lines(
+        [item for _observation, item in entries],
+        entries[-1][0],
+    )
+    parameter_text = "\n".join(parameter_lines)
+    fig.subplots_adjust(
+        left=.03,
+        right=.96,
+        bottom=.08,
+        top=max(.48, .88 - .05 * (2 + len(parameter_lines))),
+    )
     axis_display_vector = ax.transData.transform(axis_end) - ax.transData.transform(axis_start)
     label_angle = math.degrees(math.atan2(axis_dy, axis_dx))
     if label_angle > 90:
@@ -18878,7 +19548,10 @@ def _plot_chronological_swv_stack(
         phase for phase in ("buffer", "target", "measurement", "unknown")
         if any(str(row["phase"]).lower() == phase for row in loaded)
     ]
-    phase_handles = [
+    direction_handles = _swv_direction_legend_handles([
+        item for _observation, item in entries
+    ])
+    phase_handles = direction_handles or [
         Line2D(
             [0],
             [0],
@@ -18894,7 +19567,11 @@ def _plot_chronological_swv_stack(
     if legend_handles:
         ax.legend(
             handles=legend_handles,
-            title="Channel / phase",
+            title=(
+                "Channel / phase / BO direction"
+                if direction_handles
+                else "Channel / phase"
+            ),
             loc="upper left",
             fontsize=7,
             title_fontsize=8,
@@ -18905,6 +19582,7 @@ def _plot_chronological_swv_stack(
             f"Chronological diagonal stack | "
             f"{_swv_trace_kind_label(corrected, normalize_to_peak, corrected_trace_key, offset_to_baseline)}"
             f"{f' ({correction_label})' if corrected else ''}"
+            f"\n{parameter_text}"
         ),
     )
     ax.set_xlabel("")
@@ -29068,6 +29746,11 @@ def render_bo_session_app() -> None:
             {
                 "Group": item["name"],
                 "Channels": ", ".join(map(str, item["channels"])),
+                "Optimization direction": (
+                    str(item["optimization_direction"]).capitalize()
+                    if item.get("optimization_direction") is not None
+                    else "Not saved"
+                ),
                 "Explore weight": item["exploration"],
                 "Exploit weight": item["exploitation"],
                 "Initial-point mode": item["initial_point_mode"],
@@ -29091,6 +29774,52 @@ def render_bo_session_app() -> None:
                 "Exploit weight": st.column_config.NumberColumn(format="%.3f"),
             },
         )
+        st.markdown("#### Optimized parameters")
+        optimized_parameters = _optimized_parameters_by_group_frame(
+            full_session,
+            groups,
+        )
+        if optimized_parameters.empty:
+            st.info("No completed optimization observations were saved.")
+        else:
+            optimized_column_config = {
+                "Group": st.column_config.TextColumn(width="small"),
+                "Channels": st.column_config.TextColumn(width="small"),
+                "Optimization direction": st.column_config.TextColumn(
+                    width="medium"
+                ),
+                "Optimized iteration": st.column_config.NumberColumn(
+                    width="small",
+                    format="%d",
+                ),
+                "Optimized objective (Q_run)": st.column_config.NumberColumn(
+                    width="medium",
+                    format="%.6g",
+                ),
+            }
+            optimized_column_config.update({
+                column: st.column_config.NumberColumn(width="medium")
+                for column in optimized_parameters.columns
+                if column.startswith("Optimized ")
+                and column not in optimized_column_config
+            })
+            st.dataframe(
+                optimized_parameters,
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                column_config=optimized_column_config,
+            )
+            if (optimized_parameters["Optimization direction"] == "Not saved").any():
+                st.warning(
+                    "An optimized result is not shown for groups whose optimization "
+                    "direction was not saved in the BO session."
+                )
+            st.caption(
+                "Selected from the saved completed BO observations using each "
+                "channel group's recorded optimization direction. Minimize groups "
+                "use the lowest Q_run; maximize groups use the highest Q_run."
+            )
         parameter_config = (full_session.get("config") or {}).get("parameters") or {}
         falloff_parameters = [
             name for name in PARAMETERS
