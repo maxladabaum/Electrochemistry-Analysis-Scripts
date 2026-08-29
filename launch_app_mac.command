@@ -1,8 +1,12 @@
 #!/bin/bash
 
-cd "$(dirname "$0")" || exit 1
+APP_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
+cd "$APP_DIR" || exit 1
 
-if [ ! -x ".venv/bin/python" ]; then
+APP_SUPPORT_DIR="${HOME}/Library/Application Support/Electrochemistry Analysis Scripts"
+VENV_DIR="${APP_SUPPORT_DIR}/venv"
+
+if [ ! -x "$VENV_DIR/bin/python" ]; then
     if command -v python3 >/dev/null 2>&1; then
         SYSTEM_PYTHON="python3"
     elif command -v python >/dev/null 2>&1; then
@@ -14,15 +18,21 @@ if [ ! -x ".venv/bin/python" ]; then
         exit 1
     fi
 
-    echo "Creating a Python virtual environment..."
-    if ! "$SYSTEM_PYTHON" -m venv .venv; then
+    echo "Creating a Python virtual environment in:"
+    echo "$VENV_DIR"
+    if ! mkdir -p "$APP_SUPPORT_DIR"; then
+        echo "Failed to create the local application-support folder."
+        read -r -p "Press Return to close..."
+        exit 1
+    fi
+    if ! "$SYSTEM_PYTHON" -m venv "$VENV_DIR"; then
         echo "Failed to create the virtual environment."
         read -r -p "Press Return to close..."
         exit 1
     fi
 fi
 
-PYTHON=".venv/bin/python"
+PYTHON="$VENV_DIR/bin/python"
 
 echo "Installing required packages..."
 if ! "$PYTHON" -m pip install --disable-pip-version-check -r requirements.txt; then

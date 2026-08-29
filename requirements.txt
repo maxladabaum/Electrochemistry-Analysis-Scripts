@@ -8,3 +8,4 @@ streamlit-plotly-events
 kaleido==0.2.1
 Pillow
 pywavelets
+joblib

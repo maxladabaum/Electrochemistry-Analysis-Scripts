@@ -714,6 +714,42 @@ def test_observation_table_keeps_top_level_paired_q_run():
     assert history.loc[0, "Q_run"] == pytest.approx(8.5)
 
 
+def test_observation_table_promotes_blank_history_metadata_columns_to_text():
+    session = {
+        "history": pd.DataFrame([{
+            "iteration": 1,
+            "group_id": 1,
+            "group_name": np.nan,
+            "channels": np.nan,
+            "objective": np.nan,
+            "completed_at": np.nan,
+            "frequency": 100,
+        }]),
+        "observations": [{
+            "iteration": 1,
+            "group_id": 1,
+            "group_name": "Group 1",
+            "channels": [2],
+            "objective": "paired_response",
+            "completed_at": "2026-08-28T18:00:00",
+            "params": {"frequency": 86.5},
+            "Q_run": 3.0,
+        }],
+    }
+
+    history = _observation_table(session)
+
+    assert history.loc[0, "group_name"] == "Group 1"
+    assert history.loc[0, "channels"] == "2"
+    assert history.loc[0, "objective"] == "paired_response"
+    assert history.loc[0, "completed_at"] == "2026-08-28T18:00:00"
+    assert history.loc[0, "frequency"] == pytest.approx(86.5)
+    assert all(
+        history[column].dtype == object
+        for column in ("group_name", "channels", "objective", "completed_at")
+    )
+
+
 def test_history_trend_moving_average_is_applied_per_trace():
     figure = go.Figure()
     figure.add_trace(go.Scatter(

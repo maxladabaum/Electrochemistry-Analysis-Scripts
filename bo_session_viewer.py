@@ -2002,17 +2002,46 @@ def _observation_table(session: dict) -> pd.DataFrame:
         if column not in history.columns
     ]
     if missing_columns:
+        missing_data = {}
+        for column in missing_columns:
+            observation_dtype = observation_frame[column].dtype
+            is_numeric = (
+                pd.api.types.is_numeric_dtype(observation_dtype)
+                and not pd.api.types.is_bool_dtype(observation_dtype)
+            )
+            missing_data[column] = pd.Series(
+                np.nan if is_numeric else pd.NA,
+                index=history.index,
+                dtype=float if is_numeric else object,
+            )
         history = pd.concat(
             [
                 history,
-                pd.DataFrame(
-                    np.nan,
-                    index=history.index,
-                    columns=missing_columns,
-                ),
+                pd.DataFrame(missing_data, index=history.index),
             ],
             axis=1,
         )
+    # CSV history columns containing only blanks are inferred as float64. The
+    # observation overlay later writes saved text metadata into those columns.
+    # Pandas 2 allowed that implicit upcast with a warning; pandas 3 raises a
+    # TypeError. Promote textual/boolean overlay columns explicitly, while
+    # preserving numeric columns for plotting and aggregation.
+    for column in observation_frame.columns:
+        observation_dtype = observation_frame[column].dtype
+        is_numeric = (
+            pd.api.types.is_numeric_dtype(observation_dtype)
+            and not pd.api.types.is_bool_dtype(observation_dtype)
+        )
+        if not is_numeric:
+            history[column] = history[column].astype(object)
+        elif (
+            pd.api.types.is_float_dtype(observation_dtype)
+            and not pd.api.types.is_float_dtype(history[column].dtype)
+        ):
+            history[column] = pd.to_numeric(
+                history[column],
+                errors="coerce",
+            ).astype(float)
     history_group = pd.to_numeric(
         history.get("group_id", pd.Series(1, index=history.index)),
         errors="coerce",

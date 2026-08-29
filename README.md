@@ -21,8 +21,10 @@ Or launch it by double-clicking the file for your operating system:
 - Windows: `launch_app_windows.bat`
 - macOS: `launch_app_mac.command`
 
-The launcher creates a local `.venv` virtual environment when needed and
-installs all packages from `requirements.txt` before starting the app.
+The macOS launcher creates its virtual environment under
+`~/Library/Application Support/Electrochemistry Analysis Scripts/venv`, so
+generated environment files are kept outside the GitHub checkout. It installs
+all packages from `requirements.txt` before starting the app.
 
 On macOS, if the launcher is not executable after downloading it, run
 `chmod +x launch_app_mac.command` once.
