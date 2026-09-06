@@ -1966,6 +1966,10 @@ def _observation_table(session: dict) -> pd.DataFrame:
             # paired sessions stored a Classic Q value in quality.Q_run.
             "Q_run": obs.get("Q_run", quality.get("Q_run")),
             "objective": obs.get("objective"),
+            "method_id": obs.get("method_id"),
+            "optimization_direction": _saved_observation_optimization_direction(
+                session, obs,
+            ),
             "completed_at": obs.get("completed_at"),
         }
         row.update(obs.get("params") or {})
@@ -2047,18 +2051,32 @@ def _observation_table(session: dict) -> pd.DataFrame:
         errors="coerce",
     ).fillna(1).astype(int)
     history_iteration = pd.to_numeric(history["iteration"], errors="coerce")
+    matched_indices = set()
+    unmatched_rows = []
     for _, row in observation_frame.iterrows():
         mask = (
             (history_group == int(row.get("group_id", 1)))
             & (history_iteration == int(row["iteration"]))
         )
-        matching = history.index[mask]
-        if matching.empty:
+        # A group can evaluate both directions at the same iteration. Match
+        # the saved identity before overlaying scores, and never reuse a row.
+        for identity in ("method_id", "optimization_direction", "objective"):
+            value = row.get(identity)
+            if pd.notna(value) and identity in history.columns:
+                candidates = history.loc[mask, identity]
+                if candidates.notna().any():
+                    mask &= history[identity].astype(str).eq(str(value))
+        matching = [index for index in history.index[mask] if index not in matched_indices]
+        if not matching:
+            unmatched_rows.append(row.to_dict())
             continue
         index = matching[0]
+        matched_indices.add(index)
         for column, value in row.items():
             if pd.notna(value):
                 history.at[index, column] = value
+    if unmatched_rows:
+        history = pd.concat([history, pd.DataFrame(unmatched_rows)], ignore_index=True)
     return add_best_q_column(history)
 
 
@@ -2077,7 +2095,7 @@ def _numeric_columns(frame: pd.DataFrame) -> list[str]:
 
 
 def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
-    """Return metric -> channel -> history-column mappings."""
+    """Return numeric channel series, including constant and single-point series."""
     metrics: dict[str, dict[str, str]] = {}
     for column in frame.columns:
         q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
@@ -2088,9 +2106,86 @@ def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
             channel, metric = component_match.group(1), component_match.group(2)
         else:
             continue
-        if pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1:
+        if pd.to_numeric(frame[column], errors="coerce").notna().any():
             metrics.setdefault(metric, {})[channel] = column
     return metrics
+
+
+def _history_channel_series(
+    frame: pd.DataFrame,
+    metric: str,
+    channel_metrics: dict[str, dict[str, str]],
+    selected_channels: Sequence[str],
+) -> tuple[pd.DataFrame, str, dict[str, str], bool]:
+    """Resolve channel scores or scope shared run values to each channel's rows."""
+    channel_metric = "Q_channel" if metric == "Q_run" else metric
+    if channel_metric in channel_metrics:
+        return frame, channel_metric, channel_metrics[channel_metric], False
+    if metric not in frame.columns:
+        return frame, metric, {}, False
+
+    result = frame.copy()
+    columns = {}
+    for channel in selected_channels:
+        mask = pd.Series(False, index=frame.index)
+        if "ground_truth_channel" in frame.columns:
+            mask |= frame["ground_truth_channel"].map(
+                _simulation_channel_identity_text
+            ).eq(str(channel))
+        if "channels" in frame.columns:
+            mask |= frame["channels"].fillna("").astype(str).map(
+                lambda value: str(channel) in {
+                    part.strip() for part in value.split(",")
+                }
+            )
+        # Expanded analysis channels may not appear in the physical-channel list.
+        for metric_columns in channel_metrics.values():
+            if channel in metric_columns:
+                mask |= pd.to_numeric(
+                    frame[metric_columns[channel]], errors="coerce"
+                ).notna()
+        values = pd.to_numeric(frame[metric], errors="coerce").where(mask)
+        if values.notna().any():
+            column = f"__history_channel_{channel}"
+            result[column] = values
+            columns[channel] = column
+    return result, metric, columns, True
+
+
+def _history_channels_by_direction(
+    frame: pd.DataFrame,
+    channel_columns: dict[str, str],
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Expose each saved channel/direction pair as an independently selectable series."""
+    if "optimization_direction" not in frame.columns:
+        return frame, channel_columns
+    directions = frame["optimization_direction"].fillna("").astype(str).str.strip().str.lower()
+    result = frame.copy()
+    columns = {}
+    for channel, source in channel_columns.items():
+        values = pd.to_numeric(frame[source], errors="coerce")
+        for direction in sorted(directions.loc[values.notna()].unique()):
+            label = f"{channel} · {direction.capitalize() or 'Unspecified direction'}"
+            column = f"__history_direction_{len(columns)}"
+            result[column] = values.where(directions.eq(direction))
+            columns[label] = column
+    return result, columns
+
+
+def _history_channel_display_control(
+    key: str, *, global_metric: bool, has_channels: bool,
+) -> str:
+    options = ["Overlay selected channels", "Separate plots", "Average selected channels"]
+    if global_metric:
+        options.insert(0, "Run-level series")
+    _preserve_valid_widget_value(key, options, options[0])
+    return st.radio(
+        "Channel display",
+        options,
+        horizontal=True,
+        key=key,
+        disabled=not has_channels,
+    )
 
 
 def _best_q_parameters_by_channel_frame(
@@ -5400,6 +5495,9 @@ def _plot_channel_trend(
         if "group_name" in frame.columns
         else pd.Series("", index=frame.index)
     )
+    directions = frame.get(
+        "optimization_direction", pd.Series("", index=frame.index),
+    ).fillna("").astype(str).str.strip().str.lower()
     records = []
     frame_channels = (
         frame["ground_truth_channel"].map(_simulation_channel_identity_text)
@@ -5417,8 +5515,10 @@ def _plot_channel_trend(
         if channel in channel_columns
     ]
     shared_global_column = (
-        len(selected_column_names) > 1
-        and len(set(selected_column_names)) < len(selected_column_names)
+        any(
+            column in frame.columns and column == metric
+            for column in selected_column_names
+        )
     )
     for channel in selected_channels:
         values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
@@ -5437,6 +5537,7 @@ def _plot_channel_trend(
                 "group_id": group_id,
                 "group_name": group_name,
                 "channel": str(channel),
+                "direction": directions.loc[index],
             })
     data = pd.DataFrame(records)
     if data.empty:
@@ -5450,7 +5551,7 @@ def _plot_channel_trend(
 
     # Normalize duplicate rows before applying either display-level average.
     data = data.groupby(
-        ["group_id", "group_name", "channel", "iteration"],
+        ["group_id", "group_name", "channel", "direction", "iteration"],
         as_index=False,
         dropna=False,
     )["value"].mean()
@@ -5487,7 +5588,7 @@ def _plot_channel_trend(
             fig.update_layout(height=340)
             return fig
         data = data.groupby(
-            ["average_value", "channel", "iteration"],
+            ["average_value", "channel", "direction", "iteration"],
             as_index=False,
         ).agg(aggregation)
         data["group_id"] = [
@@ -5508,7 +5609,7 @@ def _plot_channel_trend(
         if "reference_value" in data.columns:
             aggregation["reference_value"] = "mean"
         data = data.groupby(
-            ["channel", "iteration"],
+            ["channel", "direction", "iteration"],
             as_index=False,
         ).agg(aggregation)
         data["group_id"] = "__average__"
@@ -5521,7 +5622,7 @@ def _plot_channel_trend(
         if "reference_value" in data.columns:
             value_columns["reference_value"] = "mean"
         data = data.groupby(
-            ["group_id", "group_name", "iteration"],
+            ["group_id", "group_name", "direction", "iteration"],
             as_index=False,
             dropna=False,
         ).agg(value_columns)
@@ -5577,7 +5678,7 @@ def _plot_channel_trend(
         elif separate_channels:
             facet_data = data[data["channel"] == facet_key]
 
-        series_columns = []
+        series_columns = ["direction"]
         if not separate_groups and facet_data["group_id"].nunique(dropna=False) > 1:
             series_columns.extend(["group_id", "group_name"])
         if not separate_channels and facet_data["channel"].nunique() > 1:
@@ -5603,6 +5704,11 @@ def _plot_channel_trend(
                 name_parts.append("channel average")
             elif not separate_channels:
                 name_parts.append(f"Ch {channel}")
+            direction = str(rows["direction"].iloc[0])
+            if direction and not (
+                not separate_channels and channel.endswith(f" · {direction.capitalize()}")
+            ):
+                name_parts.append(direction.capitalize())
             trace_name = " · ".join(name_parts) or (
                 f"Ch {channel}" if channel != "average" else "Channel average"
             )
@@ -5638,7 +5744,10 @@ def _plot_channel_trend(
                 mode="lines+markers",
                 name=trace_name,
                 marker=marker or None,
-                line={"color": group_color} if group_color else None,
+                line={
+                    **({"color": group_color} if group_color else {}),
+                    "dash": "dash" if direction == "minimize" else "solid",
+                },
                 opacity=trace_opacity,
                 customdata=rows["iteration"],
                 hovertemplate=(
@@ -30150,6 +30259,11 @@ def render_bo_session_app() -> None:
             starting_point_response_history = trend_history.copy()
             trend_channel_options = sorted(
                 {
+                    *{
+                        channel
+                        for columns in _channel_metric_columns(trend_history).values()
+                        for channel in columns
+                    },
                     *(
                         set(trend_history["ground_truth_channel"].dropna().astype(str))
                         if "ground_truth_channel" in trend_history.columns
@@ -30336,34 +30450,22 @@ def render_bo_session_app() -> None:
                     hide_index=True,
                 )
             channel_metrics = _channel_metric_columns(trend_history)
-            if trend_scope_key != "all":
-                selected_trend_groups = [
-                    group for group in groups
-                    if int(group["id"]) in trend_selected_observation_group_ids
-                ]
-                configured_channels = {
-                    str(channel)
-                    for group in selected_trend_groups
-                    for channel in group.get("channels", [])
+            # The scoped history is authoritative: saved analysis channels can
+            # exceed the physical channels listed in the group configuration.
+            if trend_channel_options:
+                channel_metrics = {
+                    metric_name: {
+                        channel: column
+                        for channel, column in columns.items()
+                        if channel in selected_history_channels
+                    }
+                    for metric_name, columns in channel_metrics.items()
                 }
-                if configured_channels:
-                    if trend_channel_options:
-                        configured_channels = configured_channels.intersection(
-                            set(selected_history_channels)
-                        )
-                    channel_metrics = {
-                        metric_name: {
-                            channel: column
-                            for channel, column in columns.items()
-                            if channel in configured_channels
-                        }
-                        for metric_name, columns in channel_metrics.items()
-                    }
-                    channel_metrics = {
-                        metric_name: columns
-                        for metric_name, columns in channel_metrics.items()
-                        if columns
-                    }
+                channel_metrics = {
+                    metric_name: columns
+                    for metric_name, columns in channel_metrics.items()
+                    if columns
+                }
             channel_column_names = {
                 column for column in trend_history.columns
                 if (
@@ -30394,7 +30496,10 @@ def render_bo_session_app() -> None:
                 metric_choice = st.selectbox(
                     "Trend metric",
                     metric_options,
-                    format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
+                    format_func=lambda choice: (
+                        f"{_metric_label(choice.split('::', 1)[1])}"
+                        + (" (per channel)" if choice.startswith("channel::") else "")
+                    ),
                     key=trend_metric_key,
                 )
             else:
@@ -30403,83 +30508,44 @@ def render_bo_session_app() -> None:
             metric_kind, metric = metric_choice.split("::", 1)
             plot_metric_kind = metric_kind
             plot_metric = metric
-            ground_truth_trend_channels = (
-                sorted(
-                    trend_history["ground_truth_channel"].dropna().astype(str).unique(),
-                    key=_channel_sort_key,
+            channel_frame, channel_metric, channel_columns, shared_run_values = (
+                _history_channel_series(
+                    trend_history, metric, channel_metrics, selected_history_channels,
                 )
-                if "ground_truth_channel" in trend_history.columns
-                else []
             )
-            q_run_channel_view = None
-            global_channel_view = None
-            if (
-                metric_kind == "global"
-                and metric == "Q_run"
-                and "Q_channel" in channel_metrics
-            ):
-                q_display_options = [
-                    "Run-level Q",
-                    "Average channel Q",
-                    "Overlay channel Q",
-                    "Separate channel Q plots",
-                ]
-                q_display_key = f"bo_q_run_display_{trend_scope_key}"
-                _preserve_valid_widget_value(
-                    q_display_key,
-                    q_display_options,
-                    q_display_options[0],
+            channel_layout = _history_channel_display_control(
+                f"bo_history_channel_display_{trend_scope_key}_{metric_choice}",
+                global_metric=metric_kind == "global",
+                has_channels=bool(channel_columns),
+            )
+            split_history_directions = st.checkbox(
+                "Treat minimize and maximize as separate channels",
+                value=False,
+                key=f"bo_history_split_directions_{trend_scope_key}",
+                disabled=not bool(channel_columns),
+                help=(
+                    "Adds a separate Trend channels entry for each channel and "
+                    "optimization direction. Choose Separate plots to give each "
+                    "entry its own plot."
+                ),
+            )
+            if split_history_directions:
+                channel_frame, channel_columns = _history_channels_by_direction(
+                    channel_frame, channel_columns,
                 )
-                q_run_channel_view = st.radio(
-                    "Q series",
-                    q_display_options,
-                    horizontal=True,
-                    key=q_display_key,
-                    help=(
-                        "Chooses whether Q run is shown as the saved run-level "
-                        "objective or expanded into channel Q traces."
-                    ),
-                )
-                if q_run_channel_view != "Run-level Q":
-                    plot_metric_kind = "channel"
-                    plot_metric = "Q_channel"
-            elif (
-                metric_kind == "global"
-                and metric in trend_history.columns
-                and len(ground_truth_trend_channels) > 1
-            ):
-                metric_display_label = _metric_label(metric)
-                global_display_options = [
-                    f"Run-level {metric_display_label}",
-                    f"Average channel {metric_display_label}",
-                    f"Overlay channel {metric_display_label}",
-                    f"Separate channel {metric_display_label} plots",
-                ]
-                global_display_key = (
-                    f"bo_global_channel_display_{trend_scope_key}_{metric}"
-                )
-                _preserve_valid_widget_value(
-                    global_display_key,
-                    global_display_options,
-                    global_display_options[0],
-                )
-                global_channel_view = st.radio(
-                    f"{metric_display_label} series",
-                    global_display_options,
-                    horizontal=True,
-                    key=global_display_key,
-                    help=(
-                        "Chooses whether this parameter trend is shown as saved "
-                        "simulation-run rows or expanded into real-channel traces."
-                    ),
-                )
-                if global_channel_view != global_display_options[0]:
-                    plot_metric_kind = "channel"
-                    plot_metric = metric
-                    channel_metrics[plot_metric] = {
-                        channel: metric
-                        for channel in ground_truth_trend_channels
-                    }
+            if channel_layout != "Run-level series" and channel_columns:
+                plot_metric_kind = "channel"
+                plot_metric = channel_metric
+                trend_history = channel_frame
+                channel_metrics[plot_metric] = channel_columns
+                if shared_run_values:
+                    st.caption(
+                        "This metric is saved per run. Each channel plot shows "
+                        "the run values for observations containing that channel; "
+                        "channels measured together share these values."
+                    )
+            elif not channel_columns:
+                st.caption("No saved channel values are available for this metric.")
             group_layout = "Plot groups overlaid"
             group_color_values = None
             group_color_label = None
@@ -30487,8 +30553,6 @@ def render_bo_session_app() -> None:
             group_average_label = None
             is_simulated_trend_session = False
             has_multiple_trend_groups = (
-                metric in trend_history.columns
-                and
                 "group_id" in trend_history.columns
                 and trend_history["group_id"].nunique(dropna=True) > 1
             )
@@ -30849,7 +30913,10 @@ def render_bo_session_app() -> None:
                     channel_metrics[plot_metric],
                     key=_channel_sort_key,
                 )
-                trend_channels_key = f"bo_trend_channels_{trend_scope_key}_{plot_metric}"
+                trend_channels_key = (
+                    f"bo_trend_channels_{trend_scope_key}_{plot_metric}_"
+                    f"{'directions' if split_history_directions else 'physical'}"
+                )
                 trend_channels_valid, trend_channels_display = (
                     _prepare_preferred_multiselect_value(
                         trend_channels_key,
@@ -30871,43 +30938,6 @@ def render_bo_session_app() -> None:
                     trend_channels_valid,
                     trend_channels,
                 )
-                if global_channel_view is not None:
-                    metric_display_label = _metric_label(plot_metric)
-                    channel_layout = {
-                        f"Average channel {metric_display_label}": (
-                            "Average selected channels"
-                        ),
-                        f"Overlay channel {metric_display_label}": (
-                            "Overlay selected channels"
-                        ),
-                        f"Separate channel {metric_display_label} plots": (
-                            "Separate plots"
-                        ),
-                    }[global_channel_view]
-                elif q_run_channel_view is None:
-                    channel_layout_options = [
-                        "Overlay selected channels",
-                        "Separate plots",
-                        "Average selected channels",
-                    ]
-                    channel_layout_key = f"bo_trend_layout_{trend_scope_key}_{plot_metric}"
-                    _preserve_valid_widget_value(
-                        channel_layout_key,
-                        channel_layout_options,
-                        channel_layout_options[0],
-                    )
-                    channel_layout = st.radio(
-                        "Channel display",
-                        channel_layout_options,
-                        horizontal=True,
-                        key=channel_layout_key,
-                    )
-                else:
-                    channel_layout = {
-                        "Average channel Q": "Average selected channels",
-                        "Overlay channel Q": "Overlay selected channels",
-                        "Separate channel Q plots": "Separate plots",
-                    }[q_run_channel_view]
                 if trend_channels:
                     chart_key_suffix = (
                         f"{metric}_{plot_metric}_{channel_layout}_"
