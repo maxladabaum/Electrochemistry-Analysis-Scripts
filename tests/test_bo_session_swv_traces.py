@@ -308,7 +308,8 @@ def test_compact_simulation_metadata_reaches_real_heatmap_points():
     assert points.loc[0, "gp_falloff_parameter"] == "all"
 
 
-def test_visible_swv_lines_backfill_missing_phase_replicate_peaks():
+@pytest.mark.parametrize("display_channel", [None, "Group 1 · Ch 1 · minimize"])
+def test_visible_swv_lines_backfill_missing_phase_replicate_peaks(display_channel):
     observation = {
         "buffer_channel_metrics": {"1": {}},
         "target_channel_metrics": {"1": {}},
@@ -317,6 +318,8 @@ def test_visible_swv_lines_backfill_missing_phase_replicate_peaks():
         *[{"phase": "buffer", "channel": "1"} for _ in range(3)],
         *[{"phase": "target", "channel": "1"} for _ in range(3)],
     ]
+    for trace in trace_items:
+        trace["display_channel"] = display_channel
     figure, axis = plt.subplots()
     for peak in (1.0, 1.1, 1.2, 2.0, 2.1, 2.2):
         axis.plot([0.0, 1.0, 2.0], [0.0, peak, 0.0])
@@ -333,6 +336,138 @@ def test_visible_swv_lines_backfill_missing_phase_replicate_peaks():
     assert enriched["buffer_channel_metrics"]["1"]["peak_currents_source"] == (
         "reconstructed from displayed SWV traces"
     )
+    assert set(enriched["buffer_channel_metrics"]) == {"1"}
+    assert set(enriched["target_channel_metrics"]) == {"1"}
+
+
+@pytest.mark.parametrize("direction, target_peak, expected", [
+    ("minimize", 2.0, -2.0),
+    ("maximize", 10.0, 2.0),
+])
+def test_iteration_paired_score_uses_saved_direction(direction, target_peak, expected):
+    observation = {
+        "objective": "paired_response",
+        "channels": [1],
+        "quality": {"optimization_direction": direction},
+        "buffer_channel_metrics": {"1": {
+            "mean_peak_current_uA": 6.0,
+            "mean_background_rms_uA": 1.0,
+            "ok_scan_count": 3,
+        }},
+        "target_channel_metrics": {"1": {
+            "mean_peak_current_uA": target_peak,
+            "mean_background_rms_uA": 1.0,
+            "ok_scan_count": 3,
+        }},
+    }
+    config = {
+        "acquisition": {
+            "optimization_direction": "maximize" if direction == "minimize" else "minimize",
+        },
+        "scoring": {
+            "paired_response_weights": {
+                "buffer_classic_Q": 0.0,
+                "target_classic_Q": 0.0,
+                "peak_prominence": 1.0,
+            },
+            "run_weights": {
+                "lambda_variability": 0.0,
+                "lambda_failed": 0.0,
+                "lambda_low": 0.0,
+            },
+        },
+    }
+    text = "\n".join(_iteration_trace_q_score_lines(observation, ["1"], config))
+    assert f"Derived Paired Q channel={expected:g}" in text
+    assert f"Derived Paired Q run={expected:g}" in text
+
+
+def test_trace_peak_backfill_uses_physical_channel_with_direction_label(monkeypatch):
+    monkeypatch.setattr(viewer, "_swv_trace_arrays", lambda *args: (
+        [0.0, 1.0, 2.0], [0.0, 3.0, 0.0], 1, 0, 2,
+    ))
+    observation = {"buffer_channel_metrics": {1: {"mean_peak_current_uA": 3.0}}}
+    traces = [{
+        "channel": "1", "display_channel": "Group 1 · Ch 1 · minimize",
+        "phase": "buffer", "path": Path(f"buffer_{index}.csv"),
+    } for index in range(3)]
+    enriched = viewer._observation_with_trace_peak_replicates(observation, traces, {})
+    assert set(enriched["buffer_channel_metrics"]) == {1}
+    assert enriched["buffer_channel_metrics"][1]["peak_currents_uA"] == [3.0] * 3
+    assert "peak_currents_uA" not in observation["buffer_channel_metrics"][1]
+
+
+@pytest.mark.parametrize("layout", ["overlay", "iteration"])
+def test_paired_score_panel_scores_reconstructed_peaks_without_saved_summaries(monkeypatch, layout):
+    buffer = [0.16077, 0.16592, 0.16499]
+    target = [0.13340, 0.13916, 0.14092]
+    peaks_by_path = {
+        f"{phase}_{index}.csv": peak
+        for phase, peaks in (("buffer", buffer), ("target", target))
+        for index, peak in enumerate(peaks)
+    }
+    monkeypatch.setattr(viewer, "_swv_trace_arrays", lambda path, *args: (
+        [0.0, 1.0, 2.0], [0.0, peaks_by_path[path.name], 0.0], 1, 0, 2,
+    ))
+    observation = {
+        "group_id": 1, "iteration": 49, "channels": [2],
+        "objective": "paired_response",
+        "buffer_channel_metrics": {"2": {}},
+        "target_channel_metrics": {"2": {}},
+        "quality": {
+            "optimization_direction": "minimize",
+            "channel_components": {"2_min": {
+                "pairwise_peak_differences_uA": [t - b for b in buffer for t in target],
+            }},
+        },
+    }
+    traces = [{
+        "channel": "2", "display_channel": "Group 1 · Ch 2 · minimize",
+        "optimization_direction": "minimize", "phase": phase,
+        "path": Path(f"{phase}_{index}.csv"),
+    } for phase in ("buffer", "target") for index in range(3)]
+    config = {"scoring": {
+        "paired_response_weights": {
+            "buffer_classic_Q": 0.0, "target_classic_Q": 0.0,
+            "peak_prominence": 0.0, "repeat_scan_snr": 1.0,
+            "repeat_scan_snr_definition": "pairwise", "pairwise_std_floor_uA": 0.001,
+        },
+        "run_weights": {
+            "lambda_variability": 0.0, "lambda_failed": 0.0, "lambda_low": 0.0,
+        },
+    }}
+    differences = pd.Series([t - b for b in buffer for t in target])
+    expected = differences.mean() / (differences.std() ** 2 + 0.001 ** 2) ** 0.5
+    if layout == "overlay":
+        blocks = _overlay_trace_scoring_blocks(
+            [(observation, trace) for trace in traces],
+            ["Group 1 · Ch 2 · minimize"], {}, config,
+        )
+        text = blocks[0][1]
+    else:
+        enriched = viewer._observation_with_trace_peak_replicates(observation, traces, {})
+        figure, axis = plt.subplots()
+        for trace in traces:
+            axis.plot([0, 1, 2], [0, peaks_by_path[trace["path"].name], 0])
+        enriched = _observation_with_plotted_peak_replicates(enriched, traces, figure)
+        plt.close(figure)
+        text = "\n".join(_iteration_trace_q_score_lines(enriched, ["2"], config))
+    assert f"Derived Paired Q channel={expected:.4g}" in text
+    assert f"Derived Paired Q run={expected:.4g}" in text
+    assert f"weight=1; contribution={expected:.4g}" in text
+    assert "2_min" not in text
+    assert observation["buffer_channel_metrics"]["2"] == {}
+
+
+def test_trace_score_phase_metrics_preserves_saved_values_and_failed_counts():
+    metrics = {"2": {
+        "peak_currents_uA": [0.1, 0.2, 0.3],
+        "mean_peak_current_uA": 0.25,
+        "std_peak_current_uA": 0.05,
+        "ok_scan_count": 0,
+        "total_scan_count": 3,
+    }}
+    assert viewer._trace_score_phase_metrics(metrics) == metrics
 
 
 def test_separate_iteration_score_panel_lists_q_inputs_and_replicate_peaks():
@@ -844,6 +979,39 @@ def test_pair_buffer_target_traces_preserves_every_replicate():
         [trace["phase"] for trace in pair] == ["buffer", "target"]
         for _channel, pair in pairs
     )
+
+
+@pytest.mark.parametrize("include_group", [False, True])
+def test_swv_channel_groups_separate_directions_on_same_channel(include_group):
+    observation = {"group_id": 1, "group_name": "Shared channel"}
+    traces = [
+        viewer._group_qualified_trace(
+            observation,
+            {"channel": "1", "phase": phase, "optimization_direction": direction},
+            include_group,
+        )
+        for phase in ("buffer", "target")
+        for direction in ("minimize", "maximize")
+    ]
+
+    channels = {viewer._trace_channel_key(trace) for trace in traces}
+    prefix = "Shared channel · " if include_group else ""
+    assert channels == {prefix + "Ch 1 · minimize", prefix + "Ch 1 · maximize"}
+    pairs = viewer._pair_buffer_target_traces(traces)
+    assert len(pairs) == 2
+    for channel, pair in pairs:
+        assert [trace["phase"] for trace in pair] == ["buffer", "target"]
+        assert len({trace["optimization_direction"] for trace in pair}) == 1
+        assert all(viewer._trace_channel_key(trace) == channel for trace in pair)
+        assert all(trace["channel"] == "1" for trace in pair)
+
+
+def test_swv_channel_group_without_saved_direction_keeps_legacy_label():
+    trace = {"channel": "1", "phase": "measurement"}
+    assert viewer._group_qualified_trace({}, trace, False) is trace
+    qualified = viewer._group_qualified_trace({"group_id": 2}, trace, True)
+    assert viewer._trace_channel_key(qualified) == "Group 2 · Ch 1"
+    assert "display_channel" not in trace
 
 
 def test_trace_entries_group_all_same_iteration_swvs_together():

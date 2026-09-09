@@ -17601,16 +17601,21 @@ def _group_qualified_trace(
     trace: dict,
     include_group: bool,
 ) -> dict:
-    if not include_group:
+    """Keep saved optimization directions distinct in SWV channel selectors."""
+    direction = str(trace.get("optimization_direction") or "").strip().lower()
+    if not include_group and not direction:
         return trace
-    group_name = str(
-        observation.get("group_name")
-        or f"Group {observation.get('group_id', 1)}"
-    )
+    label_parts = []
+    if include_group:
+        label_parts.append(str(
+            observation.get("group_name")
+            or f"Group {observation.get('group_id', 1)}"
+        ))
+    label_parts.append(_trace_channel_label(trace["channel"]))
+    if direction:
+        label_parts.append(direction)
     qualified = dict(trace)
-    qualified["display_channel"] = (
-        f"{group_name} · {_trace_channel_label(trace['channel'])}"
-    )
+    qualified["display_channel"] = " · ".join(label_parts)
     return qualified
 
 
@@ -18269,6 +18274,31 @@ def _classic_active_input_lines(
     return lines
 
 
+def _trace_score_phase_metrics(metrics_by_channel: Mapping[str, Any]) -> dict:
+    """Complete missing scoring summaries from the replicate peaks in the panel."""
+    completed = {}
+    for channel, raw_metrics in metrics_by_channel.items():
+        metrics = dict(raw_metrics or {})
+        raw_peaks = metrics.get("peak_currents_uA")
+        peaks = [
+            numeric for value in raw_peaks
+            if (numeric := _finite_float(value)) is not None
+        ] if isinstance(raw_peaks, (list, tuple, np.ndarray, pd.Series)) else []
+        if peaks:
+            # Trace backfilling supplies replicate lists, but the scorer also
+            # needs phase means and counts. Missing means otherwise become
+            # zero, even while the panel displays nonzero peak differences.
+            for key, value in {
+                "mean_peak_current_uA": float(np.mean(peaks)),
+                "std_peak_current_uA": _rescore_sample_std(peaks),
+                "ok_scan_count": len(peaks),
+            }.items():
+                if _finite_float(metrics.get(key)) is None:
+                    metrics[key] = value
+        completed[channel] = metrics
+    return completed
+
+
 def _paired_iteration_q_score_lines(
     observation: Mapping[str, Any],
     channels: Sequence[str],
@@ -18298,19 +18328,19 @@ def _paired_iteration_q_score_lines(
     snr_definition = str(
         paired_weights.get("repeat_scan_snr_definition", "original") or "original"
     ).strip().lower()
-    direction = _rescore_group_direction(
+    direction = _saved_observation_optimization_direction({}, observation) or _rescore_group_direction(
         config,
         int(observation.get("group_id", 1) or 1),
     )
     allowed_channels = _rescore_observation_channels(observation, config)
-    buffer_all = _scoped_rescore_metrics(
+    buffer_all = _trace_score_phase_metrics(_scoped_rescore_metrics(
         observation.get("buffer_channel_metrics") or {},
         allowed_channels,
-    )
-    target_all = _scoped_rescore_metrics(
+    ))
+    target_all = _trace_score_phase_metrics(_scoped_rescore_metrics(
         observation.get("target_channel_metrics") or {},
         allowed_channels,
-    )
+    ))
     derived_quality = _rescore_paired_quality(
         buffer_all,
         target_all,
@@ -18322,6 +18352,9 @@ def _paired_iteration_q_score_lines(
         (observation.get("quality") or {}).get("channel_components") or {}
     )
     for saved_channel, saved_component in saved_components.items():
+        if str(saved_channel) not in derived_components:
+            # Saved display aliases (e.g. 2_min) are not extra run channels.
+            continue
         saved_differences = (saved_component or {}).get(
             "pairwise_peak_differences_uA"
         )
@@ -18677,7 +18710,7 @@ def _observation_with_trace_peak_replicates(
         phase = str(item.get("phase") or "").strip().lower()
         if phase not in {"buffer", "target"}:
             continue
-        channel = str(_trace_channel_key(dict(item)))
+        channel = str(item["channel"])
         path_value = item.get("path")
         if path_value is None:
             continue
@@ -18812,7 +18845,7 @@ def _observation_with_plotted_peak_replicates(
             np.nanpercentile(values, 99) - np.nanpercentile(values, 5)
         )
         phase = str(item.get("phase") or "").strip().lower()
-        channel = str(_trace_channel_key(dict(item)))
+        channel = str(item["channel"])
         source_name = f"{phase}_channel_metrics"
         source = enriched.get(source_name)
         if not isinstance(source, dict):
@@ -29941,13 +29974,46 @@ def render_bo_session_app() -> None:
                 if column.startswith("Optimized ")
                 and column not in optimized_column_config
             })
-            st.dataframe(
-                optimized_parameters,
-                use_container_width=True,
-                height=420,
-                hide_index=True,
-                column_config=optimized_column_config,
+            optimized_table_view = st.radio(
+                "Optimized parameters view",
+                ["Full table", "Interactive table"],
+                horizontal=True,
+                key="bo_optimized_parameters_view",
             )
+            if optimized_table_view == "Full table":
+                table_html = optimized_parameters.to_html(
+                    index=False,
+                    border=0,
+                    classes="bo-optimized-parameters",
+                    escape=True,
+                    na_rep="—",
+                    float_format=lambda value: f"{value:.6g}",
+                    formatters={
+                        "Optimized iteration": lambda value: f"{value:.0f}",
+                        "Optimized objective (Q_run)": lambda value: f"{value:.6g}",
+                    },
+                )
+                st.markdown(
+                    """<style>
+                    table.bo-optimized-parameters {
+                        width: 100%; table-layout: fixed;
+                    }
+                    table.bo-optimized-parameters th,
+                    table.bo-optimized-parameters td {
+                        white-space: normal; overflow-wrap: anywhere;
+                        text-align: left; vertical-align: top;
+                    }
+                    </style>""" + table_html,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.dataframe(
+                    optimized_parameters,
+                    use_container_width=True,
+                    height=35 * (len(optimized_parameters) + 1) + 3,
+                    hide_index=True,
+                    column_config=optimized_column_config,
+                )
             if (optimized_parameters["Optimization direction"] == "Not saved").any():
                 st.warning(
                     "An optimized result is not shown for groups whose optimization "
