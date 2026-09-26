@@ -2507,6 +2507,20 @@ def plot_metric_vs_scan(
 
     channel_colors: Optional[Dict[Any, Any]] = None,
 
+    show_time_axis: bool = False,
+
+    annotate_measurement_numbers: bool = False,
+
+    annotation_every: int = 1,
+
+    annotation_every_by_channel: Optional[Dict[Any, int]] = None,
+
+    show_measurement_rate: bool = False,
+
+    elapsed_time: bool = False,
+
+    annotation_offset_by_channel: Optional[Dict[Any, float]] = None,
+
 ) -> Optional[plt.Figure]:
 
     if normalize_per_channel and percent_change_per_channel:
@@ -2531,6 +2545,16 @@ def plot_metric_vs_scan(
 
     )
 
+    time_origin = None
+    if elapsed_time:
+        timestamps = [
+            float(mdates.date2num(row["measurement_time"]))
+            for row in plot_results
+            if row.get("channel") in channels and row.get("measurement_time") is not None
+        ]
+        if timestamps:
+            time_origin = min(timestamps)
+
     filtered_vlines = (
 
         [(x, lab) for x, lab in vlines if scan_range[0] <= x <= scan_range[1]]
@@ -2545,7 +2569,7 @@ def plot_metric_vs_scan(
 
         for row in plot_results:
 
-            if row.get("scan_number") is None or row.get(x_key) is None:
+            if row.get("channel") not in channels or row.get("scan_number") is None or row.get(x_key) is None:
 
                 continue
 
@@ -2592,6 +2616,12 @@ def plot_metric_vs_scan(
             filtered_vlines = []
 
 
+
+    if elapsed_time and x_key == "measurement_time" and filtered_vlines and time_origin is not None:
+        filtered_vlines = [
+            ((float(mdates.date2num(time)) - time_origin) * 1440, label)
+            for time, label in filtered_vlines
+        ]
 
     normalized_directions = {
         channel: str(direction).strip().lower()
@@ -2686,6 +2716,8 @@ def plot_metric_vs_scan(
             continue
 
         x = [r[x_key] for r in ch_res]
+        if elapsed_time and x_key == "measurement_time" and time_origin is not None:
+            x = [(float(mdates.date2num(time)) - time_origin) * 1440 for time in x]
 
         y = np.asarray([r.get(metric, np.nan) for r in ch_res], dtype=float)
 
@@ -2752,6 +2784,21 @@ def plot_metric_vs_scan(
             ch,
             normalized_directions if use_direction_colors else None,
         )
+        if show_measurement_rate:
+            measurement_times = sorted(
+                float(mdates.date2num(row["measurement_time"]))
+                for row, value in zip(ch_res, y)
+                if row.get("measurement_time") is not None and np.isfinite(value)
+            )
+            duration_minutes = (
+                (measurement_times[-1] - measurement_times[0]) * 24 * 60
+                if len(measurement_times) > 1 else 0.0
+            )
+            if duration_minutes > 0:
+                rate = (len(measurement_times) - 1) / duration_minutes
+                trace_label += f" · {rate:.2f} scans/min (avg)"
+            else:
+                trace_label += " · rate unavailable"
 
         line_style, marker = trace_style_by_channel[ch]
         line, = plot_axis.plot(x, y, marker=marker, linestyle=line_style, ms=3, lw=1.6,
@@ -2764,9 +2811,31 @@ def plot_metric_vs_scan(
         line._swv_preserve_color = _swv_method_blue(ch) is not None
         plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
 
+        if annotate_measurement_numbers and x_key == "measurement_time":
+            channel_annotation_every = (annotation_every_by_channel or {}).get(ch, annotation_every)
+            annotation_offset = float((annotation_offset_by_channel or {}).get(ch, 10.0))
+            for index in range(0, len(ch_res), max(1, int(channel_annotation_every))):
+                scan = ch_res[index].get("scan_number")
+                if scan is None or not np.isfinite(y[index]):
+                    continue
+                annotation = plot_axis.annotate(
+                    f"{float(scan):g}",
+                    xy=(x[index] if elapsed_time else mdates.date2num(x[index]), y[index]),
+                    xytext=(0, annotation_offset),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if annotation_offset >= 0 else "top",
+                    fontsize=7,
+                    color=colors[ch],
+                    alpha=0.15 if dimmed else 0.9,
+                    annotation_clip=True,
+                    zorder=5,
+                )
+                annotation._swv_series_artist = line
 
 
-    ax.set_xlabel(xlabel)
+
+    ax.set_xlabel("Elapsed time (min)" if elapsed_time and x_key == "measurement_time" else xlabel)
     ax._swv_force_black_y_axis = True
     if signal_off_ax is not None:
         signal_off_ax._swv_force_black_y_axis = True
@@ -2808,7 +2877,7 @@ def plot_metric_vs_scan(
 
     ax.set_title(title or f"{metric} vs Scan")
 
-    if x_key != "scan_number":
+    if x_key != "scan_number" and not elapsed_time:
 
         locator = mdates.AutoDateLocator()
 
@@ -2848,6 +2917,45 @@ def plot_metric_vs_scan(
     if scan_range and x_key == "scan_number":
 
         ax.set_xlim(scan_range)
+
+    if elapsed_time and x_key == "measurement_time":
+        ax.set_xlim(left=0)
+
+    if show_time_axis and x_key == "scan_number":
+        # Label actual measurement positions so irregular spacing and repeated
+        # filename timestamps do not require an invertible time transform.
+        times_by_scan: Dict[float, List[float]] = {}
+        for row in plot_results:
+            if (
+                row.get("channel") not in channels
+                or row.get("scan_number") is None
+                or row.get("measurement_time") is None
+            ):
+                continue
+            times_by_scan.setdefault(float(row["scan_number"]), []).append(
+                float(mdates.date2num(row["measurement_time"]))
+            )
+        if times_by_scan:
+            scans = sorted(times_by_scan)
+            tick_indices = np.unique(
+                np.linspace(0, len(scans) - 1, min(5, len(scans)), dtype=int)
+            )
+            tick_scans = [scans[index] for index in tick_indices]
+            tick_times = [
+                mdates.num2date(float(np.median(times_by_scan[scan])))
+                for scan in tick_scans
+            ]
+            time_axis = ax.secondary_xaxis("top")
+            time_axis.set_xticks(
+                tick_scans,
+                labels=(
+                    [f"{(float(mdates.date2num(time)) - time_origin) * 1440:.4g}" for time in tick_times]
+                    if elapsed_time and time_origin is not None
+                    else [time.strftime("%Y-%m-%d\n%H:%M") for time in tick_times]
+                ),
+            )
+            time_axis.set_xlabel("Elapsed time (min)" if elapsed_time else "Measurement time")
+            time_axis.tick_params(labelsize=8)
 
     fig.tight_layout()
 

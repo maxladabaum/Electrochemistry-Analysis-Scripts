@@ -419,3 +419,86 @@ def test_current_iteration_marker_follows_show_observed_points(monkeypatch):
         ]
         assert len(current_markers) == expected_marker_count
         plt.close(fig)
+
+
+def test_surrogate_map_style_preserves_data_and_iteration_colors():
+    from matplotlib import pyplot as plt
+    import numpy as np
+
+    fig, ax = plt.subplots()
+    mesh = ax.pcolormesh([0, 1], [0, 1], [[1., 2.], [3., 4.]])
+    points = ax.scatter([0, 1], [0, 1], c=[1, 2], s=[10, 20], cmap="hot", label="Observed")
+    line, = ax.plot([0, 1], [0, 1], linewidth=2)
+    value_bar = fig.colorbar(mesh, ax=ax, label="Acquisition")
+    iteration_bar = fig.colorbar(points, ax=ax)
+    viewer._set_surrogate_2d_colorbar_title(iteration_bar, "Iteration")
+    ax.legend()
+    original_data = mesh.get_array().copy()
+    settings = dict(
+        width=900, height=700, title="My map", xlabel="Frequency", ylabel="Amplitude",
+        title_size=18., xlabel_size=16., ylabel_size=15., tick_size=13.,
+        legend_size=12., colorbar_size=11., marker_scale=2., line_scale=1.5,
+        alpha=0.5, show_legend=False, show_grid=False, cmap="plasma",
+        value_colorbar_label="Acquisition score", iteration_colorbar_label="Measurement",
+    )
+    viewer._apply_surrogate_map_settings(fig, settings)
+    assert np.allclose(fig.get_size_inches(), [9, 7])
+    assert ax.get_title() == "My map"
+    assert value_bar.ax.get_ylabel() == "Acquisition score"
+    assert iteration_bar.ax.get_title() == "Measurement"
+    assert viewer._is_matplotlib_iteration_colorbar_axis(iteration_bar.ax)
+    assert ax.xaxis.label.get_fontsize() == 16
+    assert not ax.get_legend().get_visible()
+    assert mesh.get_cmap().name == "plasma"
+    assert points.get_cmap().name == "hot"
+    assert np.allclose(points.get_sizes(), [40, 80])
+    assert line.get_linewidth() == 3
+    assert np.array_equal(mesh.get_array(), original_data)
+    plt.close(fig)
+
+
+def test_surrogate_map_shared_settings_and_individual_override():
+    from streamlit.testing.v1 import AppTest
+    from matplotlib import pyplot as plt
+
+    plt.switch_backend("Agg")
+    app = AppTest.from_string("""
+import streamlit as st
+import bo_session_viewer as viewer
+shared = viewer._surrogate_map_settings_form(st, "shared", heading="All iterations")
+individual = viewer._surrogate_map_settings_form(st, "one", shared=shared or {}, heading="One iteration")
+st.session_state["effective"] = individual
+""", default_timeout=30).run()
+    assert not app.exception
+    app.checkbox(key="shared_enabled").check()
+    app.number_input(key="shared_title_size").set_value(24.)
+    next(b for b in app.button if b.proto.form_id == "shared_form").click()
+    app.run()
+    assert app.session_state["effective"]["title_size"] == 24
+    app.checkbox(key="one_enabled").check()
+    app.number_input(key="one_title_size").set_value(18.)
+    next(b for b in app.button if b.proto.form_id == "one_form").click()
+    app.run()
+    assert app.session_state["effective"]["title_size"] == 18
+    app.checkbox(key="one_enabled").uncheck()
+    next(b for b in app.button if b.proto.form_id == "one_form").click()
+    app.run()
+    assert app.session_state["effective"]["title_size"] == 24
+
+
+def test_surrogate_map_colorbar_height_and_gap_survive_export():
+    plt.switch_backend("Agg")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    mesh = ax.pcolormesh([[1., 2.], [3., 4.]])
+    first = fig.colorbar(mesh, ax=ax)
+    second = fig.colorbar(plt.cm.ScalarMappable(cmap="hot"), ax=ax)
+    viewer._layout_surrogate_map_colorbars(fig, 60., 50.)
+    viewer._matplotlib_png_bytes(fig, apply_global_style=False)
+    bars = sorted([first.ax, second.ax], key=lambda axis: axis.get_position().x0)
+    a, b = [axis.get_position() for axis in bars]
+    assert a.height == pytest.approx(ax.get_position().height * 0.6)
+    assert b.height == pytest.approx(a.height)
+    assert (b.x0 - a.x1) * 1000 == pytest.approx(50)
+    assert ax.get_position().x1 < a.x0
+    assert b.x1 <= 1
+    plt.close(fig)

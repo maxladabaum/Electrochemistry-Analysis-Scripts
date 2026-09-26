@@ -455,3 +455,209 @@ def test_direction_suffixed_channels_keep_scores_metrics_and_click_identity():
             assert selection["channel"] in expected
             observation = next(o for o in observations if o["method_id"] == selection["method_id"])
             assert list(trace.y) == [observation["Q_run"]]
+
+
+def test_history_separate_plots_split_simulations_instead_of_physical_channels():
+    import ast
+
+    tree = ast.parse(Path(viewer.__file__).read_text())
+    block = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and node.body
+        and isinstance(node.body[0], ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == 'separate_channel_figures'
+                for target in node.body[0].targets)
+    )
+    history = pd.DataFrame({
+        'iteration': [1, 2, 1, 2, 1, 2],
+        'group_id': [1, 1, 2, 2, 3, 3],
+        'group_name': ['Simulation A'] * 2 + ['Simulation B'] * 2 + ['Simulation C'] * 2,
+        'ground_truth_channel': ['1'] * 4 + ['2'] * 2,
+        'Q_ch1': [1., 2., 3., 4., None, None],
+        'Q_ch2': [None, None, None, None, 5., 6.],
+    })
+    for simulated, channels, expected in [
+        (True, ['1', '2'], ['Simulation A', 'Simulation B', 'Simulation C']),
+        (True, ['1'], ['Simulation A', 'Simulation B']),
+        (False, ['1', '2'], ['Channel 1', 'Channel 2']),
+    ]:
+        namespace = dict(
+            channel_layout='Separate plots', separate_simulation_figures=simulated,
+            is_simulated_trend_session=simulated,
+            group_layout='Plot groups separately' if simulated else 'Plot groups overlaid',
+            trend_history=history, trend_channels=channels, plot_metric='Q_channel',
+            channel_metrics={'Q_channel': {'1': 'Q_ch1', '2': 'Q_ch2'}},
+            group_color_values=None, group_color_label=None,
+            group_average_values=None, group_average_label=None,
+            trend_reference_values_by_group={}, trend_reference_label=None,
+            trend_trace_opacity=0.9, applied_moving_average_window=None,
+            trend_figures=[], _plot_channel_trend=viewer._plot_channel_trend,
+            _metric_label=viewer._metric_label,
+        )
+        exec(compile(ast.Module(body=block.body, type_ignores=[]), viewer.__file__, 'exec'), namespace)
+        figures = namespace['trend_figures']
+        assert [label for label, figure in figures] == expected
+        if simulated:
+            for index, (_, figure) in enumerate(figures):
+                assert len(figure.data) == 1
+                assert list(figure.data[0].y) == [float(index * 2 + 1), float(index * 2 + 2)]
+
+
+def test_simulation_extrema_keep_repeated_runs_separate_and_use_run_q():
+    history = pd.DataFrame({
+        'group_id': [1, 1, 2, 2, 3, 3],
+        'group_name': ['Same label'] * 4 + ['Other channel'] * 2,
+        'ground_truth_channel': ['2'] * 4 + ['6'] * 2,
+        'iteration': [1, 2, 1, 2, 1, 2],
+        'Q_run': [2., 5., -8., -3., 1., 9.],
+        'Q_ch2': [100., 0., 100., 0., None, None],
+        'frequency': [100., 200., 300., 400., 500., 600.],
+        'amplitude': [.03] * 6, 'step_potential': [.002] * 6,
+    })
+    summary = viewer._best_q_parameters_by_simulation_frame(history, ['2'])
+    assert summary['Run ID'].tolist() == [1, 2]
+    assert summary['Highest Q'].tolist() == [5., -3.]
+    assert summary['Lowest Q'].tolist() == [2., -8.]
+    assert summary['Frequency at highest Q (Hz)'].tolist() == [200., 400.]
+    assert summary['Frequency at lowest Q (Hz)'].tolist() == [100., 300.]
+    assert viewer._best_q_parameters_by_simulation_frame(history, []).empty
+    all_runs = viewer._best_q_parameters_by_simulation_frame(history)
+    assert len(all_runs) == 3
+
+
+def test_unsaved_simulation_extrema_use_run_index_and_observed_value():
+    history = pd.DataFrame({
+        'run_index': [1, 1, 2, 2], 'run_label': ['Repeat'] * 4,
+        'iteration': [1, 2, 1, 2], 'observed_value': [2., 5., 8., float('nan')],
+        'frequency': [100., 200., 300., 400.],
+        'amplitude': [.03] * 4, 'step_potential': [.002] * 4,
+    })
+    summary = viewer._best_q_parameters_by_simulation_frame(history)
+    assert summary['Run ID'].tolist() == [1, 2]
+    assert summary['Highest Q'].tolist() == [5., 8.]
+    assert summary['Lowest Q'].tolist() == [2., 8.]
+
+
+def test_duplicate_simulation_titles_have_unique_y_limit_widget_keys(monkeypatch):
+    import ast
+    import plotly.graph_objects as go
+
+    tree = ast.parse(Path(viewer.__file__).read_text())
+    render_loop = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.For) and ast.unparse(node.target) == '(figure_index, (figure_label, figure))'
+    )
+    registered_keys = set()
+    def register_key(key):
+        assert key not in registered_keys, f'Duplicate widget key: {key}'
+        registered_keys.add(key)
+    def checkbox(label, *, key, **kwargs):
+        register_key(key)
+        return True
+    def number_input(label, *, key, value, **kwargs):
+        register_key(key)
+        return value
+    from types import SimpleNamespace
+    monkeypatch.setattr(viewer.st, 'checkbox', checkbox)
+    monkeypatch.setattr(viewer.st, 'columns', lambda *args: [SimpleNamespace(number_input=number_input)] * 2)
+    downloads = []
+    namespace = dict(vars(viewer))
+    namespace.update(
+        trend_figures=[('Ch 1 initial 0', go.Figure(go.Scatter(x=[1, 2], y=[1, 2]))) for _ in range(3)],
+        trend_scope_key='all_channels_1_2', metric='Q_run', chart_key_suffix='test',
+        plot_width_percent=100, observations=[],
+        _render_downloadable_plotly=lambda *args, **kwargs: downloads.append(kwargs),
+    )
+    exec(compile(ast.Module(body=[render_loop], type_ignores=[]), viewer.__file__, 'exec'), namespace)
+    assert len(registered_keys) == 9  # checkbox, minimum, maximum for each run
+    assert len({item['key'] for item in downloads}) == 3
+    assert len({item['file_stem'] for item in downloads}) == 3
+
+
+def test_use_this_run_checkboxes_overlay_only_selected_run_ids(monkeypatch):
+    import ast
+    import plotly.graph_objects as go
+
+    tree = ast.parse(Path(viewer.__file__).read_text())
+    render_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.For)
+                       and ast.unparse(node.target) == '(figure_index, (figure_label, figure))')
+    overlay_block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                         and ast.unparse(node.test).startswith('any(')
+                         and 'simulation_run_id' in ast.unparse(node.test))
+    registered = []
+    def checkbox(label, *, key, **kwargs):
+        assert key not in registered
+        registered.append(key)
+        if label == 'Use this run':
+            return key.endswith('_1') or key.endswith('_3')
+        return label == 'Overlay selected runs'
+    monkeypatch.setattr(viewer.st, 'checkbox', checkbox)
+    monkeypatch.setattr(viewer.st, 'markdown', lambda *args, **kwargs: None)
+    monkeypatch.setattr(viewer.st, 'caption', lambda *args, **kwargs: None)
+    history = pd.DataFrame({
+        'iteration': [1, 2] * 3, 'group_id': [1, 1, 2, 2, 3, 3],
+        'group_name': ['Same name'] * 6, 'ground_truth_channel': ['1'] * 6,
+        'Q_ch1': [1., 2., 3., 4., 5., 6.],
+    })
+    figures = []
+    for run_id in [1, 2, 3]:
+        fig = go.Figure(go.Scatter(x=[1, 2], y=[run_id, run_id + 1]))
+        fig.update_layout(meta={'simulation_run_id': run_id})
+        figures.append(('Same name', fig))
+    outputs = []
+    namespace = dict(vars(viewer))
+    namespace.update(
+        trend_figures=figures, trend_scope_key='all', metric='Q_channel',
+        plot_metric='Q_channel', plot_metric_kind='channel', chart_key_suffix='test',
+        plot_width_percent=100, observations=[], selected_overlay_run_ids=[],
+        run_selection_token='session1', saved_run_selection={}, trend_history=history,
+        channel_metrics={'Q_channel': {'1': 'Q_ch1'}}, trend_channels=['1'],
+        trend_reference_values_by_group={}, trend_reference_label=None,
+        trend_trace_opacity=0.9, applied_moving_average_window=None,
+        group_color_values=None, group_color_label=None,
+        _manual_y_axis_range_control=lambda *args: None,
+        _render_downloadable_plotly=lambda container, figure, **kwargs: outputs.append(figure),
+        _render_selected_simulation_runs_plot=lambda figure, **kwargs: outputs.append(figure),
+    )
+    exec(compile(ast.Module(body=[render_loop, overlay_block], type_ignores=[]), viewer.__file__, 'exec'), namespace)
+    assert namespace['selected_overlay_run_ids'] == [1, 3]
+    assert namespace['saved_run_selection'] == {'1': True, '2': False, '3': True}
+    overlay = outputs[-1]
+    assert len(outputs) == 4
+    assert len(overlay.data) == 2
+    assert [list(trace.y) for trace in overlay.data] == [[1., 2.], [5., 6.]]
+    assert '(run 1)' in overlay.data[0].name
+    assert '(run 3)' in overlay.data[1].name
+
+
+def test_overlaid_runs_share_equal_optimum_reference_only():
+    history = pd.DataFrame({
+        "iteration": [1, 2, 1, 3, 1, 2],
+        "group_id": [1, 1, 2, 2, 3, 3],
+        "group_name": ["Run A", "Run A", "Run B", "Run B", "Run C", "Run C"],
+        "Q_ch1": [1., 2., 3., 4., 2., 3.],
+        "Q_run": [1., 2., 3., 4., 2., 3.],
+    })
+    references = {1: 8.4, 2: 8.4, 3: 9.0}
+    figures = [
+        viewer._plot_channel_trend(
+            history, "Q_channel", {"1": "Q_ch1"}, ["1"],
+            "Overlay selected channels", reference_values_by_group=references,
+            reference_label="Best possible Q",
+        ),
+        viewer._plot_trend(
+            history, "Q_run", reference_values_by_group=references,
+            reference_label="Best possible Q",
+        ),
+    ]
+    for figure in figures:
+        reference_traces = [
+            trace for trace in figure.data
+            if str(trace.name).startswith("Best possible Q")
+        ]
+        assert len(reference_traces) == 2
+        assert reference_traces[0].name == "Best possible Q"
+        assert list(reference_traces[0].x) == [1., 3.]
+        assert list(reference_traces[0].y) == [8.4, 8.4]
+        assert reference_traces[1].name == "Best possible Q: Run C"
+        assert list(reference_traces[1].y) == [9., 9.]

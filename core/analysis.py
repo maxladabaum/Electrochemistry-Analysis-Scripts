@@ -966,10 +966,17 @@ def run_batch(
     use_wavelet_for_correction: bool = False,
     parallel_workers: int = 1,
     progress_callback=None,
+    channels: Optional[List[int]] = None,
 ) -> List[dict]:
     files = collect_swv_csvs_from_folders(folders)
     if not files:
         raise ValueError("No SWV CSVs found.")
+
+    if channels is not None:
+        selected_channels = set(channels)
+        files = [measurement for measurement in files if measurement.ch in selected_channels]
+        if not files:
+            raise ValueError("No SWV CSVs found for the selected channels.")
 
     by_ch = group_by_channel_and_sort(files)
     all_results: List[dict] = []

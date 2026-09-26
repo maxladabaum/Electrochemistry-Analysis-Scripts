@@ -2321,6 +2321,66 @@ def _best_q_parameters_by_channel_frame(
     return pd.DataFrame(rows)
 
 
+def _best_q_parameters_by_simulation_frame(
+    history: pd.DataFrame,
+    selected_channels: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Report extrema within each run, keeping repeated runs on a channel distinct."""
+    parameters = {
+        "Frequency": ("Hz", "frequency"),
+        "Amplitude": ("V", "amplitude"),
+        "Step size": ("V", "step_potential"),
+    }
+    if history is None or history.empty or not {
+        "iteration", *(column for _, column in parameters.values())
+    }.issubset(history.columns):
+        return pd.DataFrame()
+    q_column = next((name for name in ("Q_run", "observed_value") if name in history), None)
+    if q_column is None:
+        return pd.DataFrame()
+    work = history.copy().reset_index(drop=True)
+    if selected_channels is not None:
+        selected = {_simulation_channel_identity_text(channel) for channel in selected_channels}
+        if not selected:
+            return pd.DataFrame()
+        if "ground_truth_channel" in work:
+            work = work.loc[work["ground_truth_channel"].map(_simulation_channel_identity_text).isin(selected)]
+        elif "channels" in work:
+            work = work.loc[work["channels"].map(
+                lambda value: bool(selected.intersection(str(value).split(",")))
+            )]
+    run_column = next((name for name in ("group_id", "run_index", "run_label") if name in work), None)
+    if run_column is None:
+        work["run_index"] = 1
+        run_column = "run_index"
+    work["_q"] = pd.to_numeric(work[q_column], errors="coerce")
+    work["_iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+    work = work.loc[np.isfinite(work["_q"]) & np.isfinite(work["_iteration"])]
+    rows = []
+    for run_id, run_rows in work.groupby(run_column, sort=True):
+        names = next((run_rows[name].dropna() for name in ("group_name", "run_label")
+                      if name in run_rows and not run_rows[name].dropna().empty), pd.Series(dtype=str))
+        row = {
+            "Run ID": run_id,
+            "Simulation run": str(names.iloc[0]) if not names.empty else f"Simulation {run_id}",
+        }
+        if "ground_truth_channel" in run_rows:
+            row["Channel"] = ", ".join(dict.fromkeys(
+                run_rows["ground_truth_channel"].dropna().map(_simulation_channel_identity_text)
+            ))
+        for title, extremum, index in (
+            ("Highest", "highest", run_rows["_q"].idxmax()),
+            ("Lowest", "lowest", run_rows["_q"].idxmin()),
+        ):
+            point = run_rows.loc[index]
+            row[f"{title} Q iteration"] = int(point["_iteration"])
+            row[f"{title} Q"] = float(point["_q"])
+            for label, (unit, column) in parameters.items():
+                row[f"{label} at {extremum} Q ({unit})"] = _finite_float(point.get(column))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _metric_label(metric: str) -> str:
     replacements = {
         "best_Q": "Best Q",
@@ -3029,17 +3089,33 @@ def _add_group_reference_line(
     row: int | None = None,
     col: int | None = None,
     annotate: bool = False,
+    shared_label: str | None = None,
 ) -> None:
     if y_value is None or not np.isfinite(float(y_value)):
         return
     numeric_x = pd.to_numeric(pd.Series(list(x_values)), errors="coerce").dropna()
     if numeric_x.empty:
         return
+    if shared_label and row is None and col is None and not annotate:
+        for existing in fig.data:
+            meta = existing.meta if isinstance(existing.meta, Mapping) else {}
+            if (
+                meta.get("shared_reference_label") == shared_label
+                and float(existing.y[0]) == float(y_value)
+            ):
+                existing.x = [
+                    min(float(existing.x[0]), float(numeric_x.min())),
+                    max(float(existing.x[-1]), float(numeric_x.max())),
+                ]
+                existing.name = shared_label
+                existing.hovertemplate = f"{shared_label}: %{{y:.4g}}<extra></extra>"
+                return
     trace = go.Scatter(
         x=[float(numeric_x.min()), float(numeric_x.max())],
         y=[float(y_value), float(y_value)],
         mode="lines",
         name=label,
+        meta={"shared_reference_label": shared_label} if shared_label else None,
         line={"dash": "dash", "color": "#d62728", "width": 1.5},
         hovertemplate=f"{label}: %{{y:.4g}}<extra></extra>",
         showlegend=showlegend,
@@ -3650,6 +3726,7 @@ def _plot_trend(
                 group_reference,
                 f"{reference_label or 'Ground-truth optimum'}: {group_name}",
                 showlegend=True,
+                shared_label=reference_label or "Ground-truth optimum",
             )
     if grouped:
         _apply_metadata_coloraxis(fig, group_color_values, group_color_label)
@@ -5919,6 +5996,7 @@ def _plot_channel_trend(
                         reference_value,
                         reference_name,
                         showlegend=True,
+                        shared_label=reference_label or "Best possible Q",
                     )
 
     if multiple_groups:
@@ -11102,6 +11180,7 @@ def _simulation_gp_predict(
     *,
     config: dict | None = None,
     fixed_length_scales: bool = True,
+    model_out: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if len(y_train) < 2:
         raise ValueError("At least two observations are required for GP fitting.")
@@ -11153,9 +11232,12 @@ def _simulation_gp_predict(
                 warnings.simplefilter("ignore", ConvergenceWarning)
                 gp.fit(x_train, y_train)
             means, stds = gp.predict(x_candidates, return_std=True)
+            if model_out is not None:
+                model_out["gp"] = gp
             return np.asarray(means, dtype=float), np.asarray(stds, dtype=float)
-        except Exception:
-            pass
+        except Exception as exc:
+            if model_out is not None:
+                model_out["error"] = str(exc)
     y_mean = float(np.mean(y_train))
     y_scale = float(np.std(y_train))
     if y_scale < 1e-12:
@@ -11345,7 +11427,13 @@ def _simulation_normalized_bo_config(config: dict | None) -> dict:
 
 
 def _simulation_resolve_candidate(candidate: dict, config: dict) -> dict:
-    cfg = _simulation_normalized_bo_config(config)
+    return _simulation_resolve_normalized_candidate(
+        candidate, _simulation_normalized_bo_config(config)
+    )
+
+
+def _simulation_resolve_normalized_candidate(candidate: dict, cfg: dict) -> dict:
+    """Resolve one candidate using read-only, already-normalized settings."""
     resolved = {
         name: float(candidate.get(name, cfg["initial_parameters"].get(name, DEFAULT_INITIAL_METHOD[name])))
         for name in PARAMETERS
@@ -11451,7 +11539,9 @@ def _simulation_validate_candidate(candidate: dict, config: dict) -> list[str]:
 
 def _simulation_optimization_direction(config: dict | None) -> str:
     raw = str(
-        (_simulation_normalized_bo_config(config).get("acquisition") or {}).get(
+        # Direction is already a scalar setting. Normalizing here copies the
+        # entire sweep config (including every run) once per tensor value.
+        ((config or {}).get("acquisition") or {}).get(
             "optimization_direction",
             "maximize",
         )
@@ -13760,14 +13850,14 @@ def _write_simulated_trace_record(
     return str(record_path)
 
 
-def _simulation_surrogate_artifact_frame(
+def _prepare_simulation_surrogate_candidates(
     ground_truth: pd.DataFrame,
-    history: pd.DataFrame,
     axes: tuple[str, str, str],
     value_column: str = "ground_truth_value",
     *,
     config: dict | None = None,
-) -> pd.DataFrame:
+) -> dict:
+    """Prepare a fixed candidate grid once for all saved snapshots of a run."""
     x_name, y_name, z_name = axes
     frame = ground_truth.copy()
     if value_column not in frame.columns and "interpolated_value" in frame.columns:
@@ -13789,15 +13879,40 @@ def _simulation_surrogate_artifact_frame(
                 ]
             else:
                 frame[name] = DEFAULT_INITIAL_METHOD[name]
-    observed = history.dropna(subset=[x_name, y_name, z_name])
     cfg = _simulation_normalized_bo_config(config)
     candidate_params = [
-        _simulation_resolve_candidate(
-            {name: float(row[name]) for name in PARAMETERS},
+        _simulation_resolve_normalized_candidate(
+            dict(zip(PARAMETERS, values)),
             cfg,
         )
-        for _index, row in frame.iterrows()
+        for values in frame[list(PARAMETERS)].to_numpy(dtype=float)
     ]
+    return {
+        "frame": frame,
+        "value_column": value_column,
+        "config": cfg,
+        "encoded": _simulation_encode_bo_candidates(candidate_params, cfg),
+        "keys": [_simulation_candidate_key(params) for params in candidate_params],
+    }
+
+
+def _simulation_surrogate_artifact_frame(
+    ground_truth: pd.DataFrame,
+    history: pd.DataFrame,
+    axes: tuple[str, str, str],
+    value_column: str = "ground_truth_value",
+    *,
+    config: dict | None = None,
+    prepared_candidates: dict | None = None,
+    model_out: dict | None = None,
+) -> pd.DataFrame:
+    prepared = prepared_candidates if prepared_candidates is not None else (
+        _prepare_simulation_surrogate_candidates(ground_truth, axes, value_column, config=config)
+    )
+    frame = prepared["frame"].copy()
+    value_column = prepared["value_column"]
+    cfg = prepared["config"]
+    observed = history.dropna(subset=list(axes))
     observed_params = [
         _simulation_history_row_params(row, cfg, axes)
         for _index, row in observed.iterrows()
@@ -13824,7 +13939,7 @@ def _simulation_surrogate_artifact_frame(
         means, stds = _simulation_gp_predict(
             _simulation_encode_bo_candidates(observed_params, cfg),
             observed_values,
-            _simulation_encode_bo_candidates(candidate_params, cfg),
+            prepared["encoded"],
             length_scales,
             max(
                 1e-10,
@@ -13832,11 +13947,12 @@ def _simulation_surrogate_artifact_frame(
             ),
             config=cfg,
             fixed_length_scales=fixed,
+            model_out=model_out,
         )
     elif len(observed_values) == 1:
         means = np.full(len(frame), float(observed_values[0]))
         observed_encoded = _simulation_encode_bo_candidates(observed_params, cfg)[0]
-        candidate_encoded = _simulation_encode_bo_candidates(candidate_params, cfg)
+        candidate_encoded = prepared["encoded"]
         stds = np.maximum(
             np.sqrt(
                 np.sum(
@@ -13853,8 +13969,8 @@ def _simulation_surrogate_artifact_frame(
     frame["predicted_std_Q"] = stds
     observed_keys = {_simulation_candidate_key(params) for params in observed_params}
     frame["already_tested"] = [
-        _simulation_candidate_key(params) in observed_keys
-        for params in candidate_params
+        key in observed_keys
+        for key in prepared["keys"]
     ]
     objective_means = np.asarray(
         [_simulation_objective_value(value, cfg) for value in means],
@@ -14168,6 +14284,7 @@ def _write_simulated_surrogate_artifacts(
     group_id: int,
     config: dict,
     candidate_pool: pd.DataFrame | None = None,
+    surrogate_snapshot_interval: int | None = 1,
     progress_callback: Callable[[float, str], None] | None = None,
     progress_start: float = 0.0,
     progress_end: float = 1.0,
@@ -14187,6 +14304,18 @@ def _write_simulated_surrogate_artifacts(
             errors="coerce",
         ).dropna().astype(int).unique()
     )
+    # Keep full observation history; only thin the expensive saved surfaces.
+    if iterations:
+        if surrogate_snapshot_interval is None:
+            iterations = iterations[-1:]
+        else:
+            interval = max(1, int(surrogate_snapshot_interval))
+            iterations = sorted(set(iterations[::interval] + iterations[-1:]))
+    history_iterations = pd.to_numeric(history["iteration"], errors="coerce")
+    prepared_candidates = (
+        _prepare_simulation_surrogate_candidates(artifact_source, axes, config=config)
+        if iterations else None
+    )
     total_iterations = max(1, len(iterations))
     for iteration_index, iteration in enumerate(iterations, start=1):
         progress_fraction = progress_start + (
@@ -14197,70 +14326,34 @@ def _write_simulated_surrogate_artifacts(
             progress_fraction,
             (
                 f"Writing surrogate artifacts for group {int(group_id)}: "
-                f"iteration {iteration_index}/{total_iterations}"
+                f"snapshot {iteration_index}/{total_iterations} (iteration {iteration})"
             ),
         )
         partial_history = history[
-            pd.to_numeric(history["iteration"], errors="coerce") <= iteration
+            history_iterations <= iteration
         ]
+        export_model = {}
         artifact = _simulation_surrogate_artifact_frame(
             artifact_source,
             partial_history,
             axes,
             config=config,
-        )
-        artifact.to_csv(
-            surrogate_dir / f"group_{int(group_id):02d}_iter_{int(iteration):03d}_candidate_predictions.csv",
-            index=False,
+            prepared_candidates=prepared_candidates,
+            model_out=export_model,
         )
         stem = f"group_{int(group_id):02d}_iter_{int(iteration):03d}"
-        artifact.to_csv(
-            acquisition_dir / f"{stem}_acquisition_values.csv",
-            index=False,
-        )
+        prediction_path = surrogate_dir / f"{stem}_candidate_predictions.csv"
+        artifact.to_csv(prediction_path, index=False)
+        shutil.copyfile(prediction_path, acquisition_dir / f"{stem}_acquisition_values.csv")
         if len(partial_history) >= 2:
             try:
                 import pickle
 
-                cfg = _simulation_normalized_bo_config(config)
+                cfg = prepared_candidates["config"]
                 acquisition = cfg.get("acquisition") or {}
-                falloffs = dict(
-                    acquisition.get("gp_falloff_fractions")
-                    or acquisition.get("gp_length_scales")
-                    or {}
-                )
-                fixed = all(
-                    name in falloffs and float(falloffs[name]) > 0
-                    for name in PARAMETERS
-                )
-                length_scales = np.asarray(
-                    [
-                        max(1e-9, float(falloffs.get(name, 1.0)))
-                        for name in PARAMETERS
-                    ],
-                    dtype=float,
-                )
-                observed_params = [
-                    _simulation_history_row_params(row, cfg, axes)
-                    for _index, row in partial_history.iterrows()
-                ]
-                gp = _simulation_fit_exportable_gp(
-                    _simulation_encode_bo_candidates(observed_params, cfg),
-                    pd.to_numeric(
-                        partial_history["observed_value"],
-                        errors="coerce",
-                    ).to_numpy(dtype=float),
-                    length_scales,
-                    max(
-                        1e-10,
-                        float(
-                            acquisition.get("gp_noise_level", 1e-4)
-                            or 1e-4
-                        ),
-                    ),
-                    config=cfg,
-                    fixed_length_scales=fixed,
-                )
+                gp = export_model.get("gp")
+                if gp is None:
+                    raise ValueError(export_model.get("error", "Predictions used the NumPy GP fallback."))
                 with (surrogate_dir / f"{stem}_gp_model.pkl").open(
                     "wb"
                 ) as handle:
@@ -14320,6 +14413,7 @@ def _write_simulated_bo_session(
     replicate: int | None = None,
     seed: int | None = None,
     write_surrogate_artifacts: bool = True,
+    surrogate_snapshot_interval: int | None = 1,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> Path:
     if history.empty:
@@ -14627,6 +14721,7 @@ def _write_simulated_bo_session(
                 else len(ground_truth)
             ),
             "surrogate_artifacts_written": bool(write_surrogate_artifacts),
+            "surrogate_snapshot_interval": surrogate_snapshot_interval,
         },
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -14655,6 +14750,7 @@ def _write_simulated_bo_session(
             group_id=1,
             config=config,
             candidate_pool=candidate_pool,
+            surrogate_snapshot_interval=surrogate_snapshot_interval,
             progress_callback=progress_callback,
             progress_start=0.78,
             progress_end=0.96,
@@ -14679,6 +14775,7 @@ def _write_simulated_bo_session_bundle(
     candidate_pool: pd.DataFrame | None = None,
     simulation_settings: dict | None = None,
     write_surrogate_artifacts: bool = True,
+    surrogate_snapshot_interval: int | None = 1,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> Path:
     nonempty_runs = [
@@ -14995,6 +15092,7 @@ def _write_simulated_bo_session_bundle(
                 else len(ground_truth)
             ),
             "surrogate_artifacts_written": bool(write_surrogate_artifacts),
+            "surrogate_snapshot_interval": surrogate_snapshot_interval,
         },
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -15057,6 +15155,7 @@ def _write_simulated_bo_session_bundle(
                 group_id=group_id,
                 config=run_config,
                 candidate_pool=run_candidate_pool,
+                surrogate_snapshot_interval=surrogate_snapshot_interval,
                 progress_callback=progress_callback,
                 progress_start=0.78 + 0.18 * (group_id - 1) / total_artifact_runs,
                 progress_end=0.78 + 0.18 * group_id / total_artifact_runs,
@@ -23297,16 +23396,8 @@ def _plot_surrogate(session: dict, frame: pd.DataFrame, iteration: int, value: s
         if axis_ranges and x_name in axis_ranges:
             ax.set_xlim(*map(float, axis_ranges[x_name]))
         ax.legend()
-    if (
-        view == "2D map"
-        and surrogate_2d_style == "Automation smooth heatmap"
-    ):
-        surface_title = (
-            "Predicted Q surface"
-            if value == "predicted_mean_Q"
-            else "Acquisition surface"
-        )
-        title_lines = [f"Iteration {iteration:03d} {surface_title}"]
+    if view == "2D map":
+        title_lines = [f"Iteration {iteration}"]
     else:
         title_lines = [
             f"{view} | {value} | artifact iteration {iteration}",
@@ -25166,6 +25257,198 @@ def _apply_per_plot_matplotlib_text_override(
             legend.set_bbox_to_anchor((0.86, 0.98))
 
 
+def _surrogate_map_settings_form(container, key: str, *, shared=None, width=1000, heading="Plot settings"):
+    defaults = {
+        "width": int(width), "height": 600, "title": "", "xlabel": "", "ylabel": "",
+        "title_size": 14.0, "xlabel_size": 12.0, "ylabel_size": 12.0,
+        "tick_size": 10.0, "legend_size": 10.0, "colorbar_size": 10.0,
+        "colorbar_height": 100.0, "colorbar_gap": 80.0,
+        "value_colorbar_label": "", "iteration_colorbar_label": "",
+        "marker_scale": 1.0, "line_scale": 1.0, "alpha": 1.0,
+        "show_legend": True, "show_grid": True, "cmap": "viridis",
+    }
+    defaults.update(shared or {})
+    with container.expander(heading, expanded=False):
+        with st.form(f"{key}_form"):
+            enabled = st.checkbox(
+                "Use individual settings" if shared is not None else "Use these settings",
+                value=False, key=f"{key}_enabled",
+            )
+            st.caption(
+                "Changes apply on Update settings. Blank text preserves the original labels. "
+                "Individual settings override shared settings for this map."
+            )
+            values = {}
+            for name, label, minimum, maximum, step in (
+                ("width", "Plot width (px)", 300, 3000, 20),
+                ("height", "Plot height (px)", 240, 2400, 20),
+                ("title_size", "Title text size", 1.0, 96.0, 0.5),
+                ("xlabel_size", "X-axis label text size", 1.0, 96.0, 0.5),
+                ("ylabel_size", "Y-axis label text size", 1.0, 96.0, 0.5),
+                ("tick_size", "Tick-label text size", 1.0, 96.0, 0.5),
+                ("legend_size", "Legend text size", 1.0, 96.0, 0.5),
+                ("colorbar_size", "Colorbar text size", 1.0, 96.0, 0.5),
+                ("colorbar_height", "Colorbar height (% of plot)", 10.0, 100.0, 5.0),
+                ("colorbar_gap", "Distance between colorbars (px)", 0.0, 200.0, 5.0),
+                ("marker_scale", "Marker size scale", 0.1, 5.0, 0.1),
+                ("line_scale", "Line thickness scale", 0.1, 5.0, 0.1),
+                ("alpha", "Trace opacity", 0.0, 1.0, 0.05),
+            ):
+                values[name] = st.number_input(
+                    label, min_value=minimum, max_value=maximum,
+                    value=min(maximum, max(minimum, defaults[name])), step=step, key=f"{key}_{name}",
+                )
+            for name, label in (
+                ("title", "Title"), ("xlabel", "X-axis label"), ("ylabel", "Y-axis label"),
+                ("value_colorbar_label", "Value colorbar label"),
+                ("iteration_colorbar_label", "Iteration colorbar label"),
+            ):
+                values[name] = st.text_input(label, value=defaults[name], key=f"{key}_{name}")
+            for name, label in (("show_legend", "Show legend"), ("show_grid", "Show grid")):
+                values[name] = st.checkbox(label, value=defaults[name], key=f"{key}_{name}")
+            cmaps = ["viridis", "plasma", "inferno", "magma", "cividis", "coolwarm"]
+            values["cmap"] = st.selectbox("Heatmap colors", cmaps, index=cmaps.index(defaults["cmap"]), key=f"{key}_cmap")
+            st.form_submit_button("Update settings")
+    return values if enabled else shared
+
+
+def _layout_surrogate_map_colorbars(fig, height_percent: float, gap_pixels: float) -> None:
+    """Place vertical colorbars inside the canvas with a pixel-sized gap."""
+    plot_axes = [ax for ax in fig.axes if not _is_matplotlib_colorbar_axis(ax)]
+    bars = [
+        ax for ax in fig.axes if _is_matplotlib_colorbar_axis(ax)
+        and getattr(getattr(ax, "_colorbar", None), "orientation", "vertical") == "vertical"
+    ]
+    if not plot_axes or not bars:
+        return
+    # Resolve Matplotlib's automatic colorbar widths before taking ownership.
+    fig.canvas.draw()
+    positions = {ax: ax.get_position().frozen() for ax in fig.axes}
+    left = min(positions[ax].x0 for ax in plot_axes)
+    right = max(positions[ax].x1 for ax in plot_axes)
+    bottom = min(positions[ax].y0 for ax in plot_axes)
+    top = max(positions[ax].y1 for ax in plot_axes)
+    midpoint = (left + right) / 2
+    height = (top - bottom) * height_percent / 100
+    y = (top + bottom - height) / 2
+    requested_gap = gap_pixels / (fig.get_figwidth() * 100)
+    new_left, new_right = left, right
+    for on_left in (True, False):
+        side_bars = sorted(
+            [ax for ax in bars if (positions[ax].x0 < midpoint) == on_left],
+            key=lambda ax: positions[ax].x0,
+        )
+        if not side_bars:
+            continue
+        widths = [positions[ax].width for ax in side_bars]
+        edge = min(positions[ax].x0 for ax in side_bars) if on_left else max(positions[ax].x1 for ax in side_bars)
+        available = (right - edge if on_left else edge - left) - 0.15
+        gap = min(requested_gap, max(0, (available - sum(widths)) / max(1, len(widths) - 1)))
+        total = sum(widths) + gap * (len(widths) - 1)
+        x = edge if on_left else edge - total
+        if on_left:
+            new_left = max(left, edge + total + 0.04)
+        else:
+            new_right = min(right, edge - total - 0.04)
+        for ax, width in zip(side_bars, widths):
+            ax.set_axes_locator(None)
+            ax.set_box_aspect(None)
+            ax.set_aspect("auto")
+            ax.set_position([x, y, width, height])
+            x += width + gap
+    if new_right > new_left:
+        for ax in plot_axes:
+            position = positions[ax]
+            scale = (new_right - new_left) / max(right - left, 1e-9)
+            ax.set_position([
+                new_left + (position.x0 - left) * scale, position.y0,
+                position.width * scale, position.height,
+            ])
+
+
+def _apply_surrogate_map_settings(fig, settings: Mapping[str, Any]) -> None:
+    fig.set_size_inches(settings["width"] / 100, settings["height"] / 100)
+    for axis in fig.axes:
+        if _is_matplotlib_colorbar_axis(axis):
+            label_key = (
+                "iteration_colorbar_label"
+                if _is_matplotlib_iteration_colorbar_axis(axis)
+                else "value_colorbar_label"
+            )
+            label = settings.get(label_key, "")
+            if label:
+                if getattr(axis, "_bo_colorbar_label_above", False) or axis.get_title():
+                    axis.title.set_text(label)
+                elif getattr(getattr(axis, "_colorbar", None), "orientation", "vertical") == "horizontal":
+                    axis.xaxis.label.set_text(label)
+                else:
+                    axis.yaxis.label.set_text(label)
+            axis.tick_params(labelsize=settings["colorbar_size"])
+            axis.xaxis.label.set_fontsize(settings["colorbar_size"])
+            axis.yaxis.label.set_fontsize(settings["colorbar_size"])
+            axis.title.set_fontsize(settings["colorbar_size"])
+            axis.xaxis.get_offset_text().set_fontsize(settings["colorbar_size"])
+            axis.yaxis.get_offset_text().set_fontsize(settings["colorbar_size"])
+            continue
+        for name, artist in (("title", axis.title), ("xlabel", axis.xaxis.label), ("ylabel", axis.yaxis.label)):
+            if settings[name]:
+                artist.set_text(settings[name])
+            artist.set_fontsize(settings[f"{name}_size"])
+        axis.tick_params(labelsize=settings["tick_size"])
+        axis.grid(settings["show_grid"])
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.set_visible(settings["show_legend"])
+            legend.get_title().set_fontsize(settings["legend_size"])
+            for text in legend.get_texts():
+                text.set_fontsize(settings["legend_size"])
+        for line in axis.lines:
+            line.set_linewidth(line.get_linewidth() * settings["line_scale"])
+            line.set_markersize(line.get_markersize() * settings["marker_scale"])
+            line.set_alpha(settings["alpha"])
+        for collection in axis.collections:
+            if isinstance(collection, LineCollection):
+                collection.set_linewidth(collection.get_linewidths() * settings["line_scale"])
+                collection.set_alpha(settings["alpha"])
+            elif hasattr(collection, "get_sizes"):
+                collection.set_sizes(collection.get_sizes() * settings["marker_scale"] ** 2)
+                collection.set_alpha(settings["alpha"])
+            # Preserve the iteration colors on observed points and paths.
+            elif collection.get_array() is not None:
+                collection.set_cmap(settings["cmap"])
+        for image in axis.images:
+            image.set_cmap(settings["cmap"])
+    if "colorbar_height" in settings or "colorbar_gap" in settings:
+        _layout_surrogate_map_colorbars(
+            fig, float(settings.get("colorbar_height", 100.0)),
+            float(settings.get("colorbar_gap", 80.0)),
+        )
+
+
+@st.fragment
+def _render_surrogate_map_with_settings(source, *, key, file_stem, width_percent, shared):
+    # Each map owns its updates; shared changes rerun the parent surrogate tab.
+    fig = copy.deepcopy(source)
+    _apply_global_plot_style(fig)
+    plot_area = st.container()
+    settings = _surrogate_map_settings_form(
+        st, f"{key}_map_settings", shared=shared or {},
+        width=width_percent, heading="Individual 2D map settings",
+    )
+    if settings:
+        _apply_surrogate_map_settings(fig, settings)
+    else:
+        fig.set_size_inches(width_percent / 100, fig.get_size_inches()[1])
+    width = int(settings["width"]) if settings else int(width_percent)
+    png = _matplotlib_png_bytes(fig, dpi=100, apply_global_style=False)
+    column = _sized_plot_container(plot_area, width)
+    column.image(png, width=width)
+    _render_browser_download_link(column, "Download plot", png,
+                                 file_name=f"{_safe_download_stem(file_stem)}.png", mime="image/png")
+    plt.close(fig)
+    return png
+
+
 def _render_downloadable_pyplot(
     container,
     fig,
@@ -25175,7 +25458,14 @@ def _render_downloadable_pyplot(
     width_percent: int,
     dpi: int = 100,
     enable_series_customization: bool = False,
+    enable_map_settings: bool = False,
+    shared_map_settings: Mapping[str, Any] | None = None,
 ) -> bytes:
+    if enable_map_settings:
+        return _render_surrogate_map_with_settings(
+            fig, key=key, file_stem=file_stem, width_percent=width_percent,
+            shared=shared_map_settings,
+        )
     effective_width_px = int(max(1, float(width_percent)))
     plot_column = _sized_plot_container(container, effective_width_px)
     try:
@@ -26052,11 +26342,31 @@ def _render_camera_persistent_plotly(
     return current_camera
 
 
+def _individual_plot_series(fig: go.Figure) -> list[tuple[str, Any]]:
+    """Identify series independently of their position in a selected-run overlay."""
+    series = []
+    occurrences: dict[str, int] = {}
+    for trace in fig.data:
+        if trace.type not in ("scatter", "scattergl"):
+            continue
+        identity = json.dumps([
+            trace.name, trace.legendgroup, trace.xaxis, trace.yaxis,
+            (trace.meta or {}).get("bo_trace_role")
+            if isinstance(trace.meta, Mapping) else None,
+        ])
+        occurrence = occurrences.get(identity, 0)
+        occurrences[identity] = occurrence + 1
+        token = hashlib.sha1(f"{identity}:{occurrence}".encode()).hexdigest()[:16]
+        series.append((token, trace))
+    return series
+
+
 def _apply_individual_plotly_style(
     fig: go.Figure,
     settings: Mapping[str, Any],
 ) -> go.Figure:
     """Apply settings owned by one History & Scores plot."""
+    plot_series = _individual_plot_series(fig)
     text_size = float(settings["text_size"])
     tick_size = float(settings["tick_size"])
     margin = int(settings["margin"])
@@ -26206,6 +26516,32 @@ def _apply_individual_plotly_style(
         line.width = max(0.1, base_width * line_scale)
         if valid_line_color is not None:
             line.color = valid_line_color
+    # Apply series overrides last, using identities captured before legend renaming.
+    for token, trace in plot_series:
+        color = str(settings.get(f"series_{token}_color") or "").strip()
+        parsed_color = _matplotlib_plotly_color(color) if color else None
+        if parsed_color is not None:
+            color = to_hex(parsed_color, keep_alpha=False)
+            trace.line.color = color
+            trace.marker.color = color
+            trace.marker.coloraxis = None
+            trace.marker.showscale = False
+        elif valid_line_color is not None:
+            trace.marker.color = trace.line.color
+        width = float(settings.get(f"series_{token}_width", 0.0))
+        if width > 0:
+            trace.line.width = width
+        size = float(settings.get(f"series_{token}_marker_size", 0.0))
+        if size > 0:
+            trace.marker.size = size
+        else:
+            marker_scale = float(settings.get("marker_scale", 1.0))
+            if marker_scale != 1.0:
+                original_size = trace.marker.size
+                if isinstance(original_size, (tuple, list, np.ndarray)):
+                    trace.marker.size = np.asarray(original_size) * marker_scale
+                else:
+                    trace.marker.size = (original_size or 6.0) * marker_scale
     return fig
 
 
@@ -26263,18 +26599,14 @@ def _render_individual_plotly_settings_form(
                 _INDIVIDUAL_PLOT_SETTINGS_CLIPBOARD_KEY
             ] = clipboard
             clipboard_values = clipboard["settings"]
-        if clipboard_columns[1].button(
+        clipboard_columns[1].button(
             "Apply copied settings",
             key=f"{settings_prefix}_apply_copied_settings",
             use_container_width=True,
             disabled=clipboard_values is None,
-        ):
-            _apply_copied_individual_plot_settings(
-                st.session_state,
-                settings_prefix,
-                clipboard_values,
-            )
-            st.rerun()
+            on_click=_apply_copied_individual_plot_settings,
+            args=(st.session_state, settings_prefix, clipboard_values or {}),
+        )
         if isinstance(clipboard, Mapping):
             clipboard_source = str(clipboard.get("source") or "another plot")
             st.caption(f"Copied settings source: {clipboard_source}")
@@ -26326,10 +26658,39 @@ def _render_individual_plotly_settings_form(
             key=f"{settings_prefix}_line_scale",
         )
         line_columns[1].text_input(
-            "Line color override",
+            "All-series color override",
             key=f"{settings_prefix}_line_color",
-            help="Leave blank to preserve each series color.",
+            help="One color for the whole plot. Use the per-series controls below for different colors.",
         )
+        form.slider(
+            "Marker size scale",
+            0.25, 5.0, step=0.25, format="%.2fx",
+            key=f"{settings_prefix}_marker_scale",
+        )
+        if settings.get("_series"):
+            form.markdown("**Individual series styles**")
+            form.caption(
+                "Set a separate color for each series (for example #ff6600 or blue). "
+                "Leave color blank and sizes at 0 to use the plot defaults. "
+                "These overrides take precedence over the controls above."
+            )
+            for token, label in settings["_series"]:
+                form.markdown(f"**{label}**")
+                series_columns = form.columns(3)
+                series_columns[0].text_input(
+                    "Series color",
+                    key=f"{settings_prefix}_series_{token}_color",
+                )
+                series_columns[1].number_input(
+                    "Line thickness (px; 0 = default)",
+                    min_value=0.0, max_value=30.0, step=0.5,
+                    key=f"{settings_prefix}_series_{token}_width",
+                )
+                series_columns[2].number_input(
+                    "Marker size (px; 0 = default)",
+                    min_value=0.0, max_value=60.0, step=0.5,
+                    key=f"{settings_prefix}_series_{token}_marker_size",
+                )
         if settings.get("_has_moving_average"):
             moving_average_columns = form.columns(2)
             moving_average_columns[0].slider(
@@ -26816,6 +27177,7 @@ def _render_downloadable_plotly(
             "text_size": 10.0,
             "tick_size": 10.0,
             "line_scale": 1.0,
+            "marker_scale": 1.0,
             "margin": 50,
             "perimeter_width": 0.8,
             "perimeter_color": "#222222",
@@ -26852,6 +27214,13 @@ def _render_downloadable_plotly(
             "xlabel": str(getattr(fig.layout.xaxis.title, "text", "") or ""),
             "ylabel": str(getattr(fig.layout.yaxis.title, "text", "") or ""),
         }
+        plot_series = _individual_plot_series(fig)
+        for token, trace in plot_series:
+            individual_defaults.update({
+                f"series_{token}_color": "",
+                f"series_{token}_width": 0.0,
+                f"series_{token}_marker_size": 0.0,
+            })
         for setting_name, default_value in individual_defaults.items():
             st.session_state.setdefault(
                 f"{settings_prefix}_{setting_name}",
@@ -26861,6 +27230,10 @@ def _render_downloadable_plotly(
             setting_name: st.session_state[f"{settings_prefix}_{setting_name}"]
             for setting_name in individual_defaults
         }
+        individual_settings["_series"] = [
+            (token, str(trace.name or f"Series {index}"))
+            for index, (token, trace) in enumerate(plot_series, start=1)
+        ]
         individual_settings["_has_moving_average"] = any(
             isinstance(getattr(trace, "meta", None), Mapping)
             and trace.meta.get("bo_trace_role") == "moving_average"
@@ -26869,6 +27242,26 @@ def _render_downloadable_plotly(
         individual_settings["_has_legend_entries"] = bool(
             initial_legend_traces
         )
+        # Reserve the chart above the form, but read submitted widgets before
+        # styling it. A form submission then needs only its normal rerun.
+        plot_area = container.container()
+        _render_individual_plotly_settings_form(
+            container,
+            settings_prefix,
+            individual_settings,
+            heading=individual_plot_settings_heading,
+        )
+        individual_settings.update({
+            name: st.session_state[f"{settings_prefix}_{name}"]
+            for name in individual_defaults
+        })
+        for token, label in individual_settings["_series"]:
+            color = str(individual_settings[f"series_{token}_color"] or "").strip()
+            if color and _matplotlib_plotly_color(color) is None:
+                container.warning(
+                    f"Invalid color for {label}: {color}. "
+                    "Use a color name such as blue or a hex color such as #ff6600."
+                )
         effective_export_width = int(individual_settings["width"])
         effective_export_height = int(individual_settings["height"])
         _apply_individual_plotly_style(fig, individual_settings)
@@ -26876,7 +27269,10 @@ def _render_downloadable_plotly(
         individual_settings = None
         effective_export_width = int(export_width or _plot_width_px())
         effective_export_height = int(export_height or fig.layout.height or 800)
-    plot_column = _sized_plot_container(container, effective_export_width)
+    plot_column = _sized_plot_container(
+        plot_area if individual_plot_settings else container,
+        effective_export_width,
+    )
     if individual_plot_settings:
         matplotlib_figure = _history_plotly_to_matplotlib(
             fig,
@@ -26912,14 +27308,6 @@ def _render_downloadable_plotly(
             mime="image/png",
         )
         plt.close(matplotlib_figure)
-        settings_submitted = _render_individual_plotly_settings_form(
-            plot_column,
-            settings_prefix,
-            individual_settings,
-            heading=individual_plot_settings_heading,
-        )
-        if settings_submitted:
-            st.rerun()
         return event
     _apply_plotly_colorbar_height(fig)
     fig.update_layout(width=effective_export_width, autosize=False)
@@ -26991,19 +27379,39 @@ def _render_downloadable_plotly(
             )
         except RuntimeError as exc:
             plot_column.caption(str(exc))
-    if individual_plot_settings:
-        settings_submitted = _render_individual_plotly_settings_form(
-            plot_column,
-            settings_prefix,
-            individual_settings,
-            heading=individual_plot_settings_heading,
-        )
-        if settings_submitted:
-            # Form values are committed while the form is rendered, after this
-            # plot was styled earlier in the same run. Redraw once with the
-            # newly committed per-plot state.
-            st.rerun()
     return event
+
+
+
+@st.fragment
+def _render_selected_simulation_runs_plot(
+    source_figure: go.Figure,
+    *,
+    key: str,
+    metric: str,
+    width_percent: int,
+    observations: list[dict],
+) -> None:
+    """Keep overlay settings reruns independent of the other history plots."""
+    # Fragment arguments persist across local reruns. Style a fresh copy so
+    # repeated updates do not accumulate line scaling or legend overrides.
+    figure = go.Figure(source_figure)
+    limits = _manual_y_axis_range_control("selected runs", key, [figure])
+    if limits is not None:
+        _apply_y_axis_range(figure, *limits)
+    else:
+        _fit_y_axis_to_figure(figure)
+    _render_downloadable_plotly(
+        st, figure,
+        key=key,
+        file_stem=f"history_selected_runs_{metric}",
+        width_percent=width_percent,
+        export_height=int(figure.layout.height or 520),
+        on_select="rerun", selection_mode="points",
+        individual_plot_settings=True,
+        individual_plot_settings_heading="Selected runs plot settings",
+        interactive_history=True, history_observations=observations,
+    )
 
 
 def _preserve_valid_widget_value(
@@ -29111,6 +29519,22 @@ def _render_app_scrollbar_style() -> None:
     )
 
 
+def _load_simulated_sweep_section(session: dict, section: str) -> bool:
+    """Avoid executing expensive hidden tabs when a simulated sweep opens."""
+    if not _is_loaded_simulated_sweep_session(session):
+        return True
+    token = hashlib.sha1(str(session["root"]).encode("utf-8")).hexdigest()[:12]
+    return bool(st.checkbox(
+        f"Load {section}",
+        value=False,
+        key=f"bo_sweep_load_{token}_{section}",
+        help=(
+            "Loads this section on demand to keep large simulated sweeps quick to open. "
+            "Turn it off when finished to skip its work on subsequent page updates."
+        ),
+    ))
+
+
 def render_bo_session_app() -> None:
     """Render the complete BO viewer. Called after Analysis mode is set to BO."""
     _render_app_scrollbar_style()
@@ -29979,8 +30403,13 @@ def render_bo_session_app() -> None:
                 return observation_group_family_options[scope]["label"]
             return next(
                 (
-                    f"{group['name']} (channels "
-                    f"{', '.join(map(str, group['channels']))})"
+                    f"{group['name']}"
+                    + (
+                        f" (run {group['id']})"
+                        if ((full_session.get("config") or {}).get("records") or {}).get("simulated_session")
+                        else ""
+                    )
+                    + f" (channels {', '.join(map(str, group['channels']))})"
                     for group in groups
                     if int(group["id"]) == int(scope)
                 ),
@@ -30070,207 +30499,242 @@ def render_bo_session_app() -> None:
     if history_swv_request is not None:
         _activate_swv_traces_tab()
     with rescore_tab:
-        _render_rescore_q_tab(source_session)
+        if _load_simulated_sweep_section(full_session, "Rescore Q"):
+            _render_rescore_q_tab(source_session)
     with metadata_tab:
-        st.subheader("Channel-group optimization metadata")
-        optimization_metadata = _channel_group_optimization_metadata(
-            full_session,
-            groups,
-        )
-        metadata_summary = pd.DataFrame([
-            {
-                "Group": item["name"],
-                "Channels": ", ".join(map(str, item["channels"])),
-                "Optimization direction": (
-                    str(item["optimization_direction"]).capitalize()
-                    if item.get("optimization_direction") is not None
-                    else "Not saved"
-                ),
-                "Explore weight": item["exploration"],
-                "Exploit weight": item["exploitation"],
-                "Initial-point mode": item["initial_point_mode"],
-                "Initial random points": item["n_initial_points"],
-                "Candidate pool": item["candidate_pool_size"],
-                "Local candidate pool": item["local_candidate_pool_size"],
-                "Use GP": item["use_gp"],
-                "GP optimizer restarts": item["gp_optimizer_restarts"],
-                "GP noise": item.get("gp_noise_level"),
-                "Simulation seed": item.get("simulation_seed"),
-                "Simulation replicate": item.get("simulation_replicate"),
-            }
-            for item in optimization_metadata
-        ])
-        st.dataframe(
-            metadata_summary,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Explore weight": st.column_config.NumberColumn(format="%.3f"),
-                "Exploit weight": st.column_config.NumberColumn(format="%.3f"),
-            },
-        )
-        st.markdown("#### Optimized parameters")
-        optimized_parameters = _optimized_parameters_by_group_frame(
-            full_session,
-            groups,
-        )
-        if optimized_parameters.empty:
-            st.info("No completed optimization observations were saved.")
-        else:
-            optimized_column_config = {
-                "Group": st.column_config.TextColumn(width="small"),
-                "Channels": st.column_config.TextColumn(width="small"),
-                "Optimization direction": st.column_config.TextColumn(
-                    width="medium"
-                ),
-                "Optimized iteration": st.column_config.NumberColumn(
-                    width="small",
-                    format="%d",
-                ),
-                "Optimized objective (Q_run)": st.column_config.NumberColumn(
-                    width="medium",
-                    format="%.6g",
-                ),
-            }
-            optimized_column_config.update({
-                column: st.column_config.NumberColumn(width="medium")
-                for column in optimized_parameters.columns
-                if column.startswith("Optimized ")
-                and column not in optimized_column_config
-            })
-            optimized_table_view = st.radio(
-                "Optimized parameters view",
-                ["Full table", "Interactive table"],
-                horizontal=True,
-                key="bo_optimized_parameters_view",
+        if _load_simulated_sweep_section(full_session, "Optimization metadata"):
+            st.subheader("Channel-group optimization metadata")
+            optimization_metadata = _channel_group_optimization_metadata(
+                full_session,
+                groups,
             )
-            if optimized_table_view == "Full table":
-                table_html = optimized_parameters.to_html(
-                    index=False,
-                    border=0,
-                    classes="bo-optimized-parameters",
-                    escape=True,
-                    na_rep="—",
-                    float_format=lambda value: f"{value:.6g}",
-                    formatters={
-                        "Optimized iteration": lambda value: f"{value:.0f}",
-                        "Optimized objective (Q_run)": lambda value: f"{value:.6g}",
-                    },
-                )
-                st.markdown(
-                    """<style>
-                    table.bo-optimized-parameters {
-                        width: 100%; table-layout: fixed;
-                    }
-                    table.bo-optimized-parameters th,
-                    table.bo-optimized-parameters td {
-                        white-space: normal; overflow-wrap: anywhere;
-                        text-align: left; vertical-align: top;
-                    }
-                    </style>""" + table_html,
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.dataframe(
-                    optimized_parameters,
-                    use_container_width=True,
-                    height=35 * (len(optimized_parameters) + 1) + 3,
-                    hide_index=True,
-                    column_config=optimized_column_config,
-                )
-            if (optimized_parameters["Optimization direction"] == "Not saved").any():
-                st.warning(
-                    "An optimized result is not shown for groups whose optimization "
-                    "direction was not saved in the BO session."
-                )
-            st.caption(
-                "Selected from the saved completed BO observations using each "
-                "channel group's recorded optimization direction. Minimize groups "
-                "use the lowest Q_run; maximize groups use the highest Q_run."
-            )
-        parameter_config = (full_session.get("config") or {}).get("parameters") or {}
-        falloff_parameters = [
-            name for name in PARAMETERS
-            if any(
-                name in item["gp_falloff_fractions"]
-                for item in optimization_metadata
-            )
-        ]
-        st.markdown("#### GP falloff fractions")
-        if falloff_parameters:
-            falloff_rows = []
-            for item in optimization_metadata:
-                row = {
+            metadata_summary = pd.DataFrame([
+                {
                     "Group": item["name"],
                     "Channels": ", ".join(map(str, item["channels"])),
-                }
-                row.update({
-                    (parameter_config.get(name) or {}).get("label") or name:
-                    item["gp_falloff_fractions"].get(name)
-                    for name in falloff_parameters
-                })
-                falloff_rows.append(row)
-            st.table(pd.DataFrame(falloff_rows).set_index("Group"))
-            st.caption(
-                "Each value is the saved GP falloff fraction for that parameter "
-                "and channel group."
-            )
-        else:
-            st.info("No GP falloff fractions were saved for this session.")
-
-        st.markdown("#### Starting points and parameter details")
-        first_observations_by_group = {}
-        for recorded_observation in full_session["observations"]:
-            try:
-                group_id = int(recorded_observation.get("group_id", 1))
-                iteration = int(recorded_observation.get("iteration", 0))
-            except (TypeError, ValueError):
-                continue
-            current = first_observations_by_group.get(group_id)
-            if current is None or iteration < int(current.get("iteration", 0)):
-                first_observations_by_group[group_id] = recorded_observation
-
-        start_parameter_names = [
-            name for name in PARAMETERS
-            if any(name in item["initial_parameters"] for item in optimization_metadata)
-        ]
-        first_parameter_names = [
-            name for name in PARAMETERS
-            if any(
-                name in (first_observations_by_group.get(int(item["id"])) or {}).get(
-                    "params",
-                    {},
-                )
-                for item in optimization_metadata
-            )
-        ]
-        if start_parameter_names:
-            start_rows = []
-            for item in optimization_metadata:
-                row = {
-                    "Group": item["name"],
-                    "Channels": ", ".join(map(str, item["channels"])),
+                    "Optimization direction": (
+                        str(item["optimization_direction"]).capitalize()
+                        if item.get("optimization_direction") is not None
+                        else "Not saved"
+                    ),
+                    "Explore weight": item["exploration"],
+                    "Exploit weight": item["exploitation"],
                     "Initial-point mode": item["initial_point_mode"],
+                    "Initial random points": item["n_initial_points"],
+                    "Candidate pool": item["candidate_pool_size"],
+                    "Local candidate pool": item["local_candidate_pool_size"],
+                    "Use GP": item["use_gp"],
+                    "GP optimizer restarts": item["gp_optimizer_restarts"],
+                    "GP noise": item.get("gp_noise_level"),
+                    "Simulation seed": item.get("simulation_seed"),
+                    "Simulation replicate": item.get("simulation_replicate"),
                 }
-                row.update({
-                    (parameter_config.get(name) or {}).get("label") or name:
-                    item["initial_parameters"].get(name)
-                    for name in start_parameter_names
-                })
-                start_rows.append(row)
+                for item in optimization_metadata
+            ])
             st.dataframe(
-                pd.DataFrame(start_rows),
+                metadata_summary,
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "Explore weight": st.column_config.NumberColumn(format="%.3f"),
+                    "Exploit weight": st.column_config.NumberColumn(format="%.3f"),
+                },
             )
-            st.caption(
-                "Configured starting parameters saved for each channel group."
+            st.markdown("#### Optimized parameters")
+            optimized_parameters = _optimized_parameters_by_group_frame(
+                full_session,
+                groups,
             )
-        else:
-            st.info("No configured starting parameters were saved for this session.")
+            if optimized_parameters.empty:
+                st.info("No completed optimization observations were saved.")
+            else:
+                optimized_column_config = {
+                    "Group": st.column_config.TextColumn(width="small"),
+                    "Channels": st.column_config.TextColumn(width="small"),
+                    "Optimization direction": st.column_config.TextColumn(
+                        width="medium"
+                    ),
+                    "Optimized iteration": st.column_config.NumberColumn(
+                        width="small",
+                        format="%d",
+                    ),
+                    "Optimized objective (Q_run)": st.column_config.NumberColumn(
+                        width="medium",
+                        format="%.6g",
+                    ),
+                }
+                optimized_column_config.update({
+                    column: st.column_config.NumberColumn(width="medium")
+                    for column in optimized_parameters.columns
+                    if column.startswith("Optimized ")
+                    and column not in optimized_column_config
+                })
+                optimized_table_view = st.radio(
+                    "Optimized parameters view",
+                    ["Full table", "Interactive table"],
+                    horizontal=True,
+                    key="bo_optimized_parameters_view",
+                )
+                if optimized_table_view == "Full table":
+                    table_html = optimized_parameters.to_html(
+                        index=False,
+                        border=0,
+                        classes="bo-optimized-parameters",
+                        escape=True,
+                        na_rep="—",
+                        float_format=lambda value: f"{value:.6g}",
+                        formatters={
+                            "Optimized iteration": lambda value: f"{value:.0f}",
+                            "Optimized objective (Q_run)": lambda value: f"{value:.6g}",
+                        },
+                    )
+                    st.markdown(
+                        """<style>
+                        table.bo-optimized-parameters {
+                            width: 100%; table-layout: fixed;
+                        }
+                        table.bo-optimized-parameters th,
+                        table.bo-optimized-parameters td {
+                            white-space: normal; overflow-wrap: anywhere;
+                            text-align: left; vertical-align: top;
+                        }
+                        </style>""" + table_html,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.dataframe(
+                        optimized_parameters,
+                        use_container_width=True,
+                        height=35 * (len(optimized_parameters) + 1) + 3,
+                        hide_index=True,
+                        column_config=optimized_column_config,
+                    )
+                if (optimized_parameters["Optimization direction"] == "Not saved").any():
+                    st.warning(
+                        "An optimized result is not shown for groups whose optimization "
+                        "direction was not saved in the BO session."
+                    )
+                st.caption(
+                    "Selected from the saved completed BO observations using each "
+                    "channel group's recorded optimization direction. Minimize groups "
+                    "use the lowest Q_run; maximize groups use the highest Q_run."
+                )
+            parameter_config = (full_session.get("config") or {}).get("parameters") or {}
+            falloff_parameters = [
+                name for name in PARAMETERS
+                if any(
+                    name in item["gp_falloff_fractions"]
+                    for item in optimization_metadata
+                )
+            ]
+            st.markdown("#### GP falloff fractions")
+            if falloff_parameters:
+                falloff_rows = []
+                for item in optimization_metadata:
+                    row = {
+                        "Group": item["name"],
+                        "Channels": ", ".join(map(str, item["channels"])),
+                    }
+                    row.update({
+                        (parameter_config.get(name) or {}).get("label") or name:
+                        item["gp_falloff_fractions"].get(name)
+                        for name in falloff_parameters
+                    })
+                    falloff_rows.append(row)
+                st.table(pd.DataFrame(falloff_rows).set_index("Group"))
+                st.caption(
+                    "Each value is the saved GP falloff fraction for that parameter "
+                    "and channel group."
+                )
+            else:
+                st.info("No GP falloff fractions were saved for this session.")
 
-        if first_parameter_names:
-            first_rows = []
+            st.markdown("#### Starting points and parameter details")
+            first_observations_by_group = {}
+            for recorded_observation in full_session["observations"]:
+                try:
+                    group_id = int(recorded_observation.get("group_id", 1))
+                    iteration = int(recorded_observation.get("iteration", 0))
+                except (TypeError, ValueError):
+                    continue
+                current = first_observations_by_group.get(group_id)
+                if current is None or iteration < int(current.get("iteration", 0)):
+                    first_observations_by_group[group_id] = recorded_observation
+
+            start_parameter_names = [
+                name for name in PARAMETERS
+                if any(name in item["initial_parameters"] for item in optimization_metadata)
+            ]
+            first_parameter_names = [
+                name for name in PARAMETERS
+                if any(
+                    name in (first_observations_by_group.get(int(item["id"])) or {}).get(
+                        "params",
+                        {},
+                    )
+                    for item in optimization_metadata
+                )
+            ]
+            if start_parameter_names:
+                start_rows = []
+                for item in optimization_metadata:
+                    row = {
+                        "Group": item["name"],
+                        "Channels": ", ".join(map(str, item["channels"])),
+                        "Initial-point mode": item["initial_point_mode"],
+                    }
+                    row.update({
+                        (parameter_config.get(name) or {}).get("label") or name:
+                        item["initial_parameters"].get(name)
+                        for name in start_parameter_names
+                    })
+                    start_rows.append(row)
+                st.dataframe(
+                    pd.DataFrame(start_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Configured starting parameters saved for each channel group."
+                )
+            else:
+                st.info("No configured starting parameters were saved for this session.")
+
+            if first_parameter_names:
+                first_rows = []
+                for item in optimization_metadata:
+                    first_observation = first_observations_by_group.get(int(item["id"]))
+                    first_iteration_params = (
+                        dict(first_observation.get("params") or {})
+                        if first_observation is not None
+                        else {}
+                    )
+                    first_rows.append({
+                        "Group": item["name"],
+                        "Channels": ", ".join(map(str, item["channels"])),
+                        "First completed iteration": (
+                            first_observation.get("iteration")
+                            if first_observation is not None
+                            else None
+                        ),
+                        **{
+                            (parameter_config.get(name) or {}).get("label") or name:
+                            first_iteration_params.get(name)
+                            for name in first_parameter_names
+                        },
+                    })
+                st.dataframe(
+                    pd.DataFrame(first_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "First completed iteration values show the actual parameters "
+                    "recorded at the start of each channel-group run."
+                )
+
+            st.markdown("##### Parameter bounds and GP details")
+            parameter_detail_rows = []
             for item in optimization_metadata:
                 first_observation = first_observations_by_group.get(int(item["id"]))
                 first_iteration_params = (
@@ -30278,115 +30742,82 @@ def render_bo_session_app() -> None:
                     if first_observation is not None
                     else {}
                 )
-                first_rows.append({
-                    "Group": item["name"],
-                    "Channels": ", ".join(map(str, item["channels"])),
-                    "First completed iteration": (
-                        first_observation.get("iteration")
-                        if first_observation is not None
-                        else None
-                    ),
-                    **{
-                        (parameter_config.get(name) or {}).get("label") or name:
-                        first_iteration_params.get(name)
-                        for name in first_parameter_names
-                    },
-                })
-            st.dataframe(
-                pd.DataFrame(first_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption(
-                "First completed iteration values show the actual parameters "
-                "recorded at the start of each channel-group run."
-            )
-
-        st.markdown("##### Parameter bounds and GP details")
-        parameter_detail_rows = []
-        for item in optimization_metadata:
-            first_observation = first_observations_by_group.get(int(item["id"]))
-            first_iteration_params = (
-                dict(first_observation.get("params") or {})
-                if first_observation is not None
-                else {}
-            )
-            parameter_names = [
-                name for name in PARAMETERS
-                if (
-                    name in item["initial_parameters"]
-                    or name in first_iteration_params
-                    or name in item["gp_falloff_fractions"]
-                    or name in item["gp_length_scales"]
+                parameter_names = [
+                    name for name in PARAMETERS
+                    if (
+                        name in item["initial_parameters"]
+                        or name in first_iteration_params
+                        or name in item["gp_falloff_fractions"]
+                        or name in item["gp_length_scales"]
+                    )
+                ]
+                for name in parameter_names:
+                    definition = parameter_config.get(name) or {}
+                    parameter_detail_rows.append({
+                        "Group": item["name"],
+                        "Channels": ", ".join(map(str, item["channels"])),
+                        "Parameter": definition.get("label") or name,
+                        "Mode": definition.get("mode"),
+                        "Start": item["initial_parameters"].get(name),
+                        "First iteration": first_iteration_params.get(name),
+                        "Unit": definition.get("unit"),
+                        "Minimum": definition.get("min"),
+                        "Maximum": definition.get("max"),
+                        "GP falloff fraction": item[
+                            "gp_falloff_fractions"
+                        ].get(name),
+                        "GP length scale": item["gp_length_scales"].get(name),
+                    })
+            if parameter_detail_rows:
+                st.dataframe(
+                    pd.DataFrame(parameter_detail_rows),
+                    use_container_width=True,
+                    hide_index=True,
                 )
-            ]
-            for name in parameter_names:
-                definition = parameter_config.get(name) or {}
-                parameter_detail_rows.append({
-                    "Group": item["name"],
-                    "Channels": ", ".join(map(str, item["channels"])),
-                    "Parameter": definition.get("label") or name,
-                    "Mode": definition.get("mode"),
-                    "Start": item["initial_parameters"].get(name),
-                    "First iteration": first_iteration_params.get(name),
-                    "Unit": definition.get("unit"),
-                    "Minimum": definition.get("min"),
-                    "Maximum": definition.get("max"),
-                    "GP falloff fraction": item[
-                        "gp_falloff_fractions"
-                    ].get(name),
-                    "GP length scale": item["gp_length_scales"].get(name),
-                })
-        if parameter_detail_rows:
-            st.dataframe(
-                pd.DataFrame(parameter_detail_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.caption(
-                "No parameter-level starting-point or GP metadata was saved."
-            )
+            else:
+                st.caption(
+                    "No parameter-level starting-point or GP metadata was saved."
+                )
 
-        st.divider()
-        st.markdown("#### How explore vs exploit affects candidate selection")
-        st.write(
-            "For every candidate x, the optimizer predicts mean mu(x) and "
-            "standard deviation sigma(x). With exploration weight alpha, "
-            "it maximizes:"
-        )
-        st.code(
-            "A(x) = (1 - alpha) * [mu(x) + 0.25 * EI(x)]"
-            " + alpha * sigma(x)\n"
-            "EI(x) = I(x) * Phi(z) + sigma(x) * phi(z)\n"
-            "I(x) = mu(x) - Q_best - 0.01\n"
-            "z = I(x) / sigma(x)",
-            language=None,
-        )
-        st.write(
-            "alpha is the explore weight and (1 - alpha) is the exploit "
-            "weight. alpha = 0 favors high predicted Q plus expected "
-            "improvement. alpha = 1 favors high GP uncertainty. Phi and phi "
-            "are the standard-normal CDF and PDF."
-        )
-        st.markdown("#### How GP falloff fractions affect the surrogate")
-        st.write(
-            "Each parameter is mapped to a normalized coordinate from 0 to 1. "
-            "Its falloff fraction ell_j is the fixed Matérn-5/2 length scale:"
-        )
-        st.code(
-            "r(x, x') = sqrt(sum_j(((x_j - x'_j) / ell_j)^2))\n"
-            "k(x, x') = (1 + sqrt(5)*r + 5*r^2/3) * exp(-sqrt(5)*r)",
-            language=None,
-        )
-        st.write(
-            "A smaller ell_j makes correlation fall off quickly when that "
-            "parameter changes, allowing a more rapidly varying surrogate. "
-            "A larger ell_j makes the GP smoother and extends the influence "
-            "of observations along that parameter. Because coordinates are "
-            "normalized, ell_j = 0.2 is roughly one fifth of the configured "
-            "parameter range."
-        )
+            st.divider()
+            st.markdown("#### How explore vs exploit affects candidate selection")
+            st.write(
+                "For every candidate x, the optimizer predicts mean mu(x) and "
+                "standard deviation sigma(x). With exploration weight alpha, "
+                "it maximizes:"
+            )
+            st.code(
+                "A(x) = (1 - alpha) * [mu(x) + 0.25 * EI(x)]"
+                " + alpha * sigma(x)\n"
+                "EI(x) = I(x) * Phi(z) + sigma(x) * phi(z)\n"
+                "I(x) = mu(x) - Q_best - 0.01\n"
+                "z = I(x) / sigma(x)",
+                language=None,
+            )
+            st.write(
+                "alpha is the explore weight and (1 - alpha) is the exploit "
+                "weight. alpha = 0 favors high predicted Q plus expected "
+                "improvement. alpha = 1 favors high GP uncertainty. Phi and phi "
+                "are the standard-normal CDF and PDF."
+            )
+            st.markdown("#### How GP falloff fractions affect the surrogate")
+            st.write(
+                "Each parameter is mapped to a normalized coordinate from 0 to 1. "
+                "Its falloff fraction ell_j is the fixed Matérn-5/2 length scale:"
+            )
+            st.code(
+                "r(x, x') = sqrt(sum_j(((x_j - x'_j) / ell_j)^2))\n"
+                "k(x, x') = (1 + sqrt(5)*r + 5*r^2/3) * exp(-sqrt(5)*r)",
+                language=None,
+            )
+            st.write(
+                "A smaller ell_j makes correlation fall off quickly when that "
+                "parameter changes, allowing a more rapidly varying surrogate. "
+                "A larger ell_j makes the GP smoother and extends the influence "
+                "of observations along that parameter. Because coordinates are "
+                "normalized, ell_j = 0.2 is roughly one fifth of the configured "
+                "parameter range."
+            )
 
     with overview:
         @st.fragment
@@ -30675,12 +31106,21 @@ def render_bo_session_app() -> None:
                     <= int(observation.get("iteration", 0))
                     <= iteration_end
                 ]
-            best_q_parameters_frame = _best_q_parameters_by_channel_frame(
+            simulation_extrema = bool(
+                ((full_session.get("config") or {}).get("records") or {}).get("simulated_session")
+            )
+            best_q_parameters_frame = (
+                _best_q_parameters_by_simulation_frame if simulation_extrema
+                else _best_q_parameters_by_channel_frame
+            )(
                 trend_history,
                 selected_history_channels if trend_channel_options else None,
             )
             if not best_q_parameters_frame.empty:
-                st.markdown("#### Highest and lowest Q parameters by channel")
+                st.markdown(
+                    "#### Highest and lowest Q parameters by simulation run"
+                    if simulation_extrema else "#### Highest and lowest Q parameters by channel"
+                )
                 st.dataframe(
                     best_q_parameters_frame,
                     use_container_width=True,
@@ -30788,7 +31228,12 @@ def render_bo_session_app() -> None:
             group_color_label = None
             group_average_values = None
             group_average_label = None
-            is_simulated_trend_session = False
+            is_simulated_trend_session = bool(
+                ((full_session.get("config") or {}).get("records") or {}).get("simulated_session")
+            )
+            separate_simulation_figures = (
+                is_simulated_trend_session and channel_layout == "Separate plots"
+            )
             has_multiple_trend_groups = (
                 "group_id" in trend_history.columns
                 and trend_history["group_id"].nunique(dropna=True) > 1
@@ -30865,19 +31310,23 @@ def render_bo_session_app() -> None:
                     group_layout_options,
                     group_layout_options[0],
                 )
-                group_layout = st.selectbox(
-                    "Simulation run display" if is_simulated_trend_session else "Group display",
-                    group_layout_options,
-                    format_func=group_layout_display_label,
-                    key=group_layout_key,
-                    help=(
-                        "Controls how repeated simulation runs are arranged. "
-                        "For per-channel sweeps, each exploration-rate/channel "
-                        "combination is one simulation run."
-                        if is_simulated_trend_session
-                        else None
-                    ),
-                )
+                if separate_simulation_figures:
+                    group_layout = "Plot groups separately"
+                    st.caption("Separate plots shows one figure per simulation run, including repeated runs on the same channel.")
+                else:
+                    group_layout = st.selectbox(
+                        "Simulation run display" if is_simulated_trend_session else "Group display",
+                        group_layout_options,
+                        format_func=group_layout_display_label,
+                        key=group_layout_key,
+                        help=(
+                            "Controls how repeated simulation runs are arranged. "
+                            "For per-channel sweeps, each exploration-rate/channel "
+                            "combination is one simulation run."
+                            if is_simulated_trend_session
+                            else None
+                        ),
+                    )
                 if group_layout in metadata_group_options:
                     group_average_values, group_average_label = metadata_group_options[
                         group_layout
@@ -31203,9 +31652,11 @@ def render_bo_session_app() -> None:
                         channel_count=len(trend_channels),
                         simulation_count=trend_simulation_count,
                     ):
-                        separate_channel_figures = channel_layout == "Separate plots"
+                        separate_channel_figures = (
+                            channel_layout == "Separate plots" and not separate_simulation_figures
+                        )
                         separate_group_figures = (
-                            group_layout == "Plot groups separately"
+                            (group_layout == "Plot groups separately" or separate_simulation_figures)
                             and "group_id" in trend_history.columns
                         )
                         channel_targets = (
@@ -31240,7 +31691,7 @@ def render_bo_session_app() -> None:
                                     target_channels,
                                     (
                                         "Overlay selected channels"
-                                        if separate_channel_figures
+                                        if separate_channel_figures or separate_simulation_figures
                                         else channel_layout
                                     ),
                                     (
@@ -31268,6 +31719,8 @@ def render_bo_session_app() -> None:
                                         applied_moving_average_window
                                     ),
                                 )
+                                if separate_simulation_figures and not figure.data:
+                                    continue
                                 title_parts = []
                                 if group_name:
                                     title_parts.append(group_name)
@@ -31281,6 +31734,11 @@ def render_bo_session_app() -> None:
                                             f"{figure_label}"
                                         )
                                     )
+                                if group_id is not None and is_simulated_trend_session:
+                                    figure.update_layout(meta={
+                                        **(figure.layout.meta or {}),
+                                        "simulation_run_id": int(group_id),
+                                    })
                                 trend_figures.append((figure_label, figure))
                     else:
                         skip_large_trend_render = True
@@ -31355,6 +31813,11 @@ def render_bo_session_app() -> None:
                             figure.update_layout(
                                 title=f"{_metric_label(metric)} — {group_name}"
                             )
+                            if is_simulated_trend_session:
+                                figure.update_layout(meta={
+                                    **(figure.layout.meta or {}),
+                                    "simulation_run_id": int(group_id),
+                                })
                             trend_figures.append((group_name, figure))
                     else:
                         trend_figure = _plot_trend(
@@ -31385,6 +31848,10 @@ def render_bo_session_app() -> None:
                     (label, _strip_categorical_plot_colorbars(figure))
                     for label, figure in trend_figures
                 ]
+            selected_overlay_run_ids = []
+            run_selection_token = hashlib.sha1(str(full_session["root"]).encode()).hexdigest()[:12]
+            run_selection_key = f"bo_history_chosen_runs_{run_selection_token}"
+            saved_run_selection = dict(st.session_state.get(run_selection_key, {}))
             if trend_figures:
                 st.caption("Click an iteration point to open its SWV traces in the SWV traces tab. "
                            "Channel or group averages do not identify a single trace.")
@@ -31403,7 +31870,7 @@ def render_bo_session_app() -> None:
                         ),
                         (
                             f"bo_trend_{trend_scope_key}_{metric}_"
-                            f"{figure_token}"
+                            f"{figure_index}_{figure_token}"
                         ),
                         [figure],
                     )
@@ -31420,7 +31887,7 @@ def render_bo_session_app() -> None:
                         ),
                         file_stem=(
                             f"history_scores_trend_{chart_key_suffix}_"
-                            f"{figure_token}"
+                            f"{figure_index}_{figure_token}"
                         ),
                         width_percent=plot_width_percent,
                         export_height=int(figure.layout.height or 520),
@@ -31431,6 +31898,71 @@ def render_bo_session_app() -> None:
                         interactive_history=True,
                         history_observations=observations,
                     )
+                    run_id = (figure.layout.meta or {}).get("simulation_run_id")
+                    if run_id is not None:
+                        run_id = int(run_id)
+                        use_run = st.checkbox(
+                            "Use this run",
+                            value=bool(saved_run_selection.get(str(run_id), False)),
+                            key=f"bo_history_use_run_{run_selection_token}_{run_id}",
+                            help=f"Include simulation run {run_id} in the selected-runs overlay below.",
+                        )
+                        saved_run_selection[str(run_id)] = use_run
+                        if use_run:
+                            selected_overlay_run_ids.append(run_id)
+                st.session_state[run_selection_key] = saved_run_selection
+                if any((fig.layout.meta or {}).get("simulation_run_id") is not None for _, fig in trend_figures):
+                    st.markdown("#### Selected simulation runs")
+                    st.caption(f"{len(selected_overlay_run_ids)} displayed run(s) selected.")
+                    show_selected_overlay = st.checkbox(
+                        "Overlay selected runs",
+                        key=f"bo_history_overlay_selected_{run_selection_token}",
+                        disabled=not selected_overlay_run_ids,
+                    )
+                    if show_selected_overlay and selected_overlay_run_ids:
+                        overlay_history = trend_history.loc[
+                            pd.to_numeric(trend_history["group_id"], errors="coerce").isin(selected_overlay_run_ids)
+                        ].copy()
+                        # Repeated simulation names remain distinguishable in the legend.
+                        overlay_history["group_name"] = [
+                            f"{row.get('group_name', 'Simulation')} (run {int(row['group_id'])})"
+                            for _, row in overlay_history.iterrows()
+                        ]
+                        overlay_references = {
+                            run_id: value for run_id, value in trend_reference_values_by_group.items()
+                            if run_id in selected_overlay_run_ids
+                        }
+                        if plot_metric_kind == "channel":
+                            selected_overlay = _plot_channel_trend(
+                                overlay_history, plot_metric, channel_metrics[plot_metric], trend_channels,
+                                "Overlay selected channels", "Plot groups overlaid",
+                                group_color_values, group_color_label,
+                                reference_values_by_group=overlay_references,
+                                reference_label=trend_reference_label,
+                                trace_opacity=trend_trace_opacity,
+                                moving_average_window=applied_moving_average_window,
+                            )
+                        else:
+                            selected_overlay = _plot_trend(
+                                overlay_history, metric, "Plot groups overlaid",
+                                group_color_values, group_color_label,
+                                reference_value=trend_reference_value,
+                                reference_values_by_group=overlay_references,
+                                reference_label=trend_reference_label,
+                                trace_opacity=trend_trace_opacity,
+                                moving_average_window=applied_moving_average_window,
+                            )
+                        selected_overlay.update_layout(title=f"{_metric_label(plot_metric)} — Selected simulation runs")
+                        if group_color_values is None:
+                            selected_overlay = _strip_categorical_plot_colorbars(selected_overlay)
+                        overlay_key = f"bo_history_selected_overlay_{run_selection_token}_{plot_metric_kind}_{plot_metric}"
+                        _render_selected_simulation_runs_plot(
+                            selected_overlay,
+                            key=overlay_key,
+                            metric=plot_metric,
+                            width_percent=plot_width_percent,
+                            observations=observations,
+                        )
                 trend_q_kind = _metric_q_kind(metric, paired_objective)
                 if trend_q_kind:
                     _render_q_equation(session["config"], trend_q_kind)
@@ -33939,6 +34471,8 @@ def render_bo_session_app() -> None:
     with traces:
         @st.fragment
         def _render_swv_traces_tab() -> None:
+            if st.session_state.get("bo_history_swv_render_request") is None and not _load_simulated_sweep_section(full_session, "SWV traces"):
+                return
             history_swv_request = st.session_state.pop("bo_history_swv_render_request", None)
             history_focus = st.session_state.get("bo_history_swv_focus")
             swv_group_scope = selected_observation_group_scope
@@ -35341,6 +35875,8 @@ def render_bo_session_app() -> None:
     with real_data:
         @st.fragment
         def _render_real_data_landscapes_tab() -> None:
+            if not _load_simulated_sweep_section(full_session, "Real data landscapes"):
+                return
             st.caption(
                 "These plots use completed experimental observations only; no surrogate predictions are shown."
             )
@@ -40991,12 +41527,19 @@ def render_bo_session_app() -> None:
     with surrogate:
         @st.fragment
         def _render_surrogate_tab() -> None:
+            if not _load_simulated_sweep_section(full_session, "Surrogate plots"):
+                return
+            _ungrouped_surrogate_files, surrogate_file_index = _pdf_surrogate_file_index(
+                full_session["root"]
+            )
             grouped_surrogate_files = {
-                group["id"]: _surrogate_files(full_session["root"], group["id"])
+                group["id"]: surrogate_file_index.get(int(group["id"]), {})
                 for group in groups
             }
             available_surrogate_groups = [
-                group for group in groups if grouped_surrogate_files[group["id"]]
+                group for group in groups
+                if int(group["id"]) in selected_observation_group_ids
+                and grouped_surrogate_files[group["id"]]
             ]
             legacy_surrogate_state_prefix = (
                 f"bo_surrogate_"
@@ -41011,6 +41554,15 @@ def render_bo_session_app() -> None:
                 default_surrogate_groups = surrogate_group_options
                 surrogate_groups_key = f"{surrogate_state_prefix}_groups"
                 surrogate_groups_preference_key = f"{surrogate_state_prefix}_pref_groups"
+                observation_scope_signature = (
+                    str(full_session["root"]),
+                    tuple(sorted(selected_observation_group_ids)),
+                )
+                if st.session_state.get("bo_surrogate_observation_scope") != observation_scope_signature:
+                    st.session_state[surrogate_groups_key] = default_surrogate_groups
+                    st.session_state[surrogate_groups_preference_key] = default_surrogate_groups
+                    st.session_state.pop(f"{surrogate_groups_key}__fallback_display", None)
+                    st.session_state["bo_surrogate_observation_scope"] = observation_scope_signature
                 _initialize_preference(
                     surrogate_groups_preference_key,
                     surrogate_groups_key,
@@ -41029,15 +41581,8 @@ def render_bo_session_app() -> None:
                     "Surrogate channel groups",
                     surrogate_group_options,
                     default=surrogate_groups_display,
-                    format_func=lambda group_id: next(
-                        (
-                            f"{group['name']} (channels "
-                            f"{', '.join(map(str, group['channels']))})"
-                            for group in available_surrogate_groups
-                            if group["id"] == group_id
-                        ),
-                        f"Group {group_id}",
-                    ),
+                    format_func=observation_group_scope_label,
+                    help="Choose among the groups in the Observation group selection above.",
                     key=surrogate_groups_key,
                 )
                 _sync_preferred_widget_value(
@@ -41056,7 +41601,12 @@ def render_bo_session_app() -> None:
                     if group["id"] in selected_surrogate_groups
                 ]
             else:
-                ungrouped_files = _surrogate_files(full_session["root"])
+                # Grouped artifacts outside the observation scope must not
+                # reappear through the legacy ungrouped-session fallback.
+                ungrouped_files = (
+                    {} if surrogate_file_index
+                    else _surrogate_files(full_session["root"])
+                )
                 selected_surrogates = (
                     [(None, session, ungrouped_files)] if ungrouped_files else []
                 )
@@ -41067,7 +41617,7 @@ def render_bo_session_app() -> None:
                         "Select at least one channel group with saved surrogate artifacts."
                     )
                 else:
-                    st.info("No candidate-prediction artifacts were saved for this session.")
+                    st.info("No candidate-prediction artifacts were saved for the selected observation group(s).")
                 if not surrogate_dir.is_dir():
                     st.caption(
                         f"No surrogate artifact directory was found at {surrogate_dir}."
@@ -41719,7 +42269,7 @@ def render_bo_session_app() -> None:
                     if view == "2D map":
                         surrogate_lock_2d_color_range = st.checkbox(
                             "Lock color range across slices for each channel",
-                            value=True,
+                            value=False,
                             key=(
                                 f"{surrogate_state_prefix}_"
                                 "lock_2d_color_range"
@@ -42174,6 +42724,10 @@ def render_bo_session_app() -> None:
                             )
                             if shared_range is not None:
                                 surrogate_2d_color_ranges[color_group_key] = shared_range
+                    shared_surrogate_map_settings = _surrogate_map_settings_form(
+                        st, "bo_surrogate_all_2d_maps", width=plot_width_percent,
+                        heading="2D map settings — all iterations",
+                    ) if view in ("2D map", "3D tensor") else None
                     rendered_group_iteration_headings: set[tuple[Any, int]] = set()
                     for (
                         current_artifact_iteration,
@@ -42879,6 +43433,8 @@ def render_bo_session_app() -> None:
                                                 f"{slice_value_label:g}"
                                             ),
                                             width_percent=plot_width_percent,
+                                            enable_map_settings=True,
+                                            shared_map_settings=shared_surrogate_map_settings,
                                         )
                                         with st.expander(
                                             "Highlighted slice candidates"
@@ -42912,6 +43468,8 @@ def render_bo_session_app() -> None:
                                     f"{value}_{view}_{x_name}_{y_name or 'none'}"
                                 ),
                                 width_percent=plot_width_percent,
+                                enable_map_settings=view == "2D map",
+                                shared_map_settings=shared_surrogate_map_settings,
                             )
                             st.session_state[surrogate_static_preview_key] = (
                                 rendered_surrogate_png
@@ -43011,6 +43569,8 @@ def render_bo_session_app() -> None:
                                                 f"{value}_{x_name}_{y_name}_{sweep_token}"
                                             ),
                                             width_percent=plot_width_percent,
+                                            enable_map_settings=True,
+                                            shared_map_settings=shared_surrogate_map_settings,
                                         )
                             if view == "2D map":
                                 with st.expander(
@@ -43121,6 +43681,8 @@ def render_bo_session_app() -> None:
                                                 f"{value}_chronological_2d_stack_{x_name}_{y_name}"
                                             ),
                                             width_percent=plot_width_percent,
+                                            enable_map_settings=True,
+                                            shared_map_settings=shared_surrogate_map_settings,
                                         )
                                         for error in stack_errors[:5]:
                                             st.warning(error)
@@ -43174,6 +43736,8 @@ def render_bo_session_app() -> None:
     with simulation:
         @st.fragment
         def _render_simulation_tab() -> None:
+            if not _load_simulated_sweep_section(full_session, "Simulation tools"):
+                return
             st.caption(
                 "Backtest BO hyperparameters against a discrete 3D ground-truth "
                 "fitness tensor. The simulated optimizer uses the same normalized "
@@ -47222,8 +47786,11 @@ def render_bo_session_app() -> None:
                         combined_history = (
                             pd.concat(
                                 [
-                                    run["history"]
-                                    for run in nonempty_runs
+                                    run["history"].assign(
+                                        run_index=index,
+                                        run_label=str(run.get("label") or f"Simulation {index}"),
+                                    )
+                                    for index, run in enumerate(nonempty_runs, start=1)
                                     if run.get("history") is not None
                                     and not run["history"].empty
                                 ],
@@ -47232,13 +47799,13 @@ def render_bo_session_app() -> None:
                             if nonempty_runs else sim_history
                         )
                         best_parameters_frame = (
-                            _best_q_parameters_by_channel_frame(
+                            _best_q_parameters_by_simulation_frame(
                                 combined_history
                             )
                         )
                         if not best_parameters_frame.empty:
                             st.markdown(
-                                "#### Highest and lowest Q parameters by channel"
+                                "#### Highest and lowest Q parameters by simulation run"
                             )
                             st.dataframe(
                                 best_parameters_frame,
@@ -47286,8 +47853,8 @@ def render_bo_session_app() -> None:
                                 "Compact saves contain metadata, the run summary, and "
                                 "history CSV. Full saves also include complete observations, "
                                 "simulated SWV and analysis records, source points, the "
-                                "ground-truth tensor, candidate data, and per-iteration "
-                                "surrogate prediction artifacts. Full saves can be large "
+                                "ground-truth tensor, candidate data, and selected "
+                                "surrogate prediction snapshots. Full saves can be large "
                                 "and take substantially longer to write."
                             )
                         elif per_channel_simulation_export:
@@ -47322,7 +47889,7 @@ def render_bo_session_app() -> None:
                             write_surrogate_artifacts = True
                             st.caption(
                                 "Surrogate candidate artifacts will be written for every "
-                                "saved run and iteration."
+                                "saved run at the snapshot intervals selected below."
                             )
                         elif write_scope != "Compact sweep summary":
                             write_surrogate_artifacts = st.checkbox(
@@ -47330,10 +47897,35 @@ def render_bo_session_app() -> None:
                                 value=False,
                                 key=f"{run_key}_write_surrogate_artifacts",
                                 help=(
-                                    "Writes per-iteration candidate prediction CSVs. "
+                                    "Writes candidate prediction CSVs for the selected snapshots. "
                                     "This can be very slow for large sweeps and is "
                                     "not required to reopen the saved simulation."
                                 ),
+                            )
+                        surrogate_snapshot_interval = 1
+                        if write_surrogate_artifacts:
+                            snapshot_scope = st.radio(
+                                "Surrogate snapshots",
+                                ["Final iteration only (fastest)", "Every nth iteration", "All iterations (slowest)"],
+                                key=f"{run_key}_surrogate_snapshot_scope",
+                                help=(
+                                    "Each snapshot includes both surrogate predictions and acquisition values. "
+                                    "All observations are saved regardless of this choice."
+                                ),
+                            )
+                            if snapshot_scope == "Final iteration only (fastest)":
+                                surrogate_snapshot_interval = None
+                            elif snapshot_scope == "Every nth iteration":
+                                surrogate_snapshot_interval = int(st.number_input(
+                                    "Save a surrogate snapshot every n iterations",
+                                    min_value=1, value=10, step=1,
+                                    key=f"{run_key}_surrogate_snapshot_interval",
+                                    help="Includes the first and final iterations as well.",
+                                ))
+                            st.caption(
+                                "Only saved snapshots will be available in the Surrogate iteration selector "
+                                "and surrogate GIFs. Final-only saves retain the final surrogate and "
+                                "acquisition surfaces; large candidate pools can still take time."
                             )
                         write_parent = _simulated_bo_sessions_parent(
                             full_session["root"],
@@ -47390,6 +47982,7 @@ def render_bo_session_app() -> None:
                                         candidate_pool=sim_result.get("candidates"),
                                         simulation_settings=sim_result.get("settings"),
                                         write_surrogate_artifacts=True,
+                                        surrogate_snapshot_interval=surrogate_snapshot_interval,
                                         progress_callback=simulation_write_progress,
                                     )]
                                 elif write_scope == "All full channel runs in one folder":
@@ -47404,6 +47997,7 @@ def render_bo_session_app() -> None:
                                         candidate_pool=sim_result.get("candidates"),
                                         simulation_settings=sim_result.get("settings"),
                                         write_surrogate_artifacts=write_surrogate_artifacts,
+                                        surrogate_snapshot_interval=surrogate_snapshot_interval,
                                         progress_callback=simulation_write_progress,
                                     )]
                                 elif write_scope == "All sweep runs":
@@ -47418,6 +48012,7 @@ def render_bo_session_app() -> None:
                                         candidate_pool=sim_result.get("candidates"),
                                         simulation_settings=sim_result.get("settings"),
                                         write_surrogate_artifacts=write_surrogate_artifacts,
+                                        surrogate_snapshot_interval=surrogate_snapshot_interval,
                                         progress_callback=simulation_write_progress,
                                     )]
                                 else:
@@ -47478,6 +48073,7 @@ def render_bo_session_app() -> None:
                                         replicate=run.get("replicate"),
                                         seed=run.get("seed"),
                                         write_surrogate_artifacts=write_surrogate_artifacts,
+                                        surrogate_snapshot_interval=surrogate_snapshot_interval,
                                         progress_callback=simulation_write_progress,
                                     )]
                                 if written_paths:
@@ -47614,160 +48210,334 @@ def render_bo_session_app() -> None:
                                 )
 
         with gifs:
-            st.subheader("Synchronized GIF set")
-            if not groups:
-                st.info("No observation groups are available for GIF generation.")
-            else:
-                gif_group_options = [group["id"] for group in groups]
-                selected_gif_group_candidates = [
-                    group_id for group_id in gif_group_options
-                    if int(group_id) in selected_observation_group_ids
-                ]
-                default_gif_group = (
-                    selected_gif_group_candidates[0]
-                    if selected_gif_group_candidates
-                    else gif_group_options[0]
-                )
-                _preserve_valid_widget_value(
-                    "bo_gif_observation_group",
-                    gif_group_options,
-                    default_gif_group,
-                )
-                selected_gif_group = st.selectbox(
-                    "Observation group",
-                    gif_group_options,
-                    format_func=lambda group_id: next(
-                        (
-                            f"{group['name']} (channels {', '.join(map(str, group['channels']))})"
-                            for group in groups
-                            if group["id"] == group_id
-                        ),
-                        f"Group {group_id}",
-                    ),
-                    key="bo_gif_observation_group",
-                )
-                gif_group = next(
-                    group for group in groups if group["id"] == selected_gif_group
-                )
-                gif_group_session = _session_for_channel_group(
-                    full_session,
-                    selected_gif_group,
-                )
-                gif_group_files = _surrogate_files(
-                    full_session["root"],
-                    selected_gif_group,
-                )
-                if not gif_group_files:
-                    gif_group_files = _surrogate_files(full_session["root"])
-                gif_observations = sorted(
-                    gif_group_session["observations"],
-                    key=lambda item: int(item.get("iteration", 0)),
-                )
-                gif_observations_by_iteration = {
-                    int(observation.get("iteration", 0)): observation
-                    for observation in gif_observations
-                }
-                gif_iterations = [
-                    iteration for iteration in sorted(gif_group_files)
-                    if iteration in gif_observations_by_iteration
-                ]
-                gif_duration = st.slider(
-                    "GIF frame duration (ms)",
-                    min_value=100,
-                    max_value=1500,
-                    value=350,
-                    step=50,
-                    key=f"bo_gifs_duration_{selected_gif_group}",
-                )
-                if not gif_group_files:
-                    st.info("No surrogate artifacts were found for this group.")
-                elif not gif_iterations:
-                    st.info(
-                        "No shared iterations have both a surrogate artifact and an observation."
-                    )
+            if _load_simulated_sweep_section(full_session, "GIF tools"):
+                st.subheader("Synchronized GIF set")
+                if not groups:
+                    st.info("No observation groups are available for GIF generation.")
                 else:
-                    first_predictions = pd.read_csv(gif_group_files[gif_iterations[-1]])
-                    gif_local_pool_available = int(
-                        _surrogate_local_pool_mask(first_predictions).sum()
-                    ) > 0
-                    gif_show_local_pool = (
-                        st.checkbox(
-                            "Show local-pool candidates",
-                            value=False,
-                            key=f"bo_gifs_show_local_pool_{selected_gif_group}",
-                            help=(
-                                "Includes local-pool candidate rows in generated "
-                                "surrogate GIFs when the artifact identifies them. "
-                                "They use the same marker style as other candidates."
+                    gif_group_options = [group["id"] for group in groups]
+                    selected_gif_group_candidates = [
+                        group_id for group_id in gif_group_options
+                        if int(group_id) in selected_observation_group_ids
+                    ]
+                    default_gif_group = (
+                        selected_gif_group_candidates[0]
+                        if selected_gif_group_candidates
+                        else gif_group_options[0]
+                    )
+                    _preserve_valid_widget_value(
+                        "bo_gif_observation_group",
+                        gif_group_options,
+                        default_gif_group,
+                    )
+                    selected_gif_group = st.selectbox(
+                        "Observation group",
+                        gif_group_options,
+                        format_func=lambda group_id: next(
+                            (
+                                f"{group['name']} (channels {', '.join(map(str, group['channels']))})"
+                                for group in groups
+                                if group["id"] == group_id
                             ),
-                        )
-                        if gif_local_pool_available
-                        else False
+                            f"Group {group_id}",
+                        ),
+                        key="bo_gif_observation_group",
                     )
-                    preferred_dimensions = [
-                        name for name in ("step_potential", "amplitude", "frequency")
-                        if (
-                            name in first_predictions.columns
-                            and first_predictions[name].nunique(dropna=True) > 1
-                        )
-                    ]
-                    fallback_dimensions = [
-                        name for name in PARAMETERS
-                        if (
-                            name in first_predictions.columns
-                            and first_predictions[name].nunique(dropna=True) > 1
-                            and name not in preferred_dimensions
-                        )
-                    ]
-                    gif_dimensions = (preferred_dimensions + fallback_dimensions)[:3]
-                    gif_pairs = list(itertools.combinations(gif_dimensions, 2))
-                    trace_entries_for_group = [
-                        trace
-                        for iteration in gif_iterations
-                        for trace in _trace_paths(
-                            full_session,
-                            gif_observations_by_iteration[iteration],
-                        )
-                    ]
-                    group_channel_set = {str(channel) for channel in gif_group["channels"]}
-                    gif_channels = sorted(
-                        {
-                            trace["channel"]
-                            for trace in trace_entries_for_group
-                            if str(trace["channel"]) in group_channel_set
-                        },
-                        key=_channel_sort_key,
+                    gif_group = next(
+                        group for group in groups if group["id"] == selected_gif_group
                     )
-                    st.caption(
-                        f"Frames: {len(gif_iterations)} shared iterations. "
-                        f"Parameters: {', '.join(gif_dimensions) or 'not enough varied parameters'}."
+                    gif_group_session = _session_for_channel_group(
+                        full_session,
+                        selected_gif_group,
                     )
-                    if len(gif_dimensions) < 3:
-                        st.warning(
-                            "Surrogate tensor and 2D map GIFs require at least three varied parameters."
+                    gif_group_files = _surrogate_files(
+                        full_session["root"],
+                        selected_gif_group,
+                    )
+                    if not gif_group_files:
+                        gif_group_files = _surrogate_files(full_session["root"])
+                    gif_observations = sorted(
+                        gif_group_session["observations"],
+                        key=lambda item: int(item.get("iteration", 0)),
+                    )
+                    gif_observations_by_iteration = {
+                        int(observation.get("iteration", 0)): observation
+                        for observation in gif_observations
+                    }
+                    gif_iterations = [
+                        iteration for iteration in sorted(gif_group_files)
+                        if iteration in gif_observations_by_iteration
+                    ]
+                    gif_duration = st.slider(
+                        "GIF frame duration (ms)",
+                        min_value=100,
+                        max_value=1500,
+                        value=350,
+                        step=50,
+                        key=f"bo_gifs_duration_{selected_gif_group}",
+                    )
+                    if not gif_group_files:
+                        st.info("No surrogate artifacts were found for this group.")
+                    elif not gif_iterations:
+                        st.info(
+                            "No shared iterations have both a surrogate artifact and an observation."
                         )
-                    if not gif_channels:
-                        st.warning("No locally accessible SWV traces were found for this group.")
+                    else:
+                        first_predictions = pd.read_csv(gif_group_files[gif_iterations[-1]])
+                        gif_local_pool_available = int(
+                            _surrogate_local_pool_mask(first_predictions).sum()
+                        ) > 0
+                        gif_show_local_pool = (
+                            st.checkbox(
+                                "Show local-pool candidates",
+                                value=False,
+                                key=f"bo_gifs_show_local_pool_{selected_gif_group}",
+                                help=(
+                                    "Includes local-pool candidate rows in generated "
+                                    "surrogate GIFs when the artifact identifies them. "
+                                    "They use the same marker style as other candidates."
+                                ),
+                            )
+                            if gif_local_pool_available
+                            else False
+                        )
+                        preferred_dimensions = [
+                            name for name in ("step_potential", "amplitude", "frequency")
+                            if (
+                                name in first_predictions.columns
+                                and first_predictions[name].nunique(dropna=True) > 1
+                            )
+                        ]
+                        fallback_dimensions = [
+                            name for name in PARAMETERS
+                            if (
+                                name in first_predictions.columns
+                                and first_predictions[name].nunique(dropna=True) > 1
+                                and name not in preferred_dimensions
+                            )
+                        ]
+                        gif_dimensions = (preferred_dimensions + fallback_dimensions)[:3]
+                        gif_pairs = list(itertools.combinations(gif_dimensions, 2))
+                        trace_entries_for_group = [
+                            trace
+                            for iteration in gif_iterations
+                            for trace in _trace_paths(
+                                full_session,
+                                gif_observations_by_iteration[iteration],
+                            )
+                        ]
+                        group_channel_set = {str(channel) for channel in gif_group["channels"]}
+                        gif_channels = sorted(
+                            {
+                                trace["channel"]
+                                for trace in trace_entries_for_group
+                                if str(trace["channel"]) in group_channel_set
+                            },
+                            key=_channel_sort_key,
+                        )
+                        st.caption(
+                            f"Frames: {len(gif_iterations)} shared iterations. "
+                            f"Parameters: {', '.join(gif_dimensions) or 'not enough varied parameters'}."
+                        )
+                        if len(gif_dimensions) < 3:
+                            st.warning(
+                                "Surrogate tensor and 2D map GIFs require at least three varied parameters."
+                            )
+                        if not gif_channels:
+                            st.warning("No locally accessible SWV traces were found for this group.")
 
-                    batch_key = (
-                        f"bo_synced_gifs_{selected_gif_group}_"
-                        f"{len(gif_iterations)}_{gif_duration}"
-                    )
-                    batch_gif_actions = st.columns([1.15, 1.0])
-                    batch_gif_lock_colormap = batch_gif_actions[1].checkbox(
-                        "Lock color range across frames",
-                        value=True,
-                        key=f"{batch_key}_lock_colormap",
-                    )
-                    if batch_gif_actions[0].button(
-                        "Generate all GIFs",
-                        type="primary",
-                        key=f"{batch_key}_button",
-                        disabled=(len(gif_dimensions) < 3 or not gif_channels),
-                    ):
-                        try:
-                            generated_gifs: dict[str, bytes] = {}
-                            gif_targets = [
+                        batch_key = (
+                            f"bo_synced_gifs_{selected_gif_group}_"
+                            f"{len(gif_iterations)}_{gif_duration}"
+                        )
+                        batch_gif_actions = st.columns([1.15, 1.0])
+                        batch_gif_lock_colormap = batch_gif_actions[1].checkbox(
+                            "Lock color range across frames",
+                            value=True,
+                            key=f"{batch_key}_lock_colormap",
+                        )
+                        if batch_gif_actions[0].button(
+                            "Generate all GIFs",
+                            type="primary",
+                            key=f"{batch_key}_button",
+                            disabled=(len(gif_dimensions) < 3 or not gif_channels),
+                        ):
+                            try:
+                                generated_gifs: dict[str, bytes] = {}
+                                gif_targets = [
+                                    "Raw SWVs",
+                                    "Raw normalized SWVs",
+                                    "Surrogate tensor Q",
+                                    "Surrogate tensor acquisition",
+                                    *[
+                                        name
+                                        for x_name, y_name in gif_pairs
+                                        for name in (
+                                            f"2D Q {x_name} vs {y_name}",
+                                            f"2D acquisition {x_name} vs {y_name}",
+                                        )
+                                    ],
+                                ]
+                                total_target_frames = max(1, len(gif_targets) * len(gif_iterations))
+                                completed_target_frames = 0
+                                batch_progress = st.progress(
+                                    0.0,
+                                    text="Preparing synchronized GIFs...",
+                                )
+
+                                def update_batch_progress(name: str, current: int, total: int) -> None:
+                                    nonlocal completed_target_frames
+                                    batch_progress.progress(
+                                        _progress_fraction(
+                                            completed_target_frames + current,
+                                            total_target_frames,
+                                            start=0.02,
+                                            end=0.98,
+                                        ),
+                                        text=f"Rendering {name}: frame {current}/{total}",
+                                    )
+
+                                raw_y_limits = _swv_global_y_limits(
+                                    [gif_observations_by_iteration[it] for it in gif_iterations],
+                                    full_session,
+                                    gif_channels,
+                                    corrected=False,
+                                    analysis=trace_analysis,
+                                    normalize_to_peak=False,
+                                    corrected_trace_key="smoothed_corrected_current",
+                                )
+                                normalized_y_limits = (-0.2, 1.2)
+
+                                def swv_gif_frames(
+                                    normalized_raw: bool,
+                                    y_limits: tuple[float, float] | None,
+                                ):
+                                    for iteration in gif_iterations:
+                                        frame_observation = gif_observations_by_iteration[iteration]
+                                        frame_traces = _trace_paths(full_session, frame_observation)
+                                        fig, errors = _plot_traces(
+                                            full_session,
+                                            frame_observation,
+                                            corrected=normalized_raw,
+                                            selected_channels=gif_channels,
+                                            analysis=trace_analysis,
+                                            correction_label=correction_label,
+                                            overlaid=True,
+                                            trace_items=frame_traces,
+                                            normalize_to_peak=normalized_raw,
+                                            corrected_trace_key=(
+                                                "corrected_current"
+                                                if normalized_raw
+                                                else "smoothed_corrected_current"
+                                            ),
+                                        )
+                                        if y_limits is not None and fig.axes:
+                                            fig.axes[0].set_ylim(*y_limits)
+                                        if errors:
+                                            fig.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
+                                        yield fig
+
+                                for name, normalized_raw, y_limits in (
+                                    ("Raw SWVs", False, raw_y_limits),
+                                    ("Raw normalized SWVs", True, normalized_y_limits),
+                                ):
+                                    generated_gifs[name] = _figures_to_gif(
+                                        swv_gif_frames(normalized_raw, y_limits),
+                                        gif_duration,
+                                        lock_colormap_range=batch_gif_lock_colormap,
+                                        total_frames=len(gif_iterations),
+                                        progress_callback=lambda current, total, target=name: update_batch_progress(
+                                            target,
+                                            current,
+                                            total,
+                                        ),
+                                    )
+                                    completed_target_frames += len(gif_iterations)
+
+                                def surrogate_frames(
+                                    value_key: str,
+                                    view: str,
+                                    x_name: str,
+                                    y_name: str | None,
+                                    z_name: str | None = None,
+                                ):
+                                    for iteration in gif_iterations:
+                                        predictions = pd.read_csv(gif_group_files[iteration])
+                                        required = [
+                                            name for name in (x_name, y_name, z_name, value_key)
+                                            if name is not None
+                                        ]
+                                        if not all(name in predictions.columns for name in required):
+                                            continue
+                                        yield _plot_surrogate(
+                                            gif_group_session,
+                                            predictions,
+                                            iteration,
+                                            value_key,
+                                            view,
+                                            x_name,
+                                            y_name,
+                                            z_name,
+                                            tensor_height=plot_3d_height,
+                                            dot_size=plot_dot_size,
+                                            dot_opacity=plot_dot_opacity,
+                                            show_iteration_path=True,
+                                            show_local_pool=gif_show_local_pool,
+                                        )
+
+                                x_name, y_name, z_name = gif_dimensions[:3]
+                                shared_gif_camera = _stored_plotly_camera(None)
+                                for name, value_key in (
+                                    ("Surrogate tensor Q", "predicted_mean_Q"),
+                                    ("Surrogate tensor acquisition", "acquisition_value"),
+                                ):
+                                    generated_gifs[name] = _figures_to_gif(
+                                        surrogate_frames(value_key, "3D tensor", x_name, y_name, z_name),
+                                        gif_duration,
+                                        lock_colormap_range=batch_gif_lock_colormap,
+                                        plotly_width=max(500, int(plot_width_percent)),
+                                        plotly_height=plot_3d_height,
+                                        plotly_camera=shared_gif_camera,
+                                        total_frames=len(gif_iterations),
+                                        progress_callback=lambda current, total, target=name: update_batch_progress(
+                                            target,
+                                            current,
+                                            total,
+                                        ),
+                                    )
+                                    completed_target_frames += len(gif_iterations)
+
+                                for pair_x, pair_y in gif_pairs:
+                                    for label_prefix, value_key in (
+                                        ("2D Q", "predicted_mean_Q"),
+                                        ("2D acquisition", "acquisition_value"),
+                                    ):
+                                        name = f"{label_prefix} {pair_x} vs {pair_y}"
+                                        generated_gifs[name] = _figures_to_gif(
+                                            surrogate_frames(value_key, "2D map", pair_x, pair_y),
+                                            gif_duration,
+                                            lock_colormap_range=batch_gif_lock_colormap,
+                                            total_frames=len(gif_iterations),
+                                            progress_callback=lambda current, total, target=name: update_batch_progress(
+                                                target,
+                                                current,
+                                                total,
+                                            ),
+                                        )
+                                        completed_target_frames += len(gif_iterations)
+
+                                batch_progress.progress(
+                                    1.0,
+                                    text=f"Generated {len(generated_gifs)} synchronized GIFs.",
+                                )
+                                st.session_state[batch_key] = generated_gifs
+                            except Exception as exc:
+                                st.session_state.pop(batch_key, None)
+                                st.error(f"Synchronized GIF generation failed: {exc}")
+
+                        generated_gifs = st.session_state.get(batch_key, {})
+                        if generated_gifs:
+                            gif_display_order = [
                                 "Raw SWVs",
                                 "Raw normalized SWVs",
                                 "Surrogate tensor Q",
@@ -47781,250 +48551,77 @@ def render_bo_session_app() -> None:
                                     )
                                 ],
                             ]
-                            total_target_frames = max(1, len(gif_targets) * len(gif_iterations))
-                            completed_target_frames = 0
-                            batch_progress = st.progress(
-                                0.0,
-                                text="Preparing synchronized GIFs...",
-                            )
-
-                            def update_batch_progress(name: str, current: int, total: int) -> None:
-                                nonlocal completed_target_frames
-                                batch_progress.progress(
-                                    _progress_fraction(
-                                        completed_target_frames + current,
-                                        total_target_frames,
-                                        start=0.02,
-                                        end=0.98,
-                                    ),
-                                    text=f"Rendering {name}: frame {current}/{total}",
+                            ordered_generated_gifs = {
+                                name: generated_gifs[name]
+                                for name in gif_display_order
+                                if name in generated_gifs
+                            }
+                            ordered_generated_gifs.update({
+                                name: gif_bytes
+                                for name, gif_bytes in generated_gifs.items()
+                                if name not in ordered_generated_gifs
+                            })
+                            encoded = [
+                                (
+                                    name,
+                                    base64.b64encode(gif_bytes).decode("ascii"),
                                 )
-
-                            raw_y_limits = _swv_global_y_limits(
-                                [gif_observations_by_iteration[it] for it in gif_iterations],
-                                full_session,
-                                gif_channels,
-                                corrected=False,
-                                analysis=trace_analysis,
-                                normalize_to_peak=False,
-                                corrected_trace_key="smoothed_corrected_current",
-                            )
-                            normalized_y_limits = (-0.2, 1.2)
-
-                            def swv_gif_frames(
-                                normalized_raw: bool,
-                                y_limits: tuple[float, float] | None,
-                            ):
-                                for iteration in gif_iterations:
-                                    frame_observation = gif_observations_by_iteration[iteration]
-                                    frame_traces = _trace_paths(full_session, frame_observation)
-                                    fig, errors = _plot_traces(
-                                        full_session,
-                                        frame_observation,
-                                        corrected=normalized_raw,
-                                        selected_channels=gif_channels,
-                                        analysis=trace_analysis,
-                                        correction_label=correction_label,
-                                        overlaid=True,
-                                        trace_items=frame_traces,
-                                        normalize_to_peak=normalized_raw,
-                                        corrected_trace_key=(
-                                            "corrected_current"
-                                            if normalized_raw
-                                            else "smoothed_corrected_current"
-                                        ),
-                                    )
-                                    if y_limits is not None and fig.axes:
-                                        fig.axes[0].set_ylim(*y_limits)
-                                    if errors:
-                                        fig.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
-                                    yield fig
-
-                            for name, normalized_raw, y_limits in (
-                                ("Raw SWVs", False, raw_y_limits),
-                                ("Raw normalized SWVs", True, normalized_y_limits),
-                            ):
-                                generated_gifs[name] = _figures_to_gif(
-                                    swv_gif_frames(normalized_raw, y_limits),
-                                    gif_duration,
-                                    lock_colormap_range=batch_gif_lock_colormap,
-                                    total_frames=len(gif_iterations),
-                                    progress_callback=lambda current, total, target=name: update_batch_progress(
-                                        target,
-                                        current,
-                                        total,
-                                    ),
+                                for name, gif_bytes in ordered_generated_gifs.items()
+                            ]
+                            cards = "\n".join(
+                                (
+                                    "<div class='gif-card'>"
+                                    f"<div class='gif-title'>{name}</div>"
+                                    f"<img data-gif-src='data:image/gif;base64,{encoded_gif}' />"
+                                    "</div>"
                                 )
-                                completed_target_frames += len(gif_iterations)
-
-                            def surrogate_frames(
-                                value_key: str,
-                                view: str,
-                                x_name: str,
-                                y_name: str | None,
-                                z_name: str | None = None,
-                            ):
-                                for iteration in gif_iterations:
-                                    predictions = pd.read_csv(gif_group_files[iteration])
-                                    required = [
-                                        name for name in (x_name, y_name, z_name, value_key)
-                                        if name is not None
-                                    ]
-                                    if not all(name in predictions.columns for name in required):
-                                        continue
-                                    yield _plot_surrogate(
-                                        gif_group_session,
-                                        predictions,
-                                        iteration,
-                                        value_key,
-                                        view,
-                                        x_name,
-                                        y_name,
-                                        z_name,
-                                        tensor_height=plot_3d_height,
-                                        dot_size=plot_dot_size,
-                                        dot_opacity=plot_dot_opacity,
-                                        show_iteration_path=True,
-                                        show_local_pool=gif_show_local_pool,
-                                    )
-
-                            x_name, y_name, z_name = gif_dimensions[:3]
-                            shared_gif_camera = _stored_plotly_camera(None)
-                            for name, value_key in (
-                                ("Surrogate tensor Q", "predicted_mean_Q"),
-                                ("Surrogate tensor acquisition", "acquisition_value"),
-                            ):
-                                generated_gifs[name] = _figures_to_gif(
-                                    surrogate_frames(value_key, "3D tensor", x_name, y_name, z_name),
-                                    gif_duration,
-                                    lock_colormap_range=batch_gif_lock_colormap,
-                                    plotly_width=max(500, int(plot_width_percent)),
-                                    plotly_height=plot_3d_height,
-                                    plotly_camera=shared_gif_camera,
-                                    total_frames=len(gif_iterations),
-                                    progress_callback=lambda current, total, target=name: update_batch_progress(
-                                        target,
-                                        current,
-                                        total,
-                                    ),
-                                )
-                                completed_target_frames += len(gif_iterations)
-
-                            for pair_x, pair_y in gif_pairs:
-                                for label_prefix, value_key in (
-                                    ("2D Q", "predicted_mean_Q"),
-                                    ("2D acquisition", "acquisition_value"),
-                                ):
-                                    name = f"{label_prefix} {pair_x} vs {pair_y}"
-                                    generated_gifs[name] = _figures_to_gif(
-                                        surrogate_frames(value_key, "2D map", pair_x, pair_y),
-                                        gif_duration,
-                                        lock_colormap_range=batch_gif_lock_colormap,
-                                        total_frames=len(gif_iterations),
-                                        progress_callback=lambda current, total, target=name: update_batch_progress(
-                                            target,
-                                            current,
-                                            total,
-                                        ),
-                                    )
-                                    completed_target_frames += len(gif_iterations)
-
-                            batch_progress.progress(
-                                1.0,
-                                text=f"Generated {len(generated_gifs)} synchronized GIFs.",
+                                for name, encoded_gif in encoded
                             )
-                            st.session_state[batch_key] = generated_gifs
-                        except Exception as exc:
-                            st.session_state.pop(batch_key, None)
-                            st.error(f"Synchronized GIF generation failed: {exc}")
-
-                    generated_gifs = st.session_state.get(batch_key, {})
-                    if generated_gifs:
-                        gif_display_order = [
-                            "Raw SWVs",
-                            "Raw normalized SWVs",
-                            "Surrogate tensor Q",
-                            "Surrogate tensor acquisition",
-                            *[
-                                name
-                                for x_name, y_name in gif_pairs
-                                for name in (
-                                    f"2D Q {x_name} vs {y_name}",
-                                    f"2D acquisition {x_name} vs {y_name}",
-                                )
-                            ],
-                        ]
-                        ordered_generated_gifs = {
-                            name: generated_gifs[name]
-                            for name in gif_display_order
-                            if name in generated_gifs
-                        }
-                        ordered_generated_gifs.update({
-                            name: gif_bytes
-                            for name, gif_bytes in generated_gifs.items()
-                            if name not in ordered_generated_gifs
-                        })
-                        encoded = [
-                            (
-                                name,
-                                base64.b64encode(gif_bytes).decode("ascii"),
-                            )
-                            for name, gif_bytes in ordered_generated_gifs.items()
-                        ]
-                        cards = "\n".join(
-                            (
-                                "<div class='gif-card'>"
-                                f"<div class='gif-title'>{name}</div>"
-                                f"<img data-gif-src='data:image/gif;base64,{encoded_gif}' />"
-                                "</div>"
-                            )
-                            for name, encoded_gif in encoded
-                        )
-                        components.html(
-                            f"""
-                            <style>
-                            .gif-grid {{
-                                display: grid;
-                                grid-template-columns: repeat(2, minmax(0, 1fr));
-                                gap: 14px;
-                                align-items: start;
-                            }}
-                            .gif-card {{
-                                border: 1px solid #ddd;
-                                padding: 8px;
-                                background: white;
-                            }}
-                            .gif-title {{
-                                font: 600 14px sans-serif;
-                                margin-bottom: 6px;
-                            }}
-                            .gif-card img {{
-                                width: 100%;
-                                display: block;
-                            }}
-                            </style>
-                            <div class="gif-grid">{cards}</div>
-                            <script>
-                            const images = Array.from(document.querySelectorAll("img[data-gif-src]"));
-                            window.requestAnimationFrame(() => {{
-                                images.forEach((image) => {{
-                                    image.src = image.dataset.gifSrc;
+                            components.html(
+                                f"""
+                                <style>
+                                .gif-grid {{
+                                    display: grid;
+                                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                                    gap: 14px;
+                                    align-items: start;
+                                }}
+                                .gif-card {{
+                                    border: 1px solid #ddd;
+                                    padding: 8px;
+                                    background: white;
+                                }}
+                                .gif-title {{
+                                    font: 600 14px sans-serif;
+                                    margin-bottom: 6px;
+                                }}
+                                .gif-card img {{
+                                    width: 100%;
+                                    display: block;
+                                }}
+                                </style>
+                                <div class="gif-grid">{cards}</div>
+                                <script>
+                                const images = Array.from(document.querySelectorAll("img[data-gif-src]"));
+                                window.requestAnimationFrame(() => {{
+                                    images.forEach((image) => {{
+                                        image.src = image.dataset.gifSrc;
+                                    }});
                                 }});
-                            }});
-                            </script>
-                            """,
-                            height=max(520, 360 * ((len(encoded) + 1) // 2)),
-                            scrolling=True,
-                        )
-                        for name, gif_bytes in ordered_generated_gifs.items():
-                            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
-                            st.download_button(
-                                f"Download {name}",
-                                data=gif_bytes,
-                                file_name=f"{gif_group['name']}_{safe_name}.gif",
-                                mime="image/gif",
-                                key=f"{batch_key}_download_{safe_name}",
+                                </script>
+                                """,
+                                height=max(520, 360 * ((len(encoded) + 1) // 2)),
+                                scrolling=True,
                             )
+                            for name, gif_bytes in ordered_generated_gifs.items():
+                                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
+                                st.download_button(
+                                    f"Download {name}",
+                                    data=gif_bytes,
+                                    file_name=f"{gif_group['name']}_{safe_name}.gif",
+                                    mime="image/gif",
+                                    key=f"{batch_key}_download_{safe_name}",
+                                )
 
 
 

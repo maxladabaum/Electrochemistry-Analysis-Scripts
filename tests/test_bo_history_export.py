@@ -136,3 +136,131 @@ def test_2d_download_does_not_require_server_png_export(monkeypatch, plot_type, 
     assert args["download_file_stem"] == f"real_{plot_type}"
     assert args["download_width"] == 1200
     assert args["download_height"] == 560
+
+
+def test_series_styles_follow_selected_run_and_survive_legend_rename():
+    import plotly.graph_objects as go
+
+    first = go.Scatter(
+        x=[1, 2], y=[1, 2], name="Simulation (run 1)",
+        mode="lines+markers", line={"color": "blue", "width": 2},
+        marker={"size": 5},
+    )
+    second = go.Scatter(
+        x=[1, 2], y=[3, 4], name="Simulation (run 3)",
+        mode="lines+markers", line={"color": "orange", "width": 2},
+        marker={"size": 5},
+    )
+    figure = go.Figure([first, second])
+    token = viewer._individual_plot_series(figure)[1][0]
+    # Removing another selected run must not move the style to a different run.
+    assert viewer._individual_plot_series(go.Figure([second]))[0][0] == token
+    settings = {
+        "width": 1000, "height": 600, "text_size": 10, "tick_size": 10,
+        "margin": 50, "perimeter_width": 1, "perimeter_color": "black",
+        "show_legend": True, "show_grid": True, "override_text": False,
+        "line_scale": 2, "marker_scale": 2,
+        "override_legend_text": True, "legend_labels": "First\nSecond",
+        f"series_{token}_color": "purple",
+        f"series_{token}_width": 7.0,
+        f"series_{token}_marker_size": 12.0,
+    }
+    viewer._apply_individual_plotly_style(figure, settings)
+    assert figure.data[0].line.color == "blue"
+    assert figure.data[0].line.width == 4
+    assert figure.data[0].marker.size == 10
+    assert figure.data[1].name == "Second"
+    assert figure.data[1].line.color == "#800080"
+    assert figure.data[1].marker.color == "#800080"
+    assert figure.data[1].line.width == 7
+    assert figure.data[1].marker.size == 12
+    exported = viewer._history_plotly_to_matplotlib(figure, settings)
+    try:
+        line = exported.axes[0].lines[1]
+        assert line.get_color() == "#800080"
+        assert line.get_linewidth() == 7
+        assert line.get_markersize() == 12
+    finally:
+        plt.close(exported)
+
+
+def test_plot_settings_form_applies_color_in_single_submission():
+    from streamlit.testing.v1 import AppTest
+
+    # Streamlit runs the script on a worker thread; macOS GUI backends cannot.
+    plt.switch_backend("Agg")
+    app = AppTest.from_string("""
+import streamlit as st
+import plotly.graph_objects as go
+import bo_session_viewer as viewer
+st.session_state["render_count"] = st.session_state.get("render_count", 0) + 1
+figure = go.Figure(go.Scatter(
+    x=[1, 2], y=[2, 3], name="Run 1", mode="lines+markers",
+    line={"color": "blue"}, marker={"color": [1, 2], "coloraxis": "coloraxis"},
+))
+viewer._render_downloadable_plotly(
+    st, figure, key="test_plot", file_stem="test", width_percent=800,
+    individual_plot_settings=True,
+)
+st.session_state["rendered_color"] = figure.data[0].line.color
+st.session_state["marker_coloraxis"] = figure.data[0].marker.coloraxis
+""", default_timeout=30).run()
+    assert not app.exception
+    for widget_type in ("text_input", "text_area", "slider", "checkbox", "number_input", "selectbox"):
+        for widget in getattr(app, widget_type):
+            assert widget.proto.form_id == "test_plot_individual_plot_form"
+    before = app.session_state["render_count"]
+    color = next(widget for widget in app.text_input if widget.label == "Series color")
+    color.set_value("rgb(255, 0, 0)")
+    next(button for button in app.button if button.label == "Update settings").click()
+    app.run()
+    assert not app.exception
+    assert app.session_state["render_count"] == before + 1
+    assert app.session_state["rendered_color"] == "#ff0000"
+    assert app.session_state["marker_coloraxis"] is None
+
+    next(widget for widget in app.text_input if widget.label == "Series color").set_value("bad color")
+    next(button for button in app.button if button.label == "Update settings").click()
+    app.run()
+    assert not app.exception
+    assert any("Invalid color for Run 1" in warning.value for warning in app.warning)
+
+
+def test_selected_runs_settings_have_their_own_fragment():
+    from streamlit.testing.v1 import AppTest
+
+    plt.switch_backend("Agg")
+    app = AppTest.from_string("""
+import streamlit as st
+import plotly.graph_objects as go
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+import bo_session_viewer as viewer
+
+@st.fragment
+def history():
+    st.session_state["history_fragment"] = get_script_run_ctx().current_fragment_id
+    source = go.Figure(go.Scatter(x=[1, 2], y=[2, 3], name="Run 1", line={"width": 2}))
+    real_render = viewer._render_downloadable_plotly
+    def capture(*args, **kwargs):
+        st.session_state["overlay_fragment"] = get_script_run_ctx().current_fragment_id
+        return real_render(*args, **kwargs)
+    viewer._render_downloadable_plotly = capture
+    try:
+        viewer._render_selected_simulation_runs_plot(
+            source, key="isolated_overlay", metric="Q_run",
+            width_percent=800, observations=[],
+        )
+    finally:
+        viewer._render_downloadable_plotly = real_render
+    st.session_state["source_width"] = source.data[0].line.width
+history()
+""", default_timeout=30).run()
+    assert not app.exception
+    assert app.session_state["overlay_fragment"]
+    assert app.session_state["overlay_fragment"] != app.session_state["history_fragment"]
+    assert app.session_state["source_width"] == 2
+    next(widget for widget in app.slider if widget.label == "Line thickness").set_value(2.0)
+    next(button for button in app.button if button.label == "Update settings").click()
+    app.run()
+    assert not app.exception
+    assert app.session_state["source_width"] == 2

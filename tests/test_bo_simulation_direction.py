@@ -395,3 +395,35 @@ def test_starting_point_map_aggregates_duplicate_starts_and_counts_runs():
     duplicate = grouped.loc[grouped["frequency"] == 100.0].iloc[0]
     assert duplicate["runs"] == 2
     assert duplicate["metric_value"] == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize('direction, expected', [
+    ('maximize', 2.0), ('minimize', 0.0), ('min', 0.0),
+    ('more_negative', 0.0), ('negative', 0.0), (' MAXIMIZE ', 2.0),
+])
+def test_objective_direction_does_not_normalize_or_copy_sweep_config(monkeypatch, direction, expected):
+    import bo_session_viewer as viewer
+    config = {
+        'acquisition': {'optimization_direction': direction},
+        'channel_groups': [{'id': index} for index in range(60)],
+    }
+    monkeypatch.setattr(viewer, '_simulation_normalized_bo_config', lambda *args: pytest.fail('Direction lookup must not normalize the sweep'))
+    assert viewer._simulation_objective_value(2.0, config) == expected
+    assert config['acquisition']['optimization_direction'] == direction
+
+
+def test_ground_truth_summary_preserves_direction_and_channel_optima():
+    from bo_session_viewer import _simulation_channel_optima_frame
+    truth = pd.DataFrame({
+        'ground_truth_channel': ['1', '1', '2', '2'],
+        'ground_truth_value': [-3., -1., -2., -4.],
+        'frequency': [100., 200., 300., 400.],
+    })
+    session = {
+        'simulation_ground_truth': truth,
+        'config': {'acquisition': {'optimization_direction': 'minimize'}},
+        'state': {},
+    }
+    frame = _simulation_channel_optima_frame(session)
+    assert frame['Optimal possible Q'].tolist() == [-3., -4.]
+    assert frame['Best frequency'].tolist() == [100., 400.]
